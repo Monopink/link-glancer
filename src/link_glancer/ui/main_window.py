@@ -44,6 +44,7 @@ class MainWindow(QMainWindow):
         self._task_table_ids: list[int] = []
         self._editing_task_index: int | None = None
         self._review_window: ReviewWindow | None = None
+        self._confirmation_task_id: int | None = None
 
         self.setWindowTitle("Link Glancer")
         self.resize(1120, 720)
@@ -116,6 +117,15 @@ class MainWindow(QMainWindow):
         self._task_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self._task_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self._task_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self._task_table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._task_table.setStyleSheet(
+            "QTableView { outline: 0; } "
+            "QTableView::item:selected { "
+            "border: 0px; "
+            "background-color: #2563eb; "
+            "color: #ffffff; "
+            "}"
+        )
         self._task_table.setAlternatingRowColors(True)
         self._task_table.doubleClicked.connect(self._open_selected_task_from_table)
         self._task_table.itemSelectionChanged.connect(self._update_start_page_actions)
@@ -170,7 +180,11 @@ class MainWindow(QMainWindow):
         self._task_data_table = QTableWidget(0, 0)
         self._task_data_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self._task_data_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self._task_data_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self._task_data_table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self._task_data_table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._task_data_table.setStyleSheet(
+            "QTableView { outline: 0; } QTableView::item:selected { border: 0px; }"
+        )
         self._task_data_table.setAlternatingRowColors(True)
         layout.addWidget(self._task_data_table, stretch=1)
         return page
@@ -270,11 +284,13 @@ class MainWindow(QMainWindow):
         except (OSError, ValueError) as exc:
             QMessageBox.warning(self, "任务配置无效", str(exc))
             return
+        self._shutdown_confirmation_browser()
         self._editing_task_index = None
         self._refresh_task_page()
         self.statusBar().showMessage("任务配置已保存。", 4000)
 
     def _load_task(self, task_id: int) -> None:
+        self._shutdown_confirmation_browser()
         try:
             self.task = self.app_service.load_task(task_id)
         except (ValueError, OSError) as exc:
@@ -284,6 +300,7 @@ class MainWindow(QMainWindow):
         self._show_task_page()
 
     def _show_start_page(self) -> None:
+        self._shutdown_confirmation_browser()
         self.task = None
         self._editing_task_index = None
         self._toolbar.show()
@@ -348,6 +365,7 @@ class MainWindow(QMainWindow):
         if result != QMessageBox.StandardButton.Yes:
             return
         task_id = self.task.task_id
+        self._shutdown_confirmation_browser()
         self.app_service.delete_task(task_id)
         self._show_start_page()
 
@@ -388,14 +406,20 @@ class MainWindow(QMainWindow):
     def _start_review_flow(self) -> None:
         if not self.task:
             return
-        if self._review_window is not None and self._review_window.isVisible():
-            self._review_window.activateWindow()
-            self._review_window.raise_()
+        if self.task.current_item is None:
+            QMessageBox.information(
+                self,
+                "任务已完成",
+                "当前任务已完成。如需复核，请先跳转到目标条目。",
+            )
             return
-        self.task = self.app_service.mark_task_in_progress(self.task.task_id)
         confirm_url = self._resolve_confirmation_url()
         if not confirm_url:
             QMessageBox.warning(self, "无法开始", "没有可用于浏览器确认的 URL。")
+            return
+        if self._review_window is not None and self._review_window.isVisible():
+            self._review_window.activateWindow()
+            self._review_window.raise_()
             return
         request = BrowserLaunchRequest(
             browser_config_id=self.task.browser_config.config_id,
@@ -407,6 +431,8 @@ class MainWindow(QMainWindow):
         self.browser.ensure_running()
         status = self.browser.status()
         if not status.running:
+            self._confirmation_task_id = None
+            self._refresh_task_page()
             QMessageBox.warning(self, "浏览器启动失败", status.message)
             return
         self.browser.open_confirmation_page(confirm_url)
@@ -419,8 +445,11 @@ class MainWindow(QMainWindow):
         )
         if result != QMessageBox.StandardButton.Yes:
             self.browser.shutdown()
+            self._confirmation_task_id = None
             self.statusBar().showMessage("已取消开始检查。", 3000)
             return
+        self._confirmation_task_id = self.task.task_id
+        self.task = self.app_service.mark_task_in_progress(self.task.task_id)
         self._enter_review_mode()
 
     def _enter_review_mode(self) -> None:
@@ -431,6 +460,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "无任务", "当前没有可检查的条目。")
             return
         self.browser.close_confirmation_page()
+        self._confirmation_task_id = None
         self._sync_browser_buffer()
         self._review_window = ReviewWindow(
             task_id=self.task.task_id,
@@ -442,6 +472,7 @@ class MainWindow(QMainWindow):
 
     def _handle_review_window_closed(self) -> None:
         self._review_window = None
+        self._confirmation_task_id = None
         if self.task is not None:
             self.task = self.app_service.load_task(self.task.task_id)
             self._refresh_task_page()
@@ -495,7 +526,8 @@ class MainWindow(QMainWindow):
 
         current_row = min(max(self.task.current_task_index - 1, 0), max(len(items) - 1, 0))
         if 0 <= current_row < self._task_data_table.rowCount():
-            self._task_data_table.setCurrentCell(current_row, 0)
+            self._task_data_table.clearSelection()
+            self._task_data_table.setCurrentCell(-1, -1)
 
     def _resolve_table_value(
         self,
@@ -573,6 +605,7 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event) -> None:
         if self._review_window is not None:
             self._review_window.close()
+        self._confirmation_task_id = None
         self.browser.shutdown()
         super().closeEvent(event)
 
@@ -595,3 +628,9 @@ class MainWindow(QMainWindow):
         config.last_tested_at = datetime.now(UTC).isoformat()
         self.browser.shutdown()
         return True, f"启动成功：{test_url}"
+
+    def _shutdown_confirmation_browser(self) -> None:
+        if self._review_window is not None and self._review_window.isVisible():
+            return
+        self._confirmation_task_id = None
+        self.browser.shutdown()

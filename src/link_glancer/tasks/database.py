@@ -479,6 +479,26 @@ def list_reviews(database_path: Path, task_id: int) -> dict[int, ReviewRecord]:
         return {int(row["task_item_id"]): _review_from_row(row) for row in rows}
 
 
+def find_previous_reviewed_index(
+    database_path: Path, *, task_id: int, before_task_index: int
+) -> int | None:
+    with sqlite3.connect(database_path) as connection:
+        row = connection.execute(
+            """
+            SELECT i.task_index
+            FROM reviews r
+            JOIN task_items i ON i.id = r.task_item_id
+            WHERE i.task_id = ? AND i.task_index < ? AND r.review_status = 'completed'
+            ORDER BY i.task_index DESC
+            LIMIT 1
+            """,
+            (task_id, before_task_index),
+        ).fetchone()
+        if row is None:
+            return None
+        return int(row[0])
+
+
 def save_review(
     database_path: Path,
     *,
@@ -518,26 +538,6 @@ def save_review(
             next_index = min(task_index + 1, total_items + 1)
             status = "completed" if task_index >= total_items else "in_progress"
             _update_task_pointer(connection, task_id, next_index, status)
-
-
-def revoke_review(
-    database_path: Path, *, task_id: int, task_index: int, reset_pointer: bool = True
-) -> None:
-    now = _now_iso()
-    with sqlite3.connect(database_path) as connection:
-        item = load_task_item_by_index(connection, task_id, task_index)
-        if item is None:
-            raise ValueError(f"Task item not found: task_id={task_id}, task_index={task_index}")
-        connection.execute("DELETE FROM reviews WHERE task_item_id = ?", (item.task_item_id,))
-        connection.execute(
-            """
-            INSERT INTO review_history (task_item_id, action, payload_json, created_at)
-            VALUES (?, 'revoked', '{}', ?)
-            """,
-            (item.task_item_id, now),
-        )
-        if reset_pointer:
-            _update_task_pointer(connection, task_id, task_index, "in_progress")
 
 
 def jump_to_task_index(database_path: Path, task_id: int, task_index: int) -> None:

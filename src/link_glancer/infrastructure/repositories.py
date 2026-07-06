@@ -61,6 +61,13 @@ class TaskRepository:
     def list_reviews(self, task_id: int) -> dict[int, ReviewRecord]:
         return database.list_reviews(self.database_path, task_id)
 
+    def find_previous_reviewed_index(self, *, task_id: int, before_task_index: int) -> int | None:
+        return database.find_previous_reviewed_index(
+            self.database_path,
+            task_id=task_id,
+            before_task_index=before_task_index,
+        )
+
     def load_review(self, *, task_id: int, task_index: int) -> ReviewRecord | None:
         return database.load_review_by_task_index(
             self.database_path,
@@ -82,14 +89,6 @@ class TaskRepository:
             task_index=task_index,
             review_data=review_data,
             advance_pointer=advance_pointer,
-        )
-
-    def revoke_review(self, *, task_id: int, task_index: int, reset_pointer: bool) -> None:
-        database.revoke_review(
-            self.database_path,
-            task_id=task_id,
-            task_index=task_index,
-            reset_pointer=reset_pointer,
         )
 
     def jump_to_task_index(self, *, task_id: int, task_index: int) -> None:
@@ -167,6 +166,12 @@ class TaskRepository:
             "last_task_creation_defaults",
             payload,
         )
+
+    def load_app_setting(self, key: str) -> object | None:
+        return database.load_app_setting(self.database_path, key)
+
+    def save_app_setting(self, key: str, value: object) -> None:
+        database.save_app_setting(self.database_path, key, value)
 
 
 class BrowserConfigRepository:

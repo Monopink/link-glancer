@@ -403,6 +403,8 @@ def _setup_table(table: QTableWidget) -> None:
     table.setAlternatingRowColors(True)
     table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
     table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+    table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+    table.setStyleSheet("QTableView { outline: 0; } QTableView::item:selected { border: 0px; }")
     table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
 
 

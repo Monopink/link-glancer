@@ -44,10 +44,12 @@ def import_task_workbook(
         row_number = task_snapshot.header_row + 1
         rows: list[tuple[int, dict[str, object]]] = []
 
-        while True:
+        max_row = sheet.max_row
+        while row_number <= max_row:
             row_values = _read_row(sheet, row_number, header_map)
             if not any(value not in (None, "") for value in row_values.values()):
-                break
+                row_number += 1
+                continue
             normalized = {
                 header: ("" if value is None else value)
                 for header, value in row_values.items()

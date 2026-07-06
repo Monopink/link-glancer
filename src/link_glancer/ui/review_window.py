@@ -105,6 +105,7 @@ class ReviewWindow(QMainWindow):
         self.setMinimumWidth(560)
 
         self._build_ui()
+        self._load_window_preferences()
         self._render_review_fields()
         self._bind_shortcuts()
         self._refresh_view()
@@ -149,6 +150,9 @@ class ReviewWindow(QMainWindow):
         actions = QHBoxLayout()
         self._shortcut_button = QPushButton("快捷键")
         self._shortcut_button.clicked.connect(self._edit_public_shortcuts)
+        self._always_on_top_button = QPushButton("窗口置顶")
+        self._always_on_top_button.setCheckable(True)
+        self._always_on_top_button.clicked.connect(self._toggle_always_on_top)
         self._exit_button = QPushButton("退出检查")
         self._exit_button.clicked.connect(self.close)
         self._previous_button = QPushButton("上一条")
@@ -156,6 +160,7 @@ class ReviewWindow(QMainWindow):
         self._submit_button = QPushButton("提交")
         self._submit_button.clicked.connect(self._submit_review)
         actions.addWidget(self._shortcut_button)
+        actions.addWidget(self._always_on_top_button)
         actions.addWidget(self._exit_button)
         actions.addStretch(1)
         actions.addWidget(self._previous_button)
@@ -249,6 +254,7 @@ class ReviewWindow(QMainWindow):
         self._item_details_label.setText(self._build_item_details(current_index))
         self._submit_button.setEnabled(self.task.current_item is not None)
         self._previous_button.setEnabled(self._has_previous_review())
+        self._sync_form_with_current_item()
 
     def _refresh_time_labels(self) -> None:
         elapsed_seconds, eta_seconds = self._review_time_metrics()
@@ -314,7 +320,12 @@ class ReviewWindow(QMainWindow):
         self._refresh_view()
 
     def _go_to_previous(self) -> None:
-        target_index = max(1, self.task.current_task_index - 1)
+        target_index = self._app_service.find_previous_reviewed_index(
+            task_id=self.task.task_id,
+            before_task_index=self.task.current_task_index,
+        )
+        if target_index is None:
+            return
         review = self._app_service.load_review(task_id=self.task.task_id, task_index=target_index)
         if review is None:
             return
@@ -327,12 +338,10 @@ class ReviewWindow(QMainWindow):
         self._refresh_view()
 
     def _has_previous_review(self) -> bool:
-        if self.task.current_task_index <= 1:
-            return False
         return (
-            self._app_service.load_review(
+            self._app_service.find_previous_reviewed_index(
                 task_id=self.task.task_id,
-                task_index=self.task.current_task_index - 1,
+                before_task_index=self.task.current_task_index,
             )
             is not None
         )
@@ -414,6 +423,29 @@ class ReviewWindow(QMainWindow):
     def _clear_review_form(self) -> None:
         for widget in self._field_widgets.values():
             widget.clear_value()
+
+    def _sync_form_with_current_item(self) -> None:
+        if self.task.current_review is None:
+            return
+        self._populate_review_form(self.task.current_review.review_data)
+
+    def _toggle_always_on_top(self, checked: bool) -> None:
+        self._set_always_on_top(checked, persist=True)
+
+    def _set_always_on_top(self, enabled: bool, *, persist: bool) -> None:
+        self._always_on_top_button.blockSignals(True)
+        self._always_on_top_button.setChecked(enabled)
+        self._always_on_top_button.blockSignals(False)
+        was_visible = self.isVisible()
+        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, enabled)
+        if was_visible:
+            self.show()
+        if persist:
+            self._app_service.save_app_setting("always_on_top", enabled)
+
+    def _load_window_preferences(self) -> None:
+        raw = self._app_service.load_app_setting("always_on_top")
+        self._set_always_on_top(bool(raw), persist=False)
 
     def _key_sequence_text(
         self,

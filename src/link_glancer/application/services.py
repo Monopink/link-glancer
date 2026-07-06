@@ -218,6 +218,12 @@ class TaskApplicationService:
     def list_reviews(self, task_id: int) -> dict[int, ReviewRecord]:
         return self._tasks.list_reviews(task_id)
 
+    def find_previous_reviewed_index(self, *, task_id: int, before_task_index: int) -> int | None:
+        return self._tasks.find_previous_reviewed_index(
+            task_id=task_id,
+            before_task_index=before_task_index,
+        )
+
     def load_review(self, *, task_id: int, task_index: int) -> ReviewRecord | None:
         return self._tasks.load_review(task_id=task_id, task_index=task_index)
 
@@ -237,14 +243,6 @@ class TaskApplicationService:
         )
         return self.load_task(task_id)
 
-    def revoke_review(self, *, task_id: int, task_index: int, reset_pointer: bool) -> TaskDetail:
-        self._tasks.revoke_review(
-            task_id=task_id,
-            task_index=task_index,
-            reset_pointer=reset_pointer,
-        )
-        return self.load_task(task_id)
-
     def jump_to_task_index(self, *, task_id: int, task_index: int) -> TaskDetail:
         self._tasks.jump_to_task_index(task_id=task_id, task_index=task_index)
         return self.load_task(task_id)
@@ -255,6 +253,12 @@ class TaskApplicationService:
 
     def export_task(self, *, task_id: int, destination_dir: Path | None = None) -> Path:
         return self._tasks.export_task(task_id=task_id, destination_dir=destination_dir)
+
+    def load_app_setting(self, key: str) -> object | None:
+        return self._tasks.load_app_setting(key)
+
+    def save_app_setting(self, key: str, value: object) -> None:
+        self._tasks.save_app_setting(key, value)
 
     def list_browser_configs(self) -> list[BrowserConfig]:
         return self._browser_configs.list_browser_configs()
