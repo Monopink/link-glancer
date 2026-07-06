@@ -1,0 +1,26 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Local runtime data
+logs/
+profiles/
+settings.json
+.tmp-*/
+.runtime/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

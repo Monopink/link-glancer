@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "link-glancer"
+version = "0.1.0"
+description = "Windows-first desktop app for batch URL human review."
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "PySide6>=6.7,<6.8",
+  "playwright>=1.54,<2",
+  "openpyxl>=3.1,<4",
+]
+
+[project.optional-dependencies]
+build = [
+  "pyinstaller>=6.11,<7",
+]
+
+[project.scripts]
+link-glancer = "link_glancer.main:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = [
+  "E",
+  "F",
+  "I",
+  "B",
+  "UP",
+]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "auto"

@@ -1,0 +1,597 @@
+from __future__ import annotations
+
+from datetime import UTC, datetime
+from pathlib import Path
+
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QColor
+from PySide6.QtWidgets import (
+    QAbstractItemView,
+    QDialog,
+    QFileDialog,
+    QHBoxLayout,
+    QHeaderView,
+    QLabel,
+    QMainWindow,
+    QMessageBox,
+    QPushButton,
+    QSizePolicy,
+    QStackedWidget,
+    QStatusBar,
+    QTableWidget,
+    QTableWidgetItem,
+    QToolBar,
+    QVBoxLayout,
+    QWidget,
+)
+
+from link_glancer.application import TaskApplicationService
+from link_glancer.browser.base import BrowserController, BrowserLaunchRequest
+from link_glancer.browser.service import create_browser_controller
+from link_glancer.tasks.database import consume_database_reset_reason
+from link_glancer.tasks.models import BrowserConfig, TaskDetail, TaskSnapshot
+from link_glancer.ui.config_manager_dialog import ConfigManagerDialog
+from link_glancer.ui.review_window import ReviewWindow
+from link_glancer.ui.task_creation_dialog import TaskCreationDialog
+
+
+class MainWindow(QMainWindow):
+    def __init__(self) -> None:
+        super().__init__()
+        self.app_service = TaskApplicationService.create_default()
+        self.browser: BrowserController = create_browser_controller()
+        self.task: TaskDetail | None = None
+        self._task_table_ids: list[int] = []
+        self._editing_task_index: int | None = None
+        self._review_window: ReviewWindow | None = None
+
+        self.setWindowTitle("Link Glancer")
+        self.resize(1120, 720)
+        self.setMinimumWidth(980)
+
+        self._build_toolbar()
+        self._build_pages()
+        self.setStatusBar(QStatusBar(self))
+        self._show_start_page()
+        self._show_database_reset_notice()
+
+    def _show_database_reset_notice(self) -> None:
+        reason = consume_database_reset_reason()
+        if reason is None:
+            return
+        QMessageBox.information(
+            self,
+            "数据库已重建",
+            "检测到不兼容的旧数据库，已按当前版本重建。\n"
+            "旧任务数据已清空，浏览器配置的独立环境目录未删除。\n\n"
+            f"原因：{reason}",
+        )
+
+    def _build_toolbar(self) -> None:
+        self._toolbar = QToolBar("任务")
+        self._toolbar.setMovable(False)
+        self.addToolBar(self._toolbar)
+
+        new_task = QPushButton("新建任务")
+        new_task.clicked.connect(self._create_task)
+        self._toolbar.addWidget(new_task)
+
+        browser_configs = QPushButton("浏览器配置")
+        browser_configs.clicked.connect(self._show_browser_configs)
+        self._toolbar.addWidget(browser_configs)
+
+        spacer = QWidget()
+        spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self._toolbar.addWidget(spacer)
+
+        self._open_task_button = QPushButton("打开任务")
+        self._open_task_button.clicked.connect(self._open_selected_task_from_table)
+        self._toolbar.addWidget(self._open_task_button)
+
+        self._delete_task_button = QPushButton("删除任务")
+        self._delete_task_button.clicked.connect(self._delete_selected_task_from_table)
+        self._toolbar.addWidget(self._delete_task_button)
+
+    def _build_pages(self) -> None:
+        self._stack = QStackedWidget()
+        self._start_page = self._build_start_page()
+        self._task_page = self._build_task_page()
+        self._stack.addWidget(self._start_page)
+        self._stack.addWidget(self._task_page)
+        self.setCentralWidget(self._stack)
+
+    def _build_start_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
+
+        layout.addWidget(QLabel("任务列表"))
+
+        self._task_table = QTableWidget(0, 6)
+        self._task_table.setHorizontalHeaderLabels(
+            ["ID", "任务", "进度", "状态", "源文件", "更新时间"]
+        )
+        self._task_table.verticalHeader().setVisible(False)
+        self._task_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self._task_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self._task_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self._task_table.setAlternatingRowColors(True)
+        self._task_table.doubleClicked.connect(self._open_selected_task_from_table)
+        self._task_table.itemSelectionChanged.connect(self._update_start_page_actions)
+        header_view = self._task_table.horizontalHeader()
+        header_view.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        header_view.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        header_view.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        header_view.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        header_view.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+        header_view.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
+        layout.addWidget(self._task_table, stretch=1)
+        return page
+
+    def _build_task_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(12)
+
+        title_box = QVBoxLayout()
+        title_box.setContentsMargins(0, 0, 0, 0)
+        self._task_title_label = QLabel("任务")
+        self._task_title_label.setProperty("sectionTitle", True)
+        self._task_meta_label = QLabel("-")
+        self._task_meta_label.setWordWrap(True)
+        title_box.addWidget(self._task_title_label)
+        title_box.addWidget(self._task_meta_label)
+        layout.addLayout(title_box)
+
+        actions = QHBoxLayout()
+        back_button = QPushButton("返回任务列表")
+        back_button.clicked.connect(self._show_start_page)
+        config_button = QPushButton("任务配置")
+        config_button.clicked.connect(self._edit_task_configuration)
+        export_button = QPushButton("导出")
+        export_button.clicked.connect(self._export_default)
+        choose_export_button = QPushButton("导出到...")
+        choose_export_button.clicked.connect(self._export_choose_dir)
+        delete_button = QPushButton("删除任务")
+        delete_button.clicked.connect(self._delete_current_task)
+        start_button = QPushButton("开始检查")
+        start_button.clicked.connect(self._start_review_flow)
+        actions.addWidget(back_button)
+        actions.addWidget(config_button)
+        actions.addWidget(export_button)
+        actions.addWidget(choose_export_button)
+        actions.addWidget(delete_button)
+        actions.addStretch(1)
+        actions.addWidget(start_button)
+        layout.addLayout(actions)
+
+        self._task_data_table = QTableWidget(0, 0)
+        self._task_data_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self._task_data_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self._task_data_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self._task_data_table.setAlternatingRowColors(True)
+        layout.addWidget(self._task_data_table, stretch=1)
+        return page
+
+    def _summary_row(self, title: str, value_widget: QLabel) -> QWidget:
+        row_widget = QWidget()
+        row = QHBoxLayout(row_widget)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.addWidget(QLabel(f"{title}:"))
+        row.addWidget(value_widget, stretch=1)
+        return row_widget
+
+    def _create_task(self) -> None:
+        last_source_path, last_snapshot = self.app_service.load_last_task_creation_defaults()
+        dialog = TaskCreationDialog(
+            browser_configs=self.app_service.list_browser_configs(),
+            app_service=self.app_service,
+            source_path=last_source_path,
+            initial_snapshot=last_snapshot,
+            parent=self,
+        )
+        if dialog.exec() != int(QDialog.DialogCode.Accepted):
+            return
+        if dialog.source_path is None or dialog.task_snapshot is None:
+            return
+        try:
+            task_id = self.app_service.create_task(
+                source_path=dialog.source_path,
+                task_snapshot=dialog.task_snapshot,
+            )
+        except (OSError, ValueError) as exc:
+            QMessageBox.critical(self, "创建任务失败", str(exc))
+            return
+        self._load_task(task_id)
+        self.statusBar().showMessage(f"任务已创建：#{task_id}", 4000)
+
+    def _show_browser_configs(self) -> None:
+        dialog = ConfigManagerDialog(
+            browser_configs=self.app_service.list_browser_configs(),
+            browser_test_callback=self._test_browser_config,
+            parent=self,
+        )
+        if dialog.exec() != int(QDialog.DialogCode.Accepted):
+            return
+        existing_ids = {config.config_id for config in self.app_service.list_browser_configs()}
+        new_ids = {config.config_id for config in dialog.browser_configs}
+        for removed_id in existing_ids - new_ids:
+            self.app_service.delete_browser_config(removed_id)
+        for config in dialog.browser_configs:
+            self.app_service.save_browser_config(config)
+        self.statusBar().showMessage("浏览器配置已保存。", 4000)
+
+    def _edit_task_configuration(self) -> None:
+        if not self.task:
+            return
+        dialog = TaskCreationDialog(
+            browser_configs=self.app_service.list_browser_configs(),
+            app_service=self.app_service,
+            source_path=self.task.source_file_path,
+            initial_snapshot=self.task.task_snapshot,
+            dialog_title="任务配置",
+            accept_button_text="保存",
+            source_editable=False,
+            parent=self,
+        )
+        if dialog.exec() != int(QDialog.DialogCode.Accepted):
+            return
+        if dialog.task_snapshot is None:
+            return
+
+        reimport_required = self._task_source_structure_changed(
+            self.task.task_snapshot,
+            dialog.task_snapshot,
+        )
+        reset_reviews_required = (
+            self.task.task_snapshot.review_fields != dialog.task_snapshot.review_fields
+        )
+        if reimport_required or reset_reviews_required:
+            message_lines = ["保存后将重置当前任务中的已保存检查结果。"]
+            if reimport_required:
+                message_lines.append("由于修改了 Sheet 或标题行，任务数据将按新配置重新导入。")
+            else:
+                message_lines.append("由于修改了检查项，已有结果将被清空。")
+            result = QMessageBox.question(
+                self,
+                "确认保存任务配置",
+                "\n".join(message_lines) + "\n\n是否继续？",
+            )
+            if result != QMessageBox.StandardButton.Yes:
+                return
+
+        try:
+            self.task = self.app_service.update_task_configuration(
+                task_id=self.task.task_id,
+                task_snapshot=dialog.task_snapshot,
+            )
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, "任务配置无效", str(exc))
+            return
+        self._editing_task_index = None
+        self._refresh_task_page()
+        self.statusBar().showMessage("任务配置已保存。", 4000)
+
+    def _load_task(self, task_id: int) -> None:
+        try:
+            self.task = self.app_service.load_task(task_id)
+        except (ValueError, OSError) as exc:
+            QMessageBox.critical(self, "任务错误", str(exc))
+            return
+        self._editing_task_index = None
+        self._show_task_page()
+
+    def _show_start_page(self) -> None:
+        self.task = None
+        self._editing_task_index = None
+        self._toolbar.show()
+        self._stack.setCurrentWidget(self._start_page)
+        self._refresh_start_page()
+
+    def _show_task_page(self) -> None:
+        self.task = self.app_service.load_task(self.task.task_id) if self.task else None
+        self._toolbar.hide()
+        self._stack.setCurrentWidget(self._task_page)
+        self._refresh_task_page()
+
+    def _refresh_start_page(self) -> None:
+        summaries = self.app_service.list_tasks()
+        self._task_table_ids = [summary.task_id for summary in summaries]
+        self._task_table.clearSelection()
+        self._task_table.setRowCount(len(summaries))
+        for row, summary in enumerate(summaries):
+            values = [
+                str(summary.task_id),
+                summary.name,
+                f"{summary.completed_items}/{summary.total_items}",
+                summary.status,
+                summary.source_file_name,
+                summary.updated_at,
+            ]
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                if column in (0, 2, 3):
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                self._task_table.setItem(row, column, item)
+        self._update_start_page_actions()
+
+    def _open_selected_task_from_table(self, *_args: object) -> None:
+        task_id = self._selected_task_id()
+        if task_id is None:
+            return
+        self._load_task(task_id)
+
+    def _delete_selected_task_from_table(self) -> None:
+        task_id = self._selected_task_id()
+        if task_id is None:
+            return
+        result = QMessageBox.question(
+            self,
+            "确认删除任务",
+            f"将删除任务 #{task_id} 及其所有检查结果，是否继续？",
+        )
+        if result != QMessageBox.StandardButton.Yes:
+            return
+        self.app_service.delete_task(task_id)
+        self._refresh_start_page()
+
+    def _delete_current_task(self) -> None:
+        if not self.task:
+            return
+        result = QMessageBox.question(
+            self,
+            "确认删除任务",
+            f"将删除任务 #{self.task.task_id} 及其所有检查结果，是否继续？",
+        )
+        if result != QMessageBox.StandardButton.Yes:
+            return
+        task_id = self.task.task_id
+        self.app_service.delete_task(task_id)
+        self._show_start_page()
+
+    def _selected_task_id(self) -> int | None:
+        selected_ranges = self._task_table.selectedRanges()
+        if not selected_ranges:
+            return None
+        row = selected_ranges[0].topRow()
+        if row < 0 or row >= len(self._task_table_ids):
+            return None
+        return self._task_table_ids[row]
+
+    def _update_start_page_actions(self) -> None:
+        if not hasattr(self, "_task_table"):
+            self._open_task_button.setEnabled(False)
+            self._delete_task_button.setEnabled(False)
+            return
+        has_selection = self._selected_task_id() is not None
+        self._open_task_button.setEnabled(has_selection)
+        self._delete_task_button.setEnabled(has_selection)
+
+    def _refresh_task_page(self) -> None:
+        if not self.task:
+            return
+        self.task = self.app_service.load_task(self.task.task_id)
+        self._task_title_label.setText(self.task.name)
+        self._task_meta_label.setText(
+            "  ·  ".join(
+                [
+                    self._format_task_created_at(self.task.created_at),
+                    f"已完成 {self.task.completed_items}/{self.task.total_items}",
+                    f"状态 {self.task.status}",
+                ]
+            )
+        )
+        self._refresh_task_data_table()
+
+    def _start_review_flow(self) -> None:
+        if not self.task:
+            return
+        if self._review_window is not None and self._review_window.isVisible():
+            self._review_window.activateWindow()
+            self._review_window.raise_()
+            return
+        self.task = self.app_service.mark_task_in_progress(self.task.task_id)
+        confirm_url = self._resolve_confirmation_url()
+        if not confirm_url:
+            QMessageBox.warning(self, "无法开始", "没有可用于浏览器确认的 URL。")
+            return
+        request = BrowserLaunchRequest(
+            browser_config_id=self.task.browser_config.config_id,
+            browser_name="configured",
+            executable_path=self.task.browser_config.executable_path or None,
+            launch_args=self.task.browser_config.launch_args,
+        )
+        self.browser.launch(request)
+        self.browser.ensure_running()
+        status = self.browser.status()
+        if not status.running:
+            QMessageBox.warning(self, "浏览器启动失败", status.message)
+            return
+        self.browser.open_confirmation_page(confirm_url)
+        result = QMessageBox.question(
+            self,
+            "确认开始检查",
+            "请确认网页已正常打开，并完成登录或验证码等准备。\n\n是否开始检查？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Yes,
+        )
+        if result != QMessageBox.StandardButton.Yes:
+            self.browser.shutdown()
+            self.statusBar().showMessage("已取消开始检查。", 3000)
+            return
+        self._enter_review_mode()
+
+    def _enter_review_mode(self) -> None:
+        if not self.task:
+            return
+        self.task = self.app_service.load_task(self.task.task_id)
+        if self.task.current_item is None:
+            QMessageBox.information(self, "无任务", "当前没有可检查的条目。")
+            return
+        self.browser.close_confirmation_page()
+        self._sync_browser_buffer()
+        self._review_window = ReviewWindow(
+            task_id=self.task.task_id,
+            app_service=self.app_service,
+            browser=self.browser,
+            on_close=self._handle_review_window_closed,
+        )
+        self._review_window.show()
+
+    def _handle_review_window_closed(self) -> None:
+        self._review_window = None
+        if self.task is not None:
+            self.task = self.app_service.load_task(self.task.task_id)
+            self._refresh_task_page()
+
+    def _refresh_task_data_table(self) -> None:
+        if not self.task:
+            return
+        export_fields = self.task.task_snapshot.export_fields
+        items = self.app_service.list_all_items(self.task.task_id)
+        reviews = self.app_service.list_reviews(self.task.task_id)
+        self._task_data_table.clear()
+        self._task_data_table.setColumnCount(len(export_fields))
+        self._task_data_table.setHorizontalHeaderLabels(export_fields)
+        self._task_data_table.setRowCount(len(items))
+        self._task_data_table.setVerticalHeaderLabels([str(item.task_index) for item in items])
+
+        header = self._task_data_table.horizontalHeader()
+        for column in range(len(export_fields)):
+            header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
+        if export_fields:
+            header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+
+        palette = self.palette()
+        completed_background = palette.alternateBase().color()
+        current_background = QColor("#1d4ed8" if self.is_dark_mode() else "#dbeafe")
+        current_foreground = QColor("#ffffff") if self.is_dark_mode() else palette.text().color()
+
+        for row, item in enumerate(items):
+            review = reviews.get(item.task_item_id)
+            is_current = item.task_index == self.task.current_task_index
+            is_completed = review is not None
+            for column, field_name in enumerate(export_fields):
+                value = self._resolve_table_value(
+                    field_name,
+                    item.task_data,
+                    review.review_data if review else {},
+                )
+                if isinstance(value, list):
+                    display_value = ", ".join(str(part) for part in value)
+                elif value in ("", None):
+                    display_value = ""
+                else:
+                    display_value = str(value)
+                table_item = QTableWidgetItem(display_value)
+                if is_current:
+                    table_item.setBackground(current_background)
+                    table_item.setForeground(current_foreground)
+                elif is_completed:
+                    table_item.setBackground(completed_background)
+                self._task_data_table.setItem(row, column, table_item)
+
+        current_row = min(max(self.task.current_task_index - 1, 0), max(len(items) - 1, 0))
+        if 0 <= current_row < self._task_data_table.rowCount():
+            self._task_data_table.setCurrentCell(current_row, 0)
+
+    def _resolve_table_value(
+        self,
+        field_name: str,
+        task_data: dict[str, object],
+        review_data: dict[str, object],
+    ) -> object:
+        if field_name in review_data:
+            return review_data[field_name]
+        if field_name in task_data:
+            return task_data[field_name]
+        return ""
+
+    def is_dark_mode(self) -> bool:
+        return self.palette().window().color().lightness() < 128
+
+    def _task_source_structure_changed(
+        self,
+        previous: TaskSnapshot,
+        current: TaskSnapshot,
+    ) -> bool:
+        return (
+            previous.sheet_name != current.sheet_name or previous.header_row != current.header_row
+        )
+
+    def _format_task_created_at(self, value: str) -> str:
+        try:
+            created_at = datetime.fromisoformat(value)
+        except ValueError:
+            return value
+        if created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=UTC)
+        return created_at.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+
+    def _resolve_confirmation_url(self) -> str | None:
+        if not self.task:
+            return None
+        if self.task.task_snapshot.confirm_url:
+            return self.task.task_snapshot.confirm_url
+        first_item = self.app_service.load_item_at(task_id=self.task.task_id, task_index=1)
+        if first_item:
+            value = first_item.task_data.get(self.task.task_snapshot.url_field)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return None
+
+    def _sync_browser_buffer(self) -> None:
+        if not self.task:
+            return
+        items = self.app_service.list_buffer_items(self.task)
+        self.browser.sync_buffer(
+            tasks=items,
+            url_field=self.task.task_snapshot.url_field,
+            current_task_index=self.task.current_task_index,
+        )
+
+    def _export_default(self) -> None:
+        if not self.task:
+            return
+        export_path = self.app_service.export_task(task_id=self.task.task_id)
+        self.statusBar().showMessage(f"已导出到 {export_path}", 6000)
+
+    def _export_choose_dir(self) -> None:
+        if not self.task:
+            return
+        selected = QFileDialog.getExistingDirectory(self, "选择导出目录", str(Path.cwd()))
+        if not selected:
+            return
+        export_path = self.app_service.export_task(
+            task_id=self.task.task_id,
+            destination_dir=Path(selected),
+        )
+        self.statusBar().showMessage(f"已导出到 {export_path}", 6000)
+
+    def closeEvent(self, event) -> None:
+        if self._review_window is not None:
+            self._review_window.close()
+        self.browser.shutdown()
+        super().closeEvent(event)
+
+    def _test_browser_config(self, config: BrowserConfig) -> tuple[bool, str]:
+        request = BrowserLaunchRequest(
+            browser_config_id=config.config_id,
+            browser_name="configured",
+            executable_path=config.executable_path or None,
+            launch_args=config.launch_args,
+        )
+        self.browser.launch(request)
+        self.browser.ensure_running()
+        status = self.browser.status()
+        if not status.running:
+            config.last_test_status = "failed"
+            return False, status.message
+        test_url = config.test_url or "about:blank"
+        self.browser.open_confirmation_page(test_url)
+        config.last_test_status = "passed"
+        config.last_tested_at = datetime.now(UTC).isoformat()
+        self.browser.shutdown()
+        return True, f"启动成功：{test_url}"
