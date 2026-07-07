@@ -7,6 +7,19 @@ from pathlib import Path
 APP_DIR_NAME = "LinkGlancer"
 
 
+def application_root() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parents[3]
+
+
+def bundled_asset_path(*relative_parts: str) -> Path:
+    base_path = getattr(sys, "_MEIPASS", None)
+    if base_path:
+        return Path(base_path).resolve().joinpath(*relative_parts)
+    return application_root().joinpath(*relative_parts)
+
+
 def ensure_app_data_root() -> Path:
     if sys.platform == "darwin":
         root = Path.home() / "Library" / "Application Support" / APP_DIR_NAME

@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QColor, QPalette
+from PySide6.QtGui import QColor, QIcon, QPalette
 from PySide6.QtWidgets import QApplication, QMessageBox, QStyleFactory
 
+from link_glancer.runtime.paths import bundled_asset_path
 from link_glancer.ui.fonts import apply_application_font
 from link_glancer.ui.main_window import MainWindow
 
@@ -15,6 +16,9 @@ def create_application() -> QApplication:
     app = QApplication([])
     app.setApplicationName("Link Glancer")
     app.setOrganizationName("Link Glancer")
+    icon_path = bundled_asset_path("icon.svg")
+    if icon_path.exists():
+        app.setWindowIcon(QIcon(str(icon_path)))
     app.setStyle(QStyleFactory.create("Fusion"))
     apply_application_font(app)
     _apply_color_scheme(app)

@@ -22,7 +22,7 @@ from PySide6.QtWidgets import (
 )
 
 from link_glancer.application import TaskApplicationService
-from link_glancer.browser.base import BrowserController
+from link_glancer.browser.base import BrowserController, BufferBlock
 from link_glancer.tasks.models import TaskDetail, TaskSnapshot
 from link_glancer.ui.review_form import ReviewFieldWidget, create_field_widget
 
@@ -99,6 +99,7 @@ class ReviewWindow(QMainWindow):
         self._dynamic_shortcuts: list[QShortcut] = []
         self._review_started_at = datetime.now(UTC)
         self._review_started_completed = self.task.completed_items
+        self._handling_browser_block = False
 
         self.setWindowTitle("检查")
         self.resize(660, 660)
@@ -322,7 +323,8 @@ class ReviewWindow(QMainWindow):
             advance_pointer=True,
         )
         self._clear_review_form()
-        self._sync_browser_buffer()
+        if not self._sync_browser_buffer():
+            return
         self._refresh_view()
 
     def _go_to_previous(self) -> None:
@@ -340,7 +342,8 @@ class ReviewWindow(QMainWindow):
             task_index=target_index,
         )
         self._populate_review_form(review.review_data)
-        self._sync_browser_buffer()
+        if not self._sync_browser_buffer():
+            return
         self._refresh_view()
 
     def _has_previous_review(self) -> bool:
@@ -352,13 +355,52 @@ class ReviewWindow(QMainWindow):
             is not None
         )
 
-    def _sync_browser_buffer(self) -> None:
+    def _sync_browser_buffer(self) -> bool:
         items = self._app_service.list_buffer_items(self.task)
         self._browser.sync_buffer(
             tasks=items,
             url_field=self.task.task_snapshot.url_field,
             current_task_index=self.task.current_task_index,
         )
+        return self._handle_browser_buffer_block()
+
+    def _handle_browser_buffer_block(self) -> bool:
+        block = self._browser.buffer_block()
+        if block is None or self._handling_browser_block:
+            return True
+        self._handling_browser_block = True
+        try:
+            while block is not None:
+                result = QMessageBox.question(
+                    self,
+                    "页面处理",
+                    self._format_browser_block_message(block),
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                    QMessageBox.StandardButton.Yes,
+                )
+                if result != QMessageBox.StandardButton.Yes:
+                    return False
+                self._browser.resume_buffer()
+                items = self._app_service.list_buffer_items(self.task)
+                self._browser.sync_buffer(
+                    tasks=items,
+                    url_field=self.task.task_snapshot.url_field,
+                    current_task_index=self.task.current_task_index,
+                )
+                block = self._browser.buffer_block()
+            return True
+        finally:
+            self._handling_browser_block = False
+
+    def _format_browser_block_message(self, block: BufferBlock) -> str:
+        lines = [block.message]
+        if block.task_index is not None:
+            lines.append(f"条目序号：{block.task_index}")
+        if block.url:
+            lines.append(f"URL：{block.url}")
+        lines.append("")
+        lines.append("请在浏览器中处理后点击“继续”。")
+        return "\n".join(lines)
 
     def _edit_public_shortcuts(self) -> None:
         dialog = ShortcutConfigDialog(self.task, self)

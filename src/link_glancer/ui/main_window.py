@@ -27,7 +27,7 @@ from PySide6.QtWidgets import (
 
 from creator_collector import CreatorCollectorDialog
 from link_glancer.application import TaskApplicationService
-from link_glancer.browser.base import BrowserController, BrowserLaunchRequest
+from link_glancer.browser.base import BrowserController, BrowserLaunchRequest, BufferBlock
 from link_glancer.browser.service import create_browser_controller
 from link_glancer.tasks.database import consume_database_reset_reason
 from link_glancer.tasks.models import BrowserConfig, TaskDetail, TaskSnapshot
@@ -46,6 +46,7 @@ class MainWindow(QMainWindow):
         self._editing_task_index: int | None = None
         self._review_window: ReviewWindow | None = None
         self._confirmation_task_id: int | None = None
+        self._handling_browser_block = False
 
         self.setWindowTitle("Link Glancer")
         self.resize(1120, 720)
@@ -482,7 +483,8 @@ class MainWindow(QMainWindow):
             return
         self.browser.close_confirmation_page()
         self._confirmation_task_id = None
-        self._sync_browser_buffer()
+        if not self._sync_browser_buffer():
+            return
         self._review_window = ReviewWindow(
             task_id=self.task.task_id,
             app_service=self.app_service,
@@ -609,15 +611,56 @@ class MainWindow(QMainWindow):
                 return True
         return False
 
-    def _sync_browser_buffer(self) -> None:
+    def _sync_browser_buffer(self) -> bool:
         if not self.task:
-            return
+            return True
         items = self.app_service.list_buffer_items(self.task)
         self.browser.sync_buffer(
             tasks=items,
             url_field=self.task.task_snapshot.url_field,
             current_task_index=self.task.current_task_index,
         )
+        return self._handle_browser_buffer_block()
+
+    def _handle_browser_buffer_block(self) -> bool:
+        block = self.browser.buffer_block()
+        if block is None or self._handling_browser_block:
+            return True
+        self._handling_browser_block = True
+        try:
+            while block is not None:
+                result = QMessageBox.question(
+                    self,
+                    "页面处理",
+                    self._format_browser_block_message(block),
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                    QMessageBox.StandardButton.Yes,
+                )
+                if result != QMessageBox.StandardButton.Yes:
+                    return False
+                self.browser.resume_buffer()
+                if self.task is None:
+                    return False
+                items = self.app_service.list_buffer_items(self.task)
+                self.browser.sync_buffer(
+                    tasks=items,
+                    url_field=self.task.task_snapshot.url_field,
+                    current_task_index=self.task.current_task_index,
+                )
+                block = self.browser.buffer_block()
+            return True
+        finally:
+            self._handling_browser_block = False
+
+    def _format_browser_block_message(self, block: BufferBlock) -> str:
+        lines = [block.message]
+        if block.task_index is not None:
+            lines.append(f"条目序号：{block.task_index}")
+        if block.url:
+            lines.append(f"URL：{block.url}")
+        lines.append("")
+        lines.append("请在浏览器中处理后点击“继续”。")
+        return "\n".join(lines)
 
     def _export_default(self) -> None:
         if not self.task:

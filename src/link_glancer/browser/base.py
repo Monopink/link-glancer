@@ -23,6 +23,14 @@ class BrowserStatus:
     message: str
 
 
+@dataclass(slots=True)
+class BufferBlock:
+    reason: str
+    message: str
+    task_index: int | None = None
+    url: str | None = None
+
+
 class BrowserController(Protocol):
     def launch(self, request: BrowserLaunchRequest) -> None: ...
 
@@ -35,6 +43,10 @@ class BrowserController(Protocol):
     def sync_buffer(
         self, tasks: list[TaskItem], url_field: str, current_task_index: int
     ) -> None: ...
+
+    def buffer_block(self) -> BufferBlock | None: ...
+
+    def resume_buffer(self) -> None: ...
 
     def status(self) -> BrowserStatus: ...
 
