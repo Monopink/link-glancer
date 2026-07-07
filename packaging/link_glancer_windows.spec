@@ -8,7 +8,7 @@ a = Analysis(
     ["../src/link_glancer/main.py"],
     pathex=[".."],
     binaries=[],
-    datas=[],
+    datas=[("../icon.svg", ".")],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
@@ -34,6 +34,7 @@ exe = EXE(
     upx=False,
     console=False,
     disable_windowed_traceback=False,
+    icon="../packaging/icon.ico",
 )
 
 coll = COLLECT(

@@ -11,6 +11,7 @@ if (-not (Test-Path ".venv\Scripts\python.exe")) {
 & .venv\Scripts\python.exe -m playwright install
 & .venv\Scripts\python.exe -m ruff check .
 & .venv\Scripts\python.exe -m compileall -q src
+& .venv\Scripts\python.exe scripts/generate_windows_icon.py
 
 if (Test-Path build) {
     Remove-Item -LiteralPath build -Recurse -Force
