@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from copy import deepcopy
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QKeySequence, QShortcut
@@ -123,13 +123,13 @@ class ReviewWindow(QMainWindow):
 
         top_row = QHBoxLayout()
         self._progress_label = QLabel("0 / 0")
-        self._elapsed_label = QLabel("-")
-        self._eta_label = QLabel("-")
+        self._completion_label = QLabel("-")
+        self._remaining_label = QLabel("-")
         self._progress_bar = QProgressBar()
         self._progress_bar.setTextVisible(True)
         top_row.addWidget(self._summary("进度", self._progress_label))
-        top_row.addWidget(self._summary("已用时", self._elapsed_label))
-        top_row.addWidget(self._summary("预计剩余", self._eta_label))
+        top_row.addWidget(self._summary("完成", self._completion_label))
+        top_row.addWidget(self._summary("剩余", self._remaining_label))
         layout.addLayout(top_row)
         layout.addWidget(self._progress_bar)
 
@@ -257,9 +257,9 @@ class ReviewWindow(QMainWindow):
         self._sync_form_with_current_item()
 
     def _refresh_time_labels(self) -> None:
-        elapsed_seconds, eta_seconds = self._review_time_metrics()
-        self._elapsed_label.setText(self._format_duration(elapsed_seconds))
-        self._eta_label.setText(
+        eta_seconds = self._review_time_metrics()
+        self._completion_label.setText(self._format_completion_time(eta_seconds))
+        self._remaining_label.setText(
             self._format_duration(eta_seconds) if eta_seconds is not None else "计算中"
         )
 
@@ -273,14 +273,20 @@ class ReviewWindow(QMainWindow):
                 details.append(f"{field_name}：{item.task_data[field_name]}")
         return "\n".join(details) if details else "当前条目没有可展示字段。"
 
-    def _review_time_metrics(self) -> tuple[int, int | None]:
+    def _review_time_metrics(self) -> int | None:
         elapsed = max(int((datetime.now(UTC) - self._review_started_at).total_seconds()), 0)
         completed_in_session = self.task.completed_items - self._review_started_completed
         remaining = max(self.task.total_items - self.task.completed_items, 0)
         if completed_in_session <= 0:
-            return elapsed, None
+            return None
         eta = int(elapsed / completed_in_session * remaining)
-        return elapsed, eta
+        return eta
+
+    def _format_completion_time(self, remaining_seconds: int | None) -> str:
+        if remaining_seconds is None:
+            return "计算中"
+        estimated_at = datetime.now().astimezone() + timedelta(seconds=remaining_seconds)
+        return estimated_at.strftime("%H:%M")
 
     def _format_duration(self, total_seconds: int) -> str:
         hours, remainder = divmod(max(total_seconds, 0), 3600)

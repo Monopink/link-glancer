@@ -37,14 +37,6 @@ def create_application() -> QApplication:
             spacing: 8px;
             padding: 6px 8px;
         }
-        QPushButton[primary="true"] {
-            font-weight: 600;
-        }
-        QPushButton:disabled {
-            color: palette(mid);
-            background: palette(window);
-            border: 1px solid palette(mid);
-        }
         QHeaderView::section {
             border: 0;
             border-bottom: 1px solid palette(mid);
@@ -88,6 +80,7 @@ def create_application() -> QApplication:
 
 def _apply_color_scheme(app: QApplication) -> None:
     if app.styleHints().colorScheme() != Qt.ColorScheme.Dark:
+        _apply_disabled_button_text_palette(app, app.palette().color(QPalette.ColorRole.Mid))
         return
 
     palette = QPalette()
@@ -105,4 +98,11 @@ def _apply_color_scheme(app: QApplication) -> None:
     palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#ffffff"))
     palette.setColor(QPalette.ColorRole.PlaceholderText, QColor("#98a2b3"))
     palette.setColor(QPalette.ColorRole.Mid, QColor("#3a4048"))
+    app.setPalette(palette)
+    _apply_disabled_button_text_palette(app, QColor("#8e97a5"))
+
+
+def _apply_disabled_button_text_palette(app: QApplication, color: QColor) -> None:
+    palette = app.palette()
+    palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.ButtonText, color)
     app.setPalette(palette)

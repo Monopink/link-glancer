@@ -237,19 +237,16 @@ class CreatorCollectorProgressDialog(QDialog):
         hint_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
         root.addWidget(hint_label)
 
-        self._pause_button = _create_action_button("暂停自动滚动")
-        self._resume_button = _create_action_button("继续自动滚动")
+        self._auto_scroll_button = _create_action_button("暂停自动滚动")
         self._stop_button = _create_action_button("结束")
         self._save_create_button = _create_action_button("保存并创建任务")
-        self._pause_button.clicked.connect(self._pause_auto_scroll)
-        self._resume_button.clicked.connect(self._resume_auto_scroll)
+        self._auto_scroll_button.clicked.connect(self._toggle_auto_scroll)
         self._stop_button.clicked.connect(self._stop_collection)
         self._save_create_button.clicked.connect(self._save_and_create_task)
         actions = QHBoxLayout()
         actions.setContentsMargins(0, 0, 0, 0)
         actions.setSpacing(12)
-        actions.addWidget(self._pause_button)
-        actions.addWidget(self._resume_button)
+        actions.addWidget(self._auto_scroll_button)
         actions.addWidget(self._stop_button)
         actions.addStretch(1)
         actions.addWidget(self._save_create_button)
@@ -289,11 +286,10 @@ class CreatorCollectorProgressDialog(QDialog):
         self._elapsed_label.setText(f"时长 {self._format_elapsed(status.started_at)}")
         self._eta_label.setText(f"预计结束 {self._format_eta(status.estimated_end_at)}")
         self._status_label.setText(f"状态：{status.last_message}")
-        self._pause_button.setEnabled(
-            status.running and status.auto_scroll_enabled and not status.completed
-        )
-        self._resume_button.setEnabled(
-            status.running and not status.auto_scroll_enabled and not status.completed
+        auto_scroll_active = status.running and not status.completed
+        self._auto_scroll_button.setEnabled(auto_scroll_active)
+        self._auto_scroll_button.setText(
+            "暂停自动滚动" if status.auto_scroll_enabled else "继续自动滚动"
         )
         self._stop_button.setEnabled(status.running)
         has_rows = status.collected_count > 0
@@ -311,12 +307,12 @@ class CreatorCollectorProgressDialog(QDialog):
         self.last_auto_advance_interval_seconds = value
         self._refresh_status()
 
-    def _pause_auto_scroll(self) -> None:
-        self._session.pause_auto_scroll()
-        self._refresh_status()
-
-    def _resume_auto_scroll(self) -> None:
-        self._session.resume_auto_scroll()
+    def _toggle_auto_scroll(self) -> None:
+        status = self._session.status()
+        if status.auto_scroll_enabled:
+            self._session.pause_auto_scroll()
+        else:
+            self._session.resume_auto_scroll()
         self._refresh_status()
 
     def _stop_collection(self) -> None:
