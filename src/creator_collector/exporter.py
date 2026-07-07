@@ -47,6 +47,26 @@ def export_collection_to_xlsx(rows: list[dict[str, object]], output_dir: Path) -
     return export_path
 
 
+def export_collection_to_path(rows: list[dict[str, object]], export_path: Path) -> Path:
+    export_path.parent.mkdir(parents=True, exist_ok=True)
+    rows = dedupe_creator_rows(rows)
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Creators"
+
+    for column, header in enumerate(EXPORT_HEADERS, start=1):
+        sheet.cell(row=1, column=column, value=header)
+
+    for row_index, source_row in enumerate(rows, start=2):
+        flattened = flatten_creator_row(source_row)
+        for column, header in enumerate(EXPORT_HEADERS, start=1):
+            sheet.cell(row=row_index, column=column, value=flattened.get(header, ""))
+
+    workbook.save(export_path)
+    workbook.close()
+    return export_path
+
+
 def save_backup_json(rows: list[dict[str, object]], backup_path: Path) -> Path:
     backup_path.parent.mkdir(parents=True, exist_ok=True)
     backup_path.write_text(

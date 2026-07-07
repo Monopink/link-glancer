@@ -10,16 +10,19 @@ class CreatorCollectionConfig:
     browser_config_id: str
     page_url: str
     safety_limit: int = 1000
+    auto_advance_interval_seconds: float = 1.5
 
 
 @dataclass(slots=True)
 class CreatorCollectionStatus:
     running: bool
-    paused: bool
+    auto_scroll_enabled: bool
+    interrupted: bool
     completed: bool
     collected_count: int
     pages_fetched: int
     safety_limit: int
+    auto_advance_interval_seconds: float
     last_message: str
     rows: list[dict[str, object]]
     started_at: datetime | None = None

@@ -37,6 +37,9 @@ def create_application() -> QApplication:
             spacing: 8px;
             padding: 6px 8px;
         }
+        QPushButton[primary="true"] {
+            font-weight: 600;
+        }
         QPushButton:disabled {
             color: palette(mid);
             background: palette(window);

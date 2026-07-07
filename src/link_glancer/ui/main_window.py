@@ -427,6 +427,13 @@ class MainWindow(QMainWindow):
                 "当前任务已完成。如需复核，请先跳转到目标条目。",
             )
             return
+        if not self._has_usable_buffer_urls():
+            QMessageBox.warning(
+                self,
+                "无法开始",
+                "当前检查缓冲区没有可用的 URL。\n请确认采集结果中包含有效的 url 列。",
+            )
+            return
         confirm_url = self._resolve_confirmation_url()
         if not confirm_url:
             QMessageBox.warning(self, "无法开始", "没有可用于浏览器确认的 URL。")
@@ -581,12 +588,26 @@ class MainWindow(QMainWindow):
             return None
         if self.task.task_snapshot.confirm_url:
             return self.task.task_snapshot.confirm_url
-        first_item = self.app_service.load_item_at(task_id=self.task.task_id, task_index=1)
-        if first_item:
-            value = first_item.task_data.get(self.task.task_snapshot.url_field)
+        candidate_indexes = [self.task.current_task_index, 1]
+        for task_index in candidate_indexes:
+            item = self.app_service.load_item_at(task_id=self.task.task_id, task_index=task_index)
+            if item is None:
+                continue
+            value = item.task_data.get(self.task.task_snapshot.url_field)
             if isinstance(value, str) and value.strip():
                 return value.strip()
         return None
+
+    def _has_usable_buffer_urls(self) -> bool:
+        if not self.task:
+            return False
+        items = self.app_service.list_buffer_items(self.task)
+        url_field = self.task.task_snapshot.url_field
+        for item in items:
+            value = item.task_data.get(url_field)
+            if isinstance(value, str) and value.strip():
+                return True
+        return False
 
     def _sync_browser_buffer(self) -> None:
         if not self.task:
