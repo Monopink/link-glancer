@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from pathlib import Path
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from creator_collector import CreatorCollectorDialog
 from link_glancer.application import TaskApplicationService
 from link_glancer.browser.base import BrowserController, BrowserLaunchRequest
 from link_glancer.browser.service import create_browser_controller
@@ -54,7 +55,7 @@ class MainWindow(QMainWindow):
         self._build_pages()
         self.setStatusBar(QStatusBar(self))
         self._show_start_page()
-        self._show_database_reset_notice()
+        QTimer.singleShot(0, self._show_database_reset_notice)
 
     def _show_database_reset_notice(self) -> None:
         reason = consume_database_reset_reason()
@@ -76,6 +77,10 @@ class MainWindow(QMainWindow):
         new_task = QPushButton("新建任务")
         new_task.clicked.connect(self._create_task)
         self._toolbar.addWidget(new_task)
+
+        new_collection_task = QPushButton("新建采集任务")
+        new_collection_task.clicked.connect(self._create_collection_task)
+        self._toolbar.addWidget(new_collection_task)
 
         browser_configs = QPushButton("浏览器配置")
         browser_configs.clicked.connect(self._show_browser_configs)
@@ -225,17 +230,26 @@ class MainWindow(QMainWindow):
         dialog = ConfigManagerDialog(
             browser_configs=self.app_service.list_browser_configs(),
             browser_test_callback=self._test_browser_config,
+            save_browser_config_callback=self.app_service.save_browser_config,
+            save_browser_profile_callback=self.app_service.save_browser_profile,
+            delete_browser_config_callback=self.app_service.delete_browser_config,
+            delete_browser_profile_callback=self.app_service.delete_browser_profile,
+            parent=self,
+        )
+        dialog.exec()
+
+    def _create_collection_task(self) -> None:
+        dialog = CreatorCollectorDialog(
+            app_service=self.app_service,
+            browser_configs=self.app_service.list_browser_configs(),
             parent=self,
         )
         if dialog.exec() != int(QDialog.DialogCode.Accepted):
             return
-        existing_ids = {config.config_id for config in self.app_service.list_browser_configs()}
-        new_ids = {config.config_id for config in dialog.browser_configs}
-        for removed_id in existing_ids - new_ids:
-            self.app_service.delete_browser_config(removed_id)
-        for config in dialog.browser_configs:
-            self.app_service.save_browser_config(config)
-        self.statusBar().showMessage("浏览器配置已保存。", 4000)
+        if dialog.created_task_id is None:
+            return
+        self._load_task(dialog.created_task_id)
+        self.statusBar().showMessage(f"采集完成并创建任务：#{dialog.created_task_id}", 4000)
 
     def _edit_task_configuration(self) -> None:
         if not self.task:
@@ -422,7 +436,7 @@ class MainWindow(QMainWindow):
             self._review_window.raise_()
             return
         request = BrowserLaunchRequest(
-            browser_config_id=self.task.browser_config.config_id,
+            browser_config_id=self.task.browser_config.profile_id,
             browser_name="configured",
             executable_path=self.task.browser_config.executable_path or None,
             launch_args=self.task.browser_config.launch_args,
@@ -611,7 +625,7 @@ class MainWindow(QMainWindow):
 
     def _test_browser_config(self, config: BrowserConfig) -> tuple[bool, str]:
         request = BrowserLaunchRequest(
-            browser_config_id=config.config_id,
+            browser_config_id=config.profile_id,
             browser_name="configured",
             executable_path=config.executable_path or None,
             launch_args=config.launch_args,

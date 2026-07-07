@@ -32,9 +32,16 @@ class ReviewShortcutConfig:
 
 
 @dataclass(slots=True)
+class BrowserProfile:
+    profile_id: str
+    name: str
+
+
+@dataclass(slots=True)
 class BrowserConfig:
     config_id: str
     name: str
+    profile_id: str
     executable_path: str = ""
     launch_args: list[str] = field(default_factory=list)
     test_url: str = "about:blank"

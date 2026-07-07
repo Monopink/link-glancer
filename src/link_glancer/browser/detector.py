@@ -31,6 +31,23 @@ def browser_path_presets() -> dict[str, list[str]]:
     }
 
 
+def list_detected_browsers() -> list[BrowserCandidate]:
+    candidates: list[BrowserCandidate] = []
+    seen_paths: set[str] = set()
+    for browser_name, paths in (
+        ("thorium", _thorium_candidate_paths()),
+        ("chrome", _chrome_candidate_paths()),
+        ("edge", _edge_candidate_paths()),
+    ):
+        for path in _existing_paths(paths):
+            normalized_path = str(path)
+            if normalized_path in seen_paths:
+                continue
+            candidates.append(BrowserCandidate(browser_name, path, "chromium_executable"))
+            seen_paths.add(normalized_path)
+    return candidates
+
+
 def _detect_by_name(browser_name: str) -> BrowserCandidate | None:
     detectors = {
         "thorium": _detect_thorium,

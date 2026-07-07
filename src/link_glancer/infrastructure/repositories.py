@@ -6,6 +6,7 @@ from link_glancer.tasks import database
 from link_glancer.tasks.exporter import export_task_results
 from link_glancer.tasks.models import (
     BrowserConfig,
+    BrowserProfile,
     ReviewRecord,
     TaskDetail,
     TaskItem,
@@ -181,11 +182,20 @@ class BrowserConfigRepository:
     def list_browser_configs(self) -> list[BrowserConfig]:
         return database.list_browser_configs(self.database_path)
 
+    def list_browser_profiles(self) -> list[BrowserProfile]:
+        return database.list_browser_profiles(self.database_path)
+
     def load_browser_config(self, config_id: str) -> BrowserConfig:
         return database.load_browser_config(self.database_path, config_id)
 
     def save_browser_config(self, config: BrowserConfig) -> None:
         database.save_browser_config(self.database_path, config)
 
+    def save_browser_profile(self, profile: BrowserProfile) -> None:
+        database.save_browser_profile(self.database_path, profile)
+
     def delete_browser_config(self, config_id: str) -> None:
         database.delete_browser_config(self.database_path, config_id)
+
+    def delete_browser_profile(self, profile_id: str) -> None:
+        database.delete_browser_profile(self.database_path, profile_id)

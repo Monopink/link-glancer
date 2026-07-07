@@ -140,7 +140,7 @@ class TaskCreationDialog(QDialog):
         self._header_row_spin.valueChanged.connect(self._reload_headers)
         self._browser_combo = QComboBox()
         for config in self._browser_configs:
-            self._browser_combo.addItem(f"{config.name} ({config.config_id})", config.config_id)
+            self._browser_combo.addItem(config.name, config.config_id)
         self._open_tab_spin = QSpinBox()
         self._open_tab_spin.setRange(1, 10)
         self._open_tab_spin.setValue(3)

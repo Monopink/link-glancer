@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from link_glancer.tasks.models import (
     BrowserConfig,
+    BrowserProfile,
     ReviewField,
     ReviewOption,
     ReviewShortcutConfig,
@@ -56,6 +57,7 @@ def browser_config_to_dict(config: BrowserConfig) -> dict[str, object]:
     return {
         "id": config.config_id,
         "name": config.name,
+        "profile_id": config.profile_id,
         "executable_path": config.executable_path,
         "launch_args": config.launch_args,
         "test_url": config.test_url,
@@ -69,11 +71,23 @@ def browser_config_from_dict(data: dict[str, object]) -> BrowserConfig:
     return BrowserConfig(
         config_id=str(data["id"]),
         name=str(data["name"]),
+        profile_id=str(data.get("profile_id", "default-profile")),
         executable_path=str(data.get("executable_path", "")),
         launch_args=[str(item) for item in launch_args] if isinstance(launch_args, list) else [],
         test_url=str(data.get("test_url", "about:blank")),
         last_tested_at=str(data.get("last_tested_at") or "") or None,
         last_test_status=str(data.get("last_test_status", "untested")),
+    )
+
+
+def browser_profile_to_dict(profile: BrowserProfile) -> dict[str, object]:
+    return {"id": profile.profile_id, "name": profile.name}
+
+
+def browser_profile_from_dict(data: dict[str, object]) -> BrowserProfile:
+    return BrowserProfile(
+        profile_id=str(data["id"]),
+        name=str(data["name"]),
     )
 
 

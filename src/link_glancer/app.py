@@ -72,11 +72,13 @@ def create_application() -> QApplication:
 
     try:
         window = MainWindow()
-    except RuntimeError as exc:
+    except Exception as exc:
         QMessageBox.critical(None, "启动失败", str(exc))
         raise SystemExit(1) from exc
     app.main_window = window  # type: ignore[attr-defined]
     window.show()
+    window.raise_()
+    window.activateWindow()
 
     return app
 

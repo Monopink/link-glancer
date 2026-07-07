@@ -25,6 +25,12 @@ def ensure_browser_environments_root() -> Path:
     return root
 
 
+def ensure_creator_collector_dir() -> Path:
+    root = ensure_app_data_root() / "creator-collector"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
 def app_database_path() -> Path:
     return ensure_app_data_root() / "app.db"
 

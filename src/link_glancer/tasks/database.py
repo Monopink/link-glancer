@@ -6,9 +6,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from link_glancer.runtime.paths import app_database_path
-from link_glancer.tasks.defaults import default_browser_config
 from link_glancer.tasks.models import (
     BrowserConfig,
+    BrowserProfile,
     ReviewRecord,
     TaskDetail,
     TaskItem,
@@ -23,13 +23,20 @@ from link_glancer.tasks.serialization import (
     task_snapshot_to_dict,
 )
 
-CURRENT_SCHEMA_VERSION = 4
+CURRENT_SCHEMA_VERSION = 5
 _LAST_DATABASE_RESET_REASON: str | None = None
 
 _REQUIRED_SCHEMA_COLUMNS = {
+    "browser_profiles": {
+        "id",
+        "name",
+        "created_at",
+        "updated_at",
+    },
     "browser_configs": {
         "id",
         "name",
+        "profile_id",
         "executable_path",
         "launch_args_json",
         "test_url",
@@ -79,16 +86,25 @@ def ensure_app_database() -> Path:
     with sqlite3.connect(database_path) as connection:
         connection.executescript(
             """
+            CREATE TABLE IF NOT EXISTS browser_profiles (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS browser_configs (
                 id TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
+                profile_id TEXT NOT NULL,
                 executable_path TEXT NOT NULL,
                 launch_args_json TEXT NOT NULL,
                 test_url TEXT NOT NULL,
                 last_tested_at TEXT,
                 last_test_status TEXT NOT NULL,
                 created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(profile_id) REFERENCES browser_profiles(id)
             );
 
             CREATE TABLE IF NOT EXISTS tasks (
@@ -143,7 +159,6 @@ def ensure_app_database() -> Path:
             );
             """
         )
-        _seed_defaults(connection)
         _set_app_setting(connection, "schema_version", CURRENT_SCHEMA_VERSION)
     return database_path
 
@@ -583,7 +598,7 @@ def list_browser_configs(database_path: Path) -> list[BrowserConfig]:
         connection.row_factory = sqlite3.Row
         rows = connection.execute(
             """
-            SELECT id, name, executable_path, launch_args_json, test_url,
+            SELECT id, name, profile_id, executable_path, launch_args_json, test_url,
                    last_tested_at, last_test_status
             FROM browser_configs
             ORDER BY updated_at DESC, id
@@ -597,7 +612,7 @@ def load_browser_config(database_path: Path, config_id: str) -> BrowserConfig:
         connection.row_factory = sqlite3.Row
         row = connection.execute(
             """
-            SELECT id, name, executable_path, launch_args_json, test_url,
+            SELECT id, name, profile_id, executable_path, launch_args_json, test_url,
                    last_tested_at, last_test_status
             FROM browser_configs
             WHERE id = ?
@@ -615,12 +630,13 @@ def save_browser_config(database_path: Path, config: BrowserConfig) -> None:
         connection.execute(
             """
             INSERT INTO browser_configs (
-                id, name, executable_path, launch_args_json, test_url,
+                id, name, profile_id, executable_path, launch_args_json, test_url,
                 last_tested_at, last_test_status, created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 name = excluded.name,
+                profile_id = excluded.profile_id,
                 executable_path = excluded.executable_path,
                 launch_args_json = excluded.launch_args_json,
                 test_url = excluded.test_url,
@@ -631,6 +647,7 @@ def save_browser_config(database_path: Path, config: BrowserConfig) -> None:
             (
                 config.config_id,
                 config.name,
+                config.profile_id,
                 config.executable_path,
                 _json(config.launch_args),
                 config.test_url,
@@ -645,6 +662,45 @@ def save_browser_config(database_path: Path, config: BrowserConfig) -> None:
 def delete_browser_config(database_path: Path, config_id: str) -> None:
     with sqlite3.connect(database_path) as connection:
         connection.execute("DELETE FROM browser_configs WHERE id = ?", (config_id,))
+
+
+def list_browser_profiles(database_path: Path) -> list[BrowserProfile]:
+    with sqlite3.connect(database_path) as connection:
+        connection.row_factory = sqlite3.Row
+        rows = connection.execute(
+            """
+            SELECT id, name
+            FROM browser_profiles
+            ORDER BY updated_at DESC, id
+            """
+        ).fetchall()
+        return [
+            BrowserProfile(
+                profile_id=str(row["id"]),
+                name=str(row["name"]),
+            )
+            for row in rows
+        ]
+
+
+def save_browser_profile(database_path: Path, profile: BrowserProfile) -> None:
+    now = _now_iso()
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """
+            INSERT INTO browser_profiles (id, name, created_at, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                name = excluded.name,
+                updated_at = excluded.updated_at
+            """,
+            (profile.profile_id, profile.name, now, now),
+        )
+
+
+def delete_browser_profile(database_path: Path, profile_id: str) -> None:
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("DELETE FROM browser_profiles WHERE id = ?", (profile_id,))
 
 
 def _database_reset_reason(database_path: Path) -> str | None:
@@ -714,36 +770,6 @@ def _schema_version(connection: sqlite3.Connection) -> int | None:
         return None
 
 
-def _seed_defaults(connection: sqlite3.Connection) -> None:
-    now = _now_iso()
-    _ensure_default_browser_config(connection, default_browser_config(), now)
-
-
-def _ensure_default_browser_config(
-    connection: sqlite3.Connection, config: BrowserConfig, now: str
-) -> None:
-    connection.execute(
-        """
-        INSERT OR IGNORE INTO browser_configs (
-            id, name, executable_path, launch_args_json, test_url,
-            last_tested_at, last_test_status, created_at, updated_at
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            config.config_id,
-            config.name,
-            config.executable_path,
-            _json(config.launch_args),
-            config.test_url,
-            config.last_tested_at,
-            config.last_test_status,
-            now,
-            now,
-        ),
-    )
-
-
 def load_task_item_by_index(
     connection: sqlite3.Connection, task_id: int, task_index: int
 ) -> TaskItem | None:
@@ -799,6 +825,7 @@ def _browser_config_from_row(row: sqlite3.Row) -> BrowserConfig:
     return BrowserConfig(
         config_id=str(row["id"]),
         name=str(row["name"]),
+        profile_id=str(row["profile_id"]),
         executable_path=str(row["executable_path"]),
         launch_args=json.loads(row["launch_args_json"]),
         test_url=str(row["test_url"]),

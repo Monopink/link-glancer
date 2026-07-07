@@ -8,7 +8,9 @@ from link_glancer.infrastructure.repositories import BrowserConfigRepository, Ta
 from link_glancer.infrastructure.workbooks import WorkbookImporter
 from link_glancer.tasks.models import (
     BrowserConfig,
+    BrowserProfile,
     ReviewField,
+    ReviewOption,
     ReviewRecord,
     ReviewShortcutConfig,
     TaskDetail,
@@ -135,6 +137,18 @@ class TaskApplicationService:
         )
         return task_id
 
+    def create_task_from_creator_collection(
+        self,
+        *,
+        source_path: Path,
+        browser_config_id: str,
+    ) -> int:
+        task_snapshot = self.build_creator_collection_task_snapshot(
+            source_path=source_path,
+            browser_config_id=browser_config_id,
+        )
+        return self.create_task(source_path=source_path, task_snapshot=task_snapshot)
+
     def load_task(self, task_id: int) -> TaskDetail:
         return self._tasks.load_task(task_id)
 
@@ -201,6 +215,78 @@ class TaskApplicationService:
     def load_last_task_creation_defaults(self) -> tuple[Path | None, TaskSnapshot | None]:
         return self._tasks.load_last_task_creation_defaults()
 
+    def build_creator_collection_task_snapshot(
+        self,
+        *,
+        source_path: Path,
+        browser_config_id: str,
+    ) -> TaskSnapshot:
+        sheet_names = self.list_sheet_names(source_path)
+        if not sheet_names:
+            raise ValueError("采集结果中没有可用工作表。")
+        sheet_name = sheet_names[0]
+        return TaskSnapshot(
+            sheet_name=sheet_name,
+            header_row=1,
+            browser_config_id=browser_config_id,
+            open_tab_count=3,
+            confirm_url=None,
+            url_field="url",
+            display_fields=[
+                "nickname",
+                "handle",
+                "selection_region",
+                "follower_cnt",
+                "units_sold",
+                "category",
+            ],
+            review_fields=[
+                ReviewField(
+                    field_id="validity",
+                    label="是否可用",
+                    field_type="single_select",
+                    required=True,
+                    options=[
+                        ReviewOption(value="是", label="是", shortcut="1"),
+                        ReviewOption(value="否", label="否", shortcut="2"),
+                    ],
+                ),
+                ReviewField(
+                    field_id="quality",
+                    label="达人质量",
+                    field_type="single_select",
+                    required=False,
+                    options=[
+                        ReviewOption(value="好", label="好", shortcut="3"),
+                        ReviewOption(value="中", label="中", shortcut="4"),
+                        ReviewOption(value="差", label="差", shortcut="5"),
+                    ],
+                ),
+            ],
+            shortcuts=ReviewShortcutConfig(
+                submit="Enter",
+                previous="Backspace",
+                exit="Esc",
+            ),
+            export_fields=[
+                "creator_oecuid",
+                "handle",
+                "nickname",
+                "selection_region",
+                "units_sold",
+                "follower_cnt",
+                "ec_video_avg_view_cnt",
+                "video_engagement",
+                "ec_video_engagement",
+                "video_avg_view_cnt",
+                "category",
+                "top_follower_gender",
+                "url",
+                "validity",
+                "quality",
+            ],
+        )
+
     def list_buffer_items(self, task: TaskDetail) -> list[TaskItem]:
         return self._tasks.list_items_in_range(
             task_id=task.task_id,
@@ -263,11 +349,20 @@ class TaskApplicationService:
     def list_browser_configs(self) -> list[BrowserConfig]:
         return self._browser_configs.list_browser_configs()
 
+    def list_browser_profiles(self) -> list[BrowserProfile]:
+        return self._browser_configs.list_browser_profiles()
+
     def save_browser_config(self, config: BrowserConfig) -> None:
         self._browser_configs.save_browser_config(config)
 
+    def save_browser_profile(self, profile: BrowserProfile) -> None:
+        self._browser_configs.save_browser_profile(profile)
+
     def delete_browser_config(self, config_id: str) -> None:
         self._browser_configs.delete_browser_config(config_id)
+
+    def delete_browser_profile(self, profile_id: str) -> None:
+        self._browser_configs.delete_browser_profile(profile_id)
 
     def validate_review_fields(self, review_fields: list[ReviewField]) -> None:
         if not review_fields:

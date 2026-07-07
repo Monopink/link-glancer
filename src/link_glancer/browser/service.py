@@ -145,10 +145,16 @@ class PlaywrightBrowserController(BrowserController):
         self._pages_by_task_index.clear()
         self._confirmation_page = None
         if self._context is not None:
-            self._context.close()
+            try:
+                self._context.close()
+            except PlaywrightError:
+                pass
             self._context = None
         if self._playwright_manager is not None:
-            self._playwright_manager.stop()
+            try:
+                self._playwright_manager.stop()
+            except PlaywrightError:
+                pass
             self._playwright_manager = None
         self._playwright = None
 
