@@ -112,7 +112,7 @@ class ReviewWindow(QMainWindow):
         self._refresh_view()
 
         self._timer = QTimer(self)
-        self._timer.setInterval(1000)
+        self._timer.setInterval(5000)
         self._timer.timeout.connect(self._refresh_time_labels)
         self._timer.start()
 

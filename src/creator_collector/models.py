@@ -26,6 +26,7 @@ class CreatorCollectionStatus:
     last_message: str
     rows: list[dict[str, object]]
     started_at: datetime | None = None
+    ended_at: datetime | None = None
     estimated_total_count: int | None = None
     estimated_end_at: datetime | None = None
     backup_path: Path | None = None

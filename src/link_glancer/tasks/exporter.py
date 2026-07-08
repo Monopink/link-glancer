@@ -42,6 +42,33 @@ def export_task_results(
     return export_path
 
 
+def export_task_results_to_path(database_path: Path, task_id: int, export_path: Path) -> Path:
+    task = load_task_detail(database_path, task_id)
+    items = list_all_items(database_path, task_id)
+    reviews_by_item_id = list_reviews(database_path, task_id)
+
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Results"
+    export_fields = task.task_snapshot.export_fields
+
+    for column_index, export_field in enumerate(export_fields, start=1):
+        sheet.cell(row=1, column=column_index, value=export_field)
+
+    for row_index, item in enumerate(items, start=2):
+        review = reviews_by_item_id.get(item.task_item_id)
+        for column_index, export_field in enumerate(export_fields, start=1):
+            value = _resolve_export_value(export_field, item, review)
+            if isinstance(value, list):
+                value = ", ".join(str(option) for option in value)
+            sheet.cell(row=row_index, column=column_index, value=value)
+
+    export_path.parent.mkdir(parents=True, exist_ok=True)
+    workbook.save(export_path)
+    workbook.close()
+    return export_path
+
+
 def _resolve_export_value(field_name: str, item: TaskItem, review: ReviewRecord | None) -> object:
     if review and field_name in review.review_data:
         return review.review_data[field_name]

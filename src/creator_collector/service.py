@@ -51,6 +51,7 @@ class CreatorCollectorSession:
         self._last_message = "未启动"
         self._backup_path: Path | None = None
         self._started_at: datetime | None = None
+        self._ended_at: datetime | None = None
         self._estimated_total_count: int | None = None
         self._last_backup_saved_at: datetime | None = None
         self._rows_dirty = False
@@ -108,6 +109,7 @@ class CreatorCollectorSession:
             self._interrupted = False
             self._completed = False
             self._started_at = datetime.now(UTC)
+            self._ended_at = None
             self._estimated_total_count = None
             self._last_backup_saved_at = None
             self._rows_dirty = False
@@ -194,6 +196,8 @@ class CreatorCollectorSession:
 
     def stop(self) -> CreatorCollectionStatus:
         self._flush_backup(force=True)
+        if self._started_at is not None and self._ended_at is None:
+            self._ended_at = datetime.now(UTC)
         self._close_runtime(clear_collection_state=False)
         self._last_message = "采集已停止。"
         return self.status()
@@ -247,8 +251,9 @@ class CreatorCollectorSession:
             and len(self._rows) > 0
             and estimated_total_count >= len(self._rows)
         ):
+            reference_time = self._ended_at or datetime.now(UTC)
             elapsed_seconds = max(
-                int((datetime.now(UTC) - self._started_at).total_seconds()),
+                int((reference_time - self._started_at).total_seconds()),
                 1,
             )
             total_seconds = int(elapsed_seconds * estimated_total_count / len(self._rows))
@@ -265,6 +270,7 @@ class CreatorCollectorSession:
             last_message=self._last_message,
             rows=list(self._rows),
             started_at=self._started_at,
+            ended_at=self._ended_at,
             estimated_total_count=estimated_total_count,
             estimated_end_at=estimated_end_at,
             backup_path=self._backup_path,
@@ -297,6 +303,7 @@ class CreatorCollectorSession:
         if clear_collection_state:
             self._completed = False
             self._started_at = None
+            self._ended_at = None
             self._estimated_total_count = None
             self._last_backup_saved_at = None
             self._rows_dirty = False
@@ -494,6 +501,7 @@ class CreatorCollectorSession:
         self._waiting_for_response = False
         self._waiting_started_at = None
         self._next_action_at = None
+        self._ended_at = None
         self._last_message = message
 
     def _mark_completed(self, message: str) -> None:
@@ -503,6 +511,8 @@ class CreatorCollectorSession:
         self._waiting_for_response = False
         self._waiting_started_at = None
         self._next_action_at = None
+        if self._ended_at is None:
+            self._ended_at = datetime.now(UTC)
         self._last_message = message
 
     def _flush_backup(self, *, force: bool) -> None:

@@ -340,6 +340,9 @@ class TaskApplicationService:
     def export_task(self, *, task_id: int, destination_dir: Path | None = None) -> Path:
         return self._tasks.export_task(task_id=task_id, destination_dir=destination_dir)
 
+    def export_task_to_path(self, *, task_id: int, export_path: Path) -> Path:
+        return self._tasks.export_task_to_path(task_id=task_id, export_path=export_path)
+
     def load_app_setting(self, key: str) -> object | None:
         return self._tasks.load_app_setting(key)
 

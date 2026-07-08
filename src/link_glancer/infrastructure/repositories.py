@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from link_glancer.tasks import database
-from link_glancer.tasks.exporter import export_task_results
+from link_glancer.tasks.exporter import export_task_results, export_task_results_to_path
 from link_glancer.tasks.models import (
     BrowserConfig,
     BrowserProfile,
@@ -100,6 +100,9 @@ class TaskRepository:
 
     def export_task(self, *, task_id: int, destination_dir: Path | None = None) -> Path:
         return export_task_results(self.database_path, task_id, destination_dir=destination_dir)
+
+    def export_task_to_path(self, *, task_id: int, export_path: Path) -> Path:
+        return export_task_results_to_path(self.database_path, task_id, export_path=export_path)
 
     def delete_task(self, task_id: int) -> None:
         database.delete_task(self.database_path, task_id)

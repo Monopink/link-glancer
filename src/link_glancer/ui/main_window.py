@@ -30,7 +30,7 @@ from link_glancer.application import TaskApplicationService
 from link_glancer.browser.base import BrowserController, BrowserLaunchRequest, BufferBlock
 from link_glancer.browser.service import create_browser_controller
 from link_glancer.tasks.database import consume_database_reset_reason
-from link_glancer.tasks.models import BrowserConfig, TaskDetail, TaskSnapshot
+from link_glancer.tasks.models import BrowserConfig, TaskDetail, TaskSnapshot, TaskStatus
 from link_glancer.ui.config_manager_dialog import ConfigManagerDialog
 from link_glancer.ui.review_window import ReviewWindow
 from link_glancer.ui.task_creation_dialog import TaskCreationDialog
@@ -167,9 +167,7 @@ class MainWindow(QMainWindow):
         config_button = QPushButton("任务配置")
         config_button.clicked.connect(self._edit_task_configuration)
         export_button = QPushButton("导出")
-        export_button.clicked.connect(self._export_default)
-        choose_export_button = QPushButton("导出到...")
-        choose_export_button.clicked.connect(self._export_choose_dir)
+        export_button.clicked.connect(self._export_task_with_dialog)
         delete_button = QPushButton("删除任务")
         delete_button.clicked.connect(self._delete_current_task)
         start_button = QPushButton("开始检查")
@@ -177,7 +175,6 @@ class MainWindow(QMainWindow):
         actions.addWidget(back_button)
         actions.addWidget(config_button)
         actions.addWidget(export_button)
-        actions.addWidget(choose_export_button)
         actions.addWidget(delete_button)
         actions.addStretch(1)
         actions.addWidget(start_button)
@@ -192,6 +189,7 @@ class MainWindow(QMainWindow):
             "QTableView { outline: 0; } QTableView::item:selected { border: 0px; }"
         )
         self._task_data_table.setAlternatingRowColors(True)
+        self._task_data_table.horizontalHeader().setSectionsMovable(False)
         layout.addWidget(self._task_data_table, stretch=1)
         return page
 
@@ -338,7 +336,7 @@ class MainWindow(QMainWindow):
                 str(summary.task_id),
                 summary.name,
                 f"{summary.completed_items}/{summary.total_items}",
-                summary.status,
+                self._task_status_label(summary.status),
                 summary.source_file_name,
                 summary.updated_at,
             ]
@@ -412,7 +410,7 @@ class MainWindow(QMainWindow):
                 [
                     self._format_task_created_at(self.task.created_at),
                     f"已完成 {self.task.completed_items}/{self.task.total_items}",
-                    f"状态 {self.task.status}",
+                    f"状态 {self._task_status_label(self.task.status)}",
                 ]
             )
         )
@@ -514,9 +512,10 @@ class MainWindow(QMainWindow):
 
         header = self._task_data_table.horizontalHeader()
         for column in range(len(export_fields)):
-            header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
+            header.setSectionResizeMode(column, QHeaderView.ResizeMode.Interactive)
+            header.resizeSection(column, 160)
         if export_fields:
-            header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+            header.resizeSection(0, 220)
 
         palette = self.palette()
         completed_background = palette.alternateBase().color()
@@ -662,23 +661,50 @@ class MainWindow(QMainWindow):
         lines.append("请在浏览器中处理后点击“继续”。")
         return "\n".join(lines)
 
-    def _export_default(self) -> None:
+    def _export_task_with_dialog(self) -> None:
         if not self.task:
             return
-        export_path = self.app_service.export_task(task_id=self.task.task_id)
-        self.statusBar().showMessage(f"已导出到 {export_path}", 6000)
-
-    def _export_choose_dir(self) -> None:
-        if not self.task:
-            return
-        selected = QFileDialog.getExistingDirectory(self, "选择导出目录", str(Path.cwd()))
+        default_path = self._default_export_path()
+        selected, _ = QFileDialog.getSaveFileName(
+            self,
+            "导出",
+            str(default_path),
+            "Excel Workbook (*.xlsx)",
+        )
         if not selected:
             return
-        export_path = self.app_service.export_task(
+        export_path = Path(selected)
+        if export_path.suffix.lower() != ".xlsx":
+            export_path = export_path.with_suffix(".xlsx")
+        self.app_service.save_app_setting("task_export_dir", str(export_path.parent))
+        export_path = self.app_service.export_task_to_path(
             task_id=self.task.task_id,
-            destination_dir=Path(selected),
+            export_path=export_path,
         )
         self.statusBar().showMessage(f"已导出到 {export_path}", 6000)
+
+    def _default_export_path(self) -> Path:
+        if not self.task:
+            return Path.cwd() / "task_export.xlsx"
+        raw = self.app_service.load_app_setting("task_export_dir")
+        export_dir = (
+            Path(raw) if isinstance(raw, str) and raw.strip() else self.task.source_file_path.parent
+        )
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        safe_name = self._safe_filename(self.task.name)
+        return export_dir / f"{safe_name}_{timestamp}.xlsx"
+
+    def _task_status_label(self, status: TaskStatus) -> str:
+        labels: dict[TaskStatus, str] = {
+            "ready": "待开始",
+            "in_progress": "进行中",
+            "completed": "已完成",
+        }
+        return labels.get(status, str(status))
+
+    def _safe_filename(self, value: str) -> str:
+        sanitized = "".join(char if char not in '<>:"/\\|?*' else "_" for char in value).strip()
+        return sanitized or "task_export"
 
     def closeEvent(self, event) -> None:
         if self._review_window is not None:

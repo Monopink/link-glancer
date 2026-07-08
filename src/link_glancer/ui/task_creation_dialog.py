@@ -183,6 +183,7 @@ class TaskCreationDialog(QDialog):
             ["结果列名", "问题标题", "类型", "必填", "选项"]
         )
         _setup_table(self._review_fields_table)
+        self._review_fields_table.cellClicked.connect(self._handle_review_field_cell_clicked)
         root.addWidget(self._review_fields_table, stretch=1)
 
         table_actions = QHBoxLayout()
@@ -366,9 +367,15 @@ class TaskCreationDialog(QDialog):
         )
 
     def _update_warnings(self, warnings: list[str]) -> None:
-        self._warnings_label.setText(
-            "\n".join(warnings) if warnings else "创建前校验将显示在这里。"
-        )
+        self._warnings_label.setText("\n".join(warnings))
+
+    def _handle_review_field_cell_clicked(self, row: int, column: int) -> None:
+        if column != 4:
+            return
+        try:
+            _edit_options_for_row(self._review_fields_table, row)
+        except ValueError as exc:
+            QMessageBox.warning(self, "选项无效", str(exc))
 
 
 def _warning_lines(warnings) -> list[str]:
@@ -404,8 +411,15 @@ def _setup_table(table: QTableWidget) -> None:
     table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
     table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
     table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-    table.setStyleSheet("QTableView { outline: 0; } QTableView::item:selected { border: 0px; }")
-    table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+    table.setStyleSheet(
+        "QTableView { outline: 0; } "
+        "QTableView::item:selected { "
+        "border: 0px; "
+        "background-color: #2563eb; "
+        "color: #ffffff; "
+        "}"
+    )
+    table.horizontalHeader().setStretchLastSection(False)
 
 
 def _add_empty_review_row(table: QTableWidget) -> None:
@@ -419,31 +433,49 @@ def _add_empty_review_row(table: QTableWidget) -> None:
     table.setCellWidget(row, 2, type_combo)
     required_checkbox = QCheckBox()
     table.setCellWidget(row, 3, required_checkbox)
-    _set_options_button(table, row, [])
+    _set_options_item(table, row, [])
+    _configure_review_fields_table(table)
 
 
-def _set_options_button(table: QTableWidget, row: int, options: list[ReviewOption]) -> None:
-    button = QPushButton(_options_summary(options))
-    button.setProperty("options", [deepcopy(option) for option in options])
-    button.clicked.connect(lambda _checked=False, current=button: _edit_options(current))
-    table.setCellWidget(row, 4, button)
+def _set_options_item(table: QTableWidget, row: int, options: list[ReviewOption]) -> None:
+    summary_item = table.item(row, 4)
+    if summary_item is None:
+        summary_item = QTableWidgetItem()
+        table.setItem(row, 4, summary_item)
+    summary_item.setText(_options_preview(options))
+    summary_item.setToolTip(_options_tooltip(options))
+    summary_item.setData(Qt.ItemDataRole.UserRole, list(options))
+    table.setRowHeight(row, max(table.rowHeight(row), 34))
 
 
-def _edit_options(button: QPushButton) -> None:
-    raw_options = button.property("options")
-    options = raw_options if isinstance(raw_options, list) else []
-    dialog = ReviewOptionsDialog(
-        [option for option in options if isinstance(option, ReviewOption)],
-        button,
-    )
+def _edit_options_for_row(table: QTableWidget, row: int) -> None:
+    field_type = _combo_data(table, row, 2) or "single_select"
+    if field_type not in {"single_select", "multi_select"}:
+        return
+    existing_options = _options_value(table, row, 4)
+    dialog = ReviewOptionsDialog(existing_options, table)
     if dialog.exec() != int(QDialog.DialogCode.Accepted):
         return
-    button.setProperty("options", [deepcopy(option) for option in dialog.options])
-    button.setText(_options_summary(dialog.options))
+    _set_options_item(table, row, dialog.options)
 
 
-def _options_summary(options: list[ReviewOption]) -> str:
-    return f"编辑选项 ({len(options)})" if options else "编辑选项..."
+def _options_preview(options: list[ReviewOption]) -> str:
+    if not options:
+        return "未配置选项"
+    parts: list[str] = []
+    for option in options:
+        label = option.label or option.value
+        parts.append(f"{label}({option.shortcut})" if option.shortcut else label)
+    return " / ".join(parts)
+
+
+def _options_tooltip(options: list[ReviewOption]) -> str:
+    if not options:
+        return "未配置选项"
+    return "\n".join(
+        f"{option.value} | {option.label}" + (f" | {option.shortcut}" if option.shortcut else "")
+        for option in options
+    )
 
 
 def _collect_review_fields(table: QTableWidget) -> list[ReviewField]:
@@ -510,7 +542,14 @@ def _fill_review_fields_table(table: QTableWidget, fields: list[ReviewField]) ->
         required_checkbox = table.cellWidget(row, 3)
         if isinstance(required_checkbox, QCheckBox):
             required_checkbox.setChecked(field.required)
-        _set_options_button(table, row, field.options)
+        summary_item = table.item(row, 4)
+        if summary_item is None:
+            summary_item = QTableWidgetItem()
+            table.setItem(row, 4, summary_item)
+        summary_item.setText(_options_preview(field.options))
+        summary_item.setToolTip(_options_tooltip(field.options))
+        _set_options_item(table, row, field.options)
+    _configure_review_fields_table(table)
 
 
 def _add_empty_option_row(table: QTableWidget, row: int | None = None) -> None:
@@ -589,10 +628,10 @@ def _checkbox_value(table: QTableWidget, row: int, column: int) -> bool:
 
 
 def _options_value(table: QTableWidget, row: int, column: int) -> list[ReviewOption]:
-    widget = table.cellWidget(row, column)
-    if not isinstance(widget, QPushButton):
+    item = table.item(row, column)
+    if item is None:
         return []
-    raw_options = widget.property("options")
+    raw_options = item.data(Qt.ItemDataRole.UserRole)
     if not isinstance(raw_options, list):
         return []
     return [deepcopy(option) for option in raw_options if isinstance(option, ReviewOption)]
@@ -611,7 +650,7 @@ def _cell_value(table: QTableWidget, row: int, column: int) -> object:
         return widget.currentData()
     if isinstance(widget, QCheckBox):
         return widget.isChecked()
-    if isinstance(widget, QPushButton):
+    if column == 4:
         return _options_value(table, row, column)
     if isinstance(widget, QKeySequenceEdit):
         return widget.keySequence().toString(QKeySequence.SequenceFormat.NativeText).strip()
@@ -627,9 +666,9 @@ def _set_cell_value(table: QTableWidget, row: int, column: int, value: object) -
     if isinstance(widget, QCheckBox):
         widget.setChecked(bool(value))
         return
-    if isinstance(widget, QPushButton):
+    if column == 4:
         options = value if isinstance(value, list) else []
-        _set_options_button(
+        _set_options_item(
             table,
             row,
             [item for item in options if isinstance(item, ReviewOption)],
@@ -639,3 +678,16 @@ def _set_cell_value(table: QTableWidget, row: int, column: int, value: object) -
         widget.setKeySequence(QKeySequence(str(value or "")))
         return
     table.setItem(row, column, QTableWidgetItem(str(value or "")))
+
+
+def _configure_review_fields_table(table: QTableWidget) -> None:
+    header = table.horizontalHeader()
+    header.setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
+    header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+    header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+    header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+    header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+    table.setColumnWidth(0, 150)
+    table.setColumnWidth(2, 78)
+    table.setColumnWidth(3, 62)
+    table.setColumnWidth(4, 360)
