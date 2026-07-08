@@ -7,10 +7,8 @@ if (-not (Test-Path ".venv\Scripts\python.exe")) {
     throw "Missing .venv. Create the project virtual environment first."
 }
 
-if (-not (Test-Path "dist\LinkGlancer\LinkGlancer.exe")) {
-    Write-Host "Windows app build not found. Building application first..."
-    & powershell -ExecutionPolicy Bypass -File scripts\build_windows.ps1
-}
+Write-Host "Rebuilding Windows application before creating installer..."
+& powershell -ExecutionPolicy Bypass -File scripts\build_windows.ps1
 
 $isccCommand = Get-Command iscc -ErrorAction SilentlyContinue
 $isccPath = if ($isccCommand) { $isccCommand.Source } else { $null }

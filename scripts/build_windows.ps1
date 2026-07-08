@@ -7,8 +7,11 @@ if (-not (Test-Path ".venv\Scripts\python.exe")) {
     throw "Missing .venv. Create the project virtual environment first."
 }
 
-& .venv\Scripts\python.exe -m pip install -e ".[build]"
-& .venv\Scripts\python.exe -m playwright install
+& .venv\Scripts\python.exe -c "import PyInstaller, PySide6, playwright, openpyxl"
+if ($LASTEXITCODE -ne 0) {
+    throw "Missing build/runtime dependencies in .venv. Install the project environment first."
+}
+
 & .venv\Scripts\python.exe -m ruff check .
 & .venv\Scripts\python.exe -m compileall -q src
 & .venv\Scripts\python.exe scripts/generate_windows_icon.py
