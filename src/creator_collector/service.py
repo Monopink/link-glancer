@@ -28,6 +28,11 @@ RESPONSE_WAIT_SECONDS = 8
 AUTO_ADVANCE_INTERVAL_SECONDS = 1.5
 MIN_AUTO_ADVANCE_INTERVAL_SECONDS = 0.3
 MAX_AUTO_ADVANCE_INTERVAL_SECONDS = 5.0
+PLAYWRIGHT_ALLOWED_DEFAULT_ARGS = [
+    "--no-sandbox",
+    "--disable-extensions",
+    "--disable-component-extensions-with-background-pages",
+]
 
 
 @dataclass(slots=True)
@@ -98,7 +103,7 @@ class CreatorCollectorSession:
                 headless=False,
                 executable_path=str(candidate.executable_path),
                 args=self._browser_config.launch_args or [],
-                ignore_default_args=["--no-sandbox"],
+                ignore_default_args=PLAYWRIGHT_ALLOWED_DEFAULT_ARGS,
             )
             self._context.on("response", self._handle_response)
             self._page = self._context.new_page()

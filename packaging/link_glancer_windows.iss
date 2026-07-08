@@ -1,5 +1,5 @@
 #define AppName "Link Glancer"
-#define AppVersion "0.1.2"
+#define AppVersion "0.1.3"
 #define AppPublisher "Link Glancer"
 #define AppExeName "LinkGlancer.exe"
 #define AppDistDir "..\dist\LinkGlancer"

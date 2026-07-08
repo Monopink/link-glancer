@@ -34,6 +34,7 @@ class ConfigManagerDialog(QDialog):
         *,
         browser_configs: list[BrowserConfig],
         browser_test_callback,
+        browser_launch_callback,
         save_browser_config_callback,
         save_browser_profile_callback,
         delete_browser_config_callback,
@@ -43,6 +44,7 @@ class ConfigManagerDialog(QDialog):
         super().__init__(parent)
         self.browser_configs = [deepcopy(config) for config in browser_configs]
         self._browser_test_callback = browser_test_callback
+        self._browser_launch_callback = browser_launch_callback
         self._save_browser_config_callback = save_browser_config_callback
         self._save_browser_profile_callback = save_browser_profile_callback
         self._delete_browser_config_callback = delete_browser_config_callback
@@ -81,19 +83,23 @@ class ConfigManagerDialog(QDialog):
         actions = QHBoxLayout()
         add_button = QPushButton("新增")
         delete_button = QPushButton("删除")
+        launch_button = QPushButton("启动浏览器")
         advanced_button = QPushButton("高级配置")
-        for button in (add_button, delete_button, advanced_button):
+        for button in (add_button, delete_button, launch_button, advanced_button):
             button.setAutoDefault(False)
             button.setDefault(False)
         add_button.clicked.connect(self._add_browser_config)
         delete_button.clicked.connect(self._delete_selected_browser_config)
+        launch_button.clicked.connect(self._launch_selected_browser)
         advanced_button.clicked.connect(self._open_advanced_config)
         self._delete_button = delete_button
+        self._launch_button = launch_button
         self._advanced_button = advanced_button
 
         actions.addStretch(1)
         actions.addWidget(add_button)
         actions.addWidget(delete_button)
+        actions.addWidget(launch_button)
         actions.addWidget(advanced_button)
         root.addLayout(actions)
 
@@ -150,6 +156,7 @@ class ConfigManagerDialog(QDialog):
     def _update_actions(self) -> None:
         has_selection = self._selected_config() is not None
         self._delete_button.setEnabled(has_selection)
+        self._launch_button.setEnabled(has_selection)
         self._advanced_button.setEnabled(has_selection)
 
     def _add_browser_config(self) -> None:
@@ -243,6 +250,15 @@ class ConfigManagerDialog(QDialog):
             config.last_test_status = testing_config.last_test_status
             config.last_tested_at = testing_config.last_tested_at
         return ok, message
+
+    def _launch_selected_browser(self) -> None:
+        config = self._selected_config()
+        if config is None:
+            return
+        ok, message = self._browser_launch_callback(deepcopy(config))
+        if not ok:
+            QMessageBox.warning(self, "启动浏览器失败", message)
+            return
 
 
 def _status_label(status: str) -> str:

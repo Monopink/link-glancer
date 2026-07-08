@@ -20,6 +20,11 @@ from link_glancer.tasks.models import TaskItem
 TIKTOK_HOST = "www.tiktok.com"
 BUFFER_PAGE_READY_TIMEOUT_MS = 1000
 BUFFER_PAGE_READY_POLL_MS = 100
+PLAYWRIGHT_ALLOWED_DEFAULT_ARGS = [
+    "--no-sandbox",
+    "--disable-extensions",
+    "--disable-component-extensions-with-background-pages",
+]
 
 
 @dataclass(slots=True)
@@ -69,7 +74,7 @@ class PlaywrightBrowserController(BrowserController):
                 headless=False,
                 executable_path=str(candidate.executable_path),
                 args=request.launch_args or [],
-                ignore_default_args=["--no-sandbox"],
+                ignore_default_args=PLAYWRIGHT_ALLOWED_DEFAULT_ARGS,
             )
             self._status = BrowserStatus(
                 active_browser=candidate.name,

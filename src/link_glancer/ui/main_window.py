@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from pathlib import Path
 
-from PySide6.QtCore import QObject, Qt, QThread, QTimer, Signal
+from PySide6.QtCore import QObject, QProcess, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -29,6 +29,7 @@ from PySide6.QtWidgets import (
 from creator_collector import CreatorCollectorDialog
 from link_glancer.application import TaskApplicationService
 from link_glancer.browser.base import BrowserController, BrowserLaunchRequest, BufferBlock
+from link_glancer.browser.detector import detect_browser
 from link_glancer.browser.service import create_browser_controller
 from link_glancer.runtime.locks import (
     RuntimeLockConflictError,
@@ -36,6 +37,7 @@ from link_glancer.runtime.locks import (
     acquire_profile_lock,
     acquire_task_lock,
 )
+from link_glancer.runtime.paths import ensure_browser_environment_dir
 from link_glancer.tasks.database import consume_database_reset_reason
 from link_glancer.tasks.models import BrowserConfig, TaskDetail, TaskSnapshot, TaskStatus
 from link_glancer.ui.config_manager_dialog import ConfigManagerDialog
@@ -106,6 +108,7 @@ class MainWindow(QMainWindow):
         self._pending_task_success_message: str | None = None
         self._review_task_lock: RuntimeLockHandle | None = None
         self._review_profile_lock: RuntimeLockHandle | None = None
+        self._browser_launch_processes: dict[str, tuple[QProcess, RuntimeLockHandle]] = {}
 
         self._update_window_title()
         self.resize(1120, 720)
@@ -285,6 +288,7 @@ class MainWindow(QMainWindow):
         dialog = ConfigManagerDialog(
             browser_configs=self.app_service.list_browser_configs(),
             browser_test_callback=self._test_browser_config,
+            browser_launch_callback=self._launch_browser_for_config,
             save_browser_config_callback=self.app_service.save_browser_config,
             save_browser_profile_callback=self.app_service.save_browser_profile,
             delete_browser_config_callback=self.app_service.delete_browser_config,
@@ -788,6 +792,7 @@ class MainWindow(QMainWindow):
             self._review_window.close()
         self._confirmation_task_id = None
         self._release_review_locks()
+        self._shutdown_launched_browsers()
         self.browser.shutdown()
         super().closeEvent(event)
 
@@ -893,6 +898,47 @@ class MainWindow(QMainWindow):
         self._task_worker_thread = None
         self._pending_task_success_message = None
 
+    def _launch_browser_for_config(self, config: BrowserConfig) -> tuple[bool, str]:
+        existing = self._browser_launch_processes.get(config.profile_id)
+        if existing is not None:
+            process, _lock = existing
+            if process.state() != QProcess.ProcessState.NotRunning:
+                return False, f"Profile `{config.profile_id}` 已在当前实例中启动。"
+            self._release_browser_launch(config.profile_id)
+        try:
+            profile_lock = acquire_profile_lock(
+                config.profile_id,
+                owner_label=f"启动浏览器 - Profile: {config.name}",
+            )
+        except RuntimeLockConflictError as exc:
+            return False, str(exc)
+
+        candidate = detect_browser("configured", config.executable_path or None)
+        if candidate is None:
+            profile_lock.release()
+            return False, "未找到可用浏览器程序。"
+        environment_dir = ensure_browser_environment_dir(config.profile_id)
+        start_url = config.test_url or "about:blank"
+        arguments = [f"--user-data-dir={environment_dir}", *config.launch_args, start_url]
+
+        process = QProcess(self)
+        process.finished.connect(
+            lambda _code=0, _status=QProcess.ExitStatus.NormalExit, profile_id=config.profile_id: (
+                self._release_browser_launch(profile_id)
+            )
+        )
+        process.errorOccurred.connect(
+            lambda _error, profile_id=config.profile_id: self._release_browser_launch(profile_id)
+        )
+        process.start(str(candidate.executable_path), arguments)
+        if not process.waitForStarted(5000):
+            profile_lock.release()
+            process.deleteLater()
+            return False, f"浏览器启动失败：{process.errorString()}"
+
+        self._browser_launch_processes[config.profile_id] = (process, profile_lock)
+        return True, f"已启动 {config.name}，关闭浏览器后会自动释放 Profile 占用。"
+
     def _release_review_locks(self) -> None:
         if self._review_task_lock is not None:
             self._review_task_lock.release()
@@ -900,6 +946,25 @@ class MainWindow(QMainWindow):
         if self._review_profile_lock is not None:
             self._review_profile_lock.release()
             self._review_profile_lock = None
+
+    def _release_browser_launch(self, profile_id: str) -> None:
+        pair = self._browser_launch_processes.pop(profile_id, None)
+        if pair is None:
+            return
+        process, lock = pair
+        lock.release()
+        process.deleteLater()
+
+    def _shutdown_launched_browsers(self) -> None:
+        for profile_id, (process, lock) in list(self._browser_launch_processes.items()):
+            if process.state() != QProcess.ProcessState.NotRunning:
+                process.terminate()
+                if not process.waitForFinished(3000):
+                    process.kill()
+                    process.waitForFinished(2000)
+            lock.release()
+            process.deleteLater()
+            self._browser_launch_processes.pop(profile_id, None)
 
     def _update_window_title(self, *, profile_name: str | None = None) -> None:
         suffix = f" {self._instance_id}" if self._instance_id > 1 else ""
