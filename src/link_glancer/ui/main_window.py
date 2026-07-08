@@ -30,6 +30,12 @@ from creator_collector import CreatorCollectorDialog
 from link_glancer.application import TaskApplicationService
 from link_glancer.browser.base import BrowserController, BrowserLaunchRequest, BufferBlock
 from link_glancer.browser.service import create_browser_controller
+from link_glancer.runtime.locks import (
+    RuntimeLockConflictError,
+    RuntimeLockHandle,
+    acquire_profile_lock,
+    acquire_task_lock,
+)
 from link_glancer.tasks.database import consume_database_reset_reason
 from link_glancer.tasks.models import BrowserConfig, TaskDetail, TaskSnapshot, TaskStatus
 from link_glancer.ui.config_manager_dialog import ConfigManagerDialog
@@ -83,8 +89,9 @@ class _TaskMutationWorker(QObject):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self) -> None:
+    def __init__(self, *, instance_id: int) -> None:
         super().__init__()
+        self._instance_id = instance_id
         self.app_service = TaskApplicationService.create_default()
         self.browser: BrowserController = create_browser_controller()
         self.task: TaskDetail | None = None
@@ -97,8 +104,10 @@ class MainWindow(QMainWindow):
         self._task_worker: _TaskMutationWorker | None = None
         self._task_progress_dialog: QProgressDialog | None = None
         self._pending_task_success_message: str | None = None
+        self._review_task_lock: RuntimeLockHandle | None = None
+        self._review_profile_lock: RuntimeLockHandle | None = None
 
-        self.setWindowTitle("Link Glancer")
+        self._update_window_title()
         self.resize(1120, 720)
         self.setMinimumWidth(980)
 
@@ -288,6 +297,7 @@ class MainWindow(QMainWindow):
         dialog = CreatorCollectorDialog(
             app_service=self.app_service,
             browser_configs=self.app_service.list_browser_configs(),
+            instance_id=self._instance_id,
             parent=self,
         )
         if dialog.exec() != int(QDialog.DialogCode.Accepted):
@@ -487,17 +497,34 @@ class MainWindow(QMainWindow):
             self._review_window.activateWindow()
             self._review_window.raise_()
             return
+        self._release_review_locks()
+        try:
+            self._review_task_lock = acquire_task_lock(
+                self.task.task_id,
+                owner_label=f"检查任务 - Profile: {self.task.browser_config.name}",
+            )
+            self._review_profile_lock = acquire_profile_lock(
+                self.task.browser_config.profile_id,
+                owner_label=f"检查任务 - Profile: {self.task.browser_config.name}",
+            )
+        except RuntimeLockConflictError as exc:
+            self._release_review_locks()
+            QMessageBox.warning(self, "无法开始检查", str(exc))
+            return
         request = BrowserLaunchRequest(
             browser_config_id=self.task.browser_config.profile_id,
             browser_name="configured",
             executable_path=self.task.browser_config.executable_path or None,
             launch_args=self.task.browser_config.launch_args,
         )
+        self._update_window_title(profile_name=self.task.browser_config.name)
         self.browser.launch(request)
         self.browser.ensure_running()
         status = self.browser.status()
         if not status.running:
             self._confirmation_task_id = None
+            self._release_review_locks()
+            self._update_window_title()
             self._refresh_task_page()
             QMessageBox.warning(self, "浏览器启动失败", status.message)
             return
@@ -512,6 +539,8 @@ class MainWindow(QMainWindow):
         if result != QMessageBox.StandardButton.Yes:
             self.browser.shutdown()
             self._confirmation_task_id = None
+            self._release_review_locks()
+            self._update_window_title()
             self.statusBar().showMessage("已取消开始检查。", 3000)
             return
         self._confirmation_task_id = self.task.task_id
@@ -540,6 +569,8 @@ class MainWindow(QMainWindow):
     def _handle_review_window_closed(self) -> None:
         self._review_window = None
         self._confirmation_task_id = None
+        self._release_review_locks()
+        self._update_window_title()
         if self.task is not None:
             self.task = self.app_service.load_task(self.task.task_id)
             self._refresh_task_page()
@@ -756,34 +787,49 @@ class MainWindow(QMainWindow):
         if self._review_window is not None:
             self._review_window.close()
         self._confirmation_task_id = None
+        self._release_review_locks()
         self.browser.shutdown()
         super().closeEvent(event)
 
     def _test_browser_config(self, config: BrowserConfig) -> tuple[bool, str]:
+        profile_lock: RuntimeLockHandle | None = None
+        try:
+            profile_lock = acquire_profile_lock(
+                config.profile_id,
+                owner_label=f"浏览器测试 - Profile: {config.name}",
+            )
+        except RuntimeLockConflictError as exc:
+            return False, str(exc)
         request = BrowserLaunchRequest(
             browser_config_id=config.profile_id,
             browser_name="configured",
             executable_path=config.executable_path or None,
             launch_args=config.launch_args,
         )
-        self.browser.launch(request)
-        self.browser.ensure_running()
-        status = self.browser.status()
-        if not status.running:
-            config.last_test_status = "failed"
-            return False, status.message
-        test_url = config.test_url or "about:blank"
-        self.browser.open_confirmation_page(test_url)
-        config.last_test_status = "passed"
-        config.last_tested_at = datetime.now(UTC).isoformat()
-        self.browser.shutdown()
-        return True, f"启动成功：{test_url}"
+        try:
+            self.browser.launch(request)
+            self.browser.ensure_running()
+            status = self.browser.status()
+            if not status.running:
+                config.last_test_status = "failed"
+                return False, status.message
+            test_url = config.test_url or "about:blank"
+            self.browser.open_confirmation_page(test_url)
+            config.last_test_status = "passed"
+            config.last_tested_at = datetime.now(UTC).isoformat()
+            return True, f"启动成功：{test_url}"
+        finally:
+            self.browser.shutdown()
+            if profile_lock is not None:
+                profile_lock.release()
 
     def _shutdown_confirmation_browser(self) -> None:
         if self._review_window is not None and self._review_window.isVisible():
             return
         self._confirmation_task_id = None
         self.browser.shutdown()
+        self._release_review_locks()
+        self._update_window_title()
 
     def _start_task_mutation(
         self,
@@ -846,3 +892,18 @@ class MainWindow(QMainWindow):
         self._task_worker = None
         self._task_worker_thread = None
         self._pending_task_success_message = None
+
+    def _release_review_locks(self) -> None:
+        if self._review_task_lock is not None:
+            self._review_task_lock.release()
+            self._review_task_lock = None
+        if self._review_profile_lock is not None:
+            self._review_profile_lock.release()
+            self._review_profile_lock = None
+
+    def _update_window_title(self, *, profile_name: str | None = None) -> None:
+        suffix = f" {self._instance_id}" if self._instance_id > 1 else ""
+        title = f"Link Glancer{suffix}"
+        if profile_name:
+            title += f" - Profile: {profile_name}"
+        self.setWindowTitle(title)

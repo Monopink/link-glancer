@@ -29,6 +29,11 @@ from PySide6.QtWidgets import (
 from creator_collector.models import CreatorCollectionConfig
 from creator_collector.service import DEFAULT_SAFETY_LIMIT
 from link_glancer.application import TaskApplicationService
+from link_glancer.runtime.locks import (
+    RuntimeLockConflictError,
+    RuntimeLockHandle,
+    acquire_profile_lock,
+)
 from link_glancer.tasks.models import BrowserConfig
 
 DEFAULT_CREATOR_PAGE_URL = ""
@@ -105,11 +110,13 @@ class CreatorCollectorDialog(QDialog):
         *,
         app_service: TaskApplicationService,
         browser_configs: list[BrowserConfig],
+        instance_id: int,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self._app_service = app_service
         self._browser_configs = browser_configs
+        self._instance_id = instance_id
         self.last_created_task_id: int | None = None
         self._prefilled_safety_limit = DEFAULT_SAFETY_LIMIT
         self._prefilled_auto_advance_interval_seconds = 1.5
@@ -160,6 +167,7 @@ class CreatorCollectorDialog(QDialog):
             app_service=self._app_service,
             browser_config=browser_config,
             collection_config=self._build_config(),
+            instance_id=self._instance_id,
             parent=self,
         )
         progress_dialog.exec()
@@ -223,12 +231,14 @@ class CreatorCollectorProgressDialog(QDialog):
         app_service: TaskApplicationService,
         browser_config: BrowserConfig,
         collection_config: CreatorCollectionConfig,
+        instance_id: int,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self._app_service = app_service
         self._browser_config = browser_config
         self._collection_config = collection_config
+        self._instance_id = instance_id
         self._status = _CollectorWorkerStatus.idle()
         self._collection_started = False
         self._startup_pending = True
@@ -245,12 +255,13 @@ class CreatorCollectorProgressDialog(QDialog):
         self._worker_started = False
         self._worker_buffer = ""
         self._process = QProcess(self)
+        self._profile_lock: RuntimeLockHandle | None = None
         self.last_created_task_id: int | None = None
         self.last_safety_limit = collection_config.safety_limit
         self._last_auto_advance_interval_seconds = collection_config.auto_advance_interval_seconds
         self.last_auto_advance_interval_seconds = self._last_auto_advance_interval_seconds
 
-        self.setWindowTitle("采集中")
+        self._update_window_title()
         self.resize(700, 240)
 
         root = QVBoxLayout(self)
@@ -332,6 +343,16 @@ class CreatorCollectorProgressDialog(QDialog):
         self._process.errorOccurred.connect(self._handle_process_error)
 
     def _start_worker_process(self) -> None:
+        try:
+            self._profile_lock = acquire_profile_lock(
+                self._browser_config.profile_id,
+                owner_label=f"采集任务 - Profile: {self._browser_config.name}",
+            )
+        except RuntimeLockConflictError as exc:
+            QMessageBox.warning(self, "无法开始采集", str(exc))
+            self._force_close = True
+            self.close()
+            return
         if getattr(sys, "frozen", False):
             program = sys.executable
             arguments = ["--collector-worker"]
@@ -407,6 +428,7 @@ class CreatorCollectorProgressDialog(QDialog):
         if message_type == "error":
             message = str(payload.get("message") or "采集进程执行失败。")
             if not self._worker_started:
+                self._release_profile_lock()
                 QMessageBox.warning(self, "启动失败", message)
                 self._force_close = True
                 self.close()
@@ -586,6 +608,7 @@ class CreatorCollectorProgressDialog(QDialog):
         if self._force_close:
             self._force_close = False
             self._shutdown_worker_process()
+            self._release_profile_lock()
             super().closeEvent(event)
             return
         if self._is_saving():
@@ -609,6 +632,7 @@ class CreatorCollectorProgressDialog(QDialog):
             self._expected_process_exit = True
             self._send_command({"cmd": "shutdown"})
             self._shutdown_worker_process()
+            self._release_profile_lock()
             super().closeEvent(event)
             return
         event.ignore()
@@ -722,6 +746,7 @@ class CreatorCollectorProgressDialog(QDialog):
             saving=False,
         )
         self._refresh_from_status()
+        self._release_profile_lock()
         if self._close_when_process_finishes:
             self._close_when_process_finishes = False
             self._force_close = True
@@ -738,6 +763,17 @@ class CreatorCollectorProgressDialog(QDialog):
         if not self._process.waitForFinished(3000):
             self._process.kill()
             self._process.waitForFinished(2000)
+
+    def _release_profile_lock(self) -> None:
+        if self._profile_lock is None:
+            return
+        self._profile_lock.release()
+        self._profile_lock = None
+
+    def _update_window_title(self) -> None:
+        suffix = f" {self._instance_id}" if self._instance_id > 1 else ""
+        title = f"Link Glancer{suffix} - Profile: {self._browser_config.name}"
+        self.setWindowTitle(title)
 
 
 def _create_action_button(text: str) -> QPushButton:

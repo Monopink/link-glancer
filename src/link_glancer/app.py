@@ -7,6 +7,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QIcon, QPalette
 from PySide6.QtWidgets import QApplication, QMessageBox, QStyleFactory, QSystemTrayIcon
 
+from link_glancer.runtime.locks import register_instance
 from link_glancer.runtime.paths import bundled_asset_path
 from link_glancer.ui.fonts import apply_application_font
 from link_glancer.ui.main_window import MainWindow
@@ -20,6 +21,7 @@ def create_application() -> QApplication:
     app = QApplication([])
     app.setApplicationName("Link Glancer")
     app.setOrganizationName("Link Glancer")
+    instance_registration = register_instance()
     icon_path = bundled_asset_path("icon.svg")
     if icon_path.exists():
         app.setWindowIcon(QIcon(str(icon_path)))
@@ -77,13 +79,16 @@ def create_application() -> QApplication:
     )
 
     try:
-        window = MainWindow()
+        window = MainWindow(instance_id=instance_registration.instance_id)
     except Exception as exc:
+        instance_registration.release()
         QMessageBox.critical(None, "启动失败", str(exc))
         raise SystemExit(1) from exc
     tray_icon.messageClicked.connect(lambda: _activate_main_window(window))
     app.main_window = window  # type: ignore[attr-defined]
     app.tray_icon = tray_icon  # type: ignore[attr-defined]
+    app.instance_registration = instance_registration  # type: ignore[attr-defined]
+    app.aboutToQuit.connect(lambda: instance_registration.release())
     window.show()
     window.raise_()
     window.activateWindow()
