@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import QObject, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QMainWindow,
     QMessageBox,
+    QProgressDialog,
     QPushButton,
     QSizePolicy,
     QStackedWidget,
@@ -36,6 +37,51 @@ from link_glancer.ui.review_window import ReviewWindow
 from link_glancer.ui.task_creation_dialog import TaskCreationDialog
 
 
+class _TaskMutationWorker(QObject):
+    succeeded = Signal(int, str)
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        *,
+        app_service: TaskApplicationService,
+        operation: str,
+        source_path: Path | None = None,
+        task_snapshot: TaskSnapshot | None = None,
+        task_id: int | None = None,
+    ) -> None:
+        super().__init__()
+        self._app_service = app_service
+        self._operation = operation
+        self._source_path = source_path
+        self._task_snapshot = task_snapshot
+        self._task_id = task_id
+
+    def run(self) -> None:
+        try:
+            if self._operation == "create":
+                if self._source_path is None or self._task_snapshot is None:
+                    raise ValueError("缺少创建任务所需参数。")
+                result_task_id = self._app_service.create_task(
+                    source_path=self._source_path,
+                    task_snapshot=self._task_snapshot,
+                )
+                self.succeeded.emit(result_task_id, "任务已创建")
+                return
+            if self._operation == "update_config":
+                if self._task_id is None or self._task_snapshot is None:
+                    raise ValueError("缺少更新任务配置所需参数。")
+                self._app_service.update_task_configuration(
+                    task_id=self._task_id,
+                    task_snapshot=self._task_snapshot,
+                )
+                self.succeeded.emit(self._task_id, "任务配置已保存")
+                return
+            raise ValueError(f"不支持的任务操作：{self._operation}")
+        except Exception as exc:  # noqa: BLE001
+            self.failed.emit(str(exc))
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -47,6 +93,10 @@ class MainWindow(QMainWindow):
         self._review_window: ReviewWindow | None = None
         self._confirmation_task_id: int | None = None
         self._handling_browser_block = False
+        self._task_worker_thread: QThread | None = None
+        self._task_worker: _TaskMutationWorker | None = None
+        self._task_progress_dialog: QProgressDialog | None = None
+        self._pending_task_success_message: str | None = None
 
         self.setWindowTitle("Link Glancer")
         self.resize(1120, 720)
@@ -214,16 +264,13 @@ class MainWindow(QMainWindow):
             return
         if dialog.source_path is None or dialog.task_snapshot is None:
             return
-        try:
-            task_id = self.app_service.create_task(
-                source_path=dialog.source_path,
-                task_snapshot=dialog.task_snapshot,
-            )
-        except (OSError, ValueError) as exc:
-            QMessageBox.critical(self, "创建任务失败", str(exc))
-            return
-        self._load_task(task_id)
-        self.statusBar().showMessage(f"任务已创建：#{task_id}", 4000)
+        self._start_task_mutation(
+            operation="create",
+            progress_title="创建任务中",
+            progress_label="正在读取 Excel 并写入任务数据，请稍候...",
+            source_path=dialog.source_path,
+            task_snapshot=dialog.task_snapshot,
+        )
 
     def _show_browser_configs(self) -> None:
         dialog = ConfigManagerDialog(
@@ -289,18 +336,14 @@ class MainWindow(QMainWindow):
             if result != QMessageBox.StandardButton.Yes:
                 return
 
-        try:
-            self.task = self.app_service.update_task_configuration(
-                task_id=self.task.task_id,
-                task_snapshot=dialog.task_snapshot,
-            )
-        except (OSError, ValueError) as exc:
-            QMessageBox.warning(self, "任务配置无效", str(exc))
-            return
         self._shutdown_confirmation_browser()
-        self._editing_task_index = None
-        self._refresh_task_page()
-        self.statusBar().showMessage("任务配置已保存。", 4000)
+        self._start_task_mutation(
+            operation="update_config",
+            progress_title="保存任务配置中",
+            progress_label="正在按新配置处理任务数据，请稍候...",
+            task_id=self.task.task_id,
+            task_snapshot=dialog.task_snapshot,
+        )
 
     def _load_task(self, task_id: int) -> None:
         self._shutdown_confirmation_browser()
@@ -738,3 +781,65 @@ class MainWindow(QMainWindow):
             return
         self._confirmation_task_id = None
         self.browser.shutdown()
+
+    def _start_task_mutation(
+        self,
+        *,
+        operation: str,
+        progress_title: str,
+        progress_label: str,
+        source_path: Path | None = None,
+        task_snapshot: TaskSnapshot | None = None,
+        task_id: int | None = None,
+    ) -> None:
+        if self._task_worker_thread is not None and self._task_worker_thread.isRunning():
+            QMessageBox.information(self, "处理中", "当前已有任务处理进行中，请等待完成。")
+            return
+
+        self._task_worker_thread = QThread(self)
+        self._task_worker = _TaskMutationWorker(
+            app_service=self.app_service,
+            operation=operation,
+            source_path=source_path,
+            task_snapshot=task_snapshot,
+            task_id=task_id,
+        )
+        self._task_worker.moveToThread(self._task_worker_thread)
+        self._task_worker_thread.started.connect(self._task_worker.run)
+        self._task_worker.succeeded.connect(self._handle_task_mutation_success)
+        self._task_worker.failed.connect(self._handle_task_mutation_failure)
+        self._task_worker.succeeded.connect(self._task_worker_thread.quit)
+        self._task_worker.failed.connect(self._task_worker_thread.quit)
+        self._task_worker_thread.finished.connect(self._cleanup_task_worker)
+
+        self._task_progress_dialog = QProgressDialog(progress_label, "", 0, 0, self)
+        self._task_progress_dialog.setWindowTitle(progress_title)
+        self._task_progress_dialog.setCancelButton(None)
+        self._task_progress_dialog.setMinimumDuration(0)
+        self._task_progress_dialog.setWindowModality(Qt.WindowModality.WindowModal)
+        self._task_progress_dialog.setAutoClose(False)
+        self._task_progress_dialog.setAutoReset(False)
+        self._task_progress_dialog.show()
+        self._task_worker_thread.start()
+
+    def _handle_task_mutation_success(self, task_id: int, message: str) -> None:
+        self._pending_task_success_message = message
+        self._load_task(task_id)
+        self._editing_task_index = None
+        self.statusBar().showMessage(f"{message}：#{task_id}", 4000)
+
+    def _handle_task_mutation_failure(self, message: str) -> None:
+        QMessageBox.warning(self, "任务处理失败", message)
+
+    def _cleanup_task_worker(self) -> None:
+        if self._task_progress_dialog is not None:
+            self._task_progress_dialog.close()
+            self._task_progress_dialog.deleteLater()
+        if self._task_worker is not None:
+            self._task_worker.deleteLater()
+        if self._task_worker_thread is not None:
+            self._task_worker_thread.deleteLater()
+        self._task_progress_dialog = None
+        self._task_worker = None
+        self._task_worker_thread = None
+        self._pending_task_success_message = None

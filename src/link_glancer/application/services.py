@@ -352,6 +352,9 @@ class TaskApplicationService:
     def list_browser_configs(self) -> list[BrowserConfig]:
         return self._browser_configs.list_browser_configs()
 
+    def load_browser_config(self, config_id: str) -> BrowserConfig:
+        return self._browser_configs.load_browser_config(config_id)
+
     def list_browser_profiles(self) -> list[BrowserProfile]:
         return self._browser_configs.list_browser_profiles()
 

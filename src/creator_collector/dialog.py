@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import json
+import sys
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QThread, QTimer, Signal
+from PySide6.QtCore import QProcess, QTimer
 from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
@@ -22,9 +25,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from creator_collector.exporter import export_collection_to_path
 from creator_collector.models import CreatorCollectionConfig
-from creator_collector.service import DEFAULT_SAFETY_LIMIT, CreatorCollectorSession
+from creator_collector.service import DEFAULT_SAFETY_LIMIT
 from link_glancer.application import TaskApplicationService
 from link_glancer.tasks.models import BrowserConfig
 
@@ -34,35 +36,66 @@ COLLECTION_POLL_INTERVAL_MS = 1000
 TIME_LABEL_REFRESH_INTERVAL_SECONDS = 5
 
 
-class _SaveTaskWorker(QObject):
-    finished = Signal(int, str)
-    failed = Signal(str)
+@dataclass(slots=True)
+class _CollectorWorkerStatus:
+    running: bool
+    auto_scroll_enabled: bool
+    interrupted: bool
+    completed: bool
+    collected_count: int
+    pages_fetched: int
+    safety_limit: int
+    auto_advance_interval_seconds: float
+    last_message: str
+    started_at: datetime | None
+    ended_at: datetime | None
+    estimated_total_count: int | None
+    estimated_end_at: datetime | None
+    saving: bool
 
-    def __init__(
-        self,
-        *,
-        rows: list[dict[str, object]],
-        export_path: Path,
-        browser_config_id: str,
-        app_service: TaskApplicationService,
-    ) -> None:
-        super().__init__()
-        self._rows = rows
-        self._export_path = export_path
-        self._browser_config_id = browser_config_id
-        self._app_service = app_service
+    @classmethod
+    def idle(cls) -> _CollectorWorkerStatus:
+        return cls(
+            running=False,
+            auto_scroll_enabled=False,
+            interrupted=False,
+            completed=False,
+            collected_count=0,
+            pages_fetched=0,
+            safety_limit=DEFAULT_SAFETY_LIMIT,
+            auto_advance_interval_seconds=1.5,
+            last_message="采集会话未启动。",
+            started_at=None,
+            ended_at=None,
+            estimated_total_count=None,
+            estimated_end_at=None,
+            saving=False,
+        )
 
-    def run(self) -> None:
-        try:
-            saved_path = export_collection_to_path(self._rows, self._export_path)
-            task_id = self._app_service.create_task_from_creator_collection(
-                source_path=saved_path,
-                browser_config_id=self._browser_config_id,
-            )
-        except Exception as exc:  # noqa: BLE001
-            self.failed.emit(str(exc))
-            return
-        self.finished.emit(task_id, str(saved_path))
+    @classmethod
+    def from_payload(cls, payload: dict[str, object]) -> _CollectorWorkerStatus:
+        return cls(
+            running=bool(payload.get("running")),
+            auto_scroll_enabled=bool(payload.get("auto_scroll_enabled")),
+            interrupted=bool(payload.get("interrupted")),
+            completed=bool(payload.get("completed")),
+            collected_count=int(payload.get("collected_count") or 0),
+            pages_fetched=int(payload.get("pages_fetched") or 0),
+            safety_limit=int(payload.get("safety_limit") or DEFAULT_SAFETY_LIMIT),
+            auto_advance_interval_seconds=float(
+                payload.get("auto_advance_interval_seconds") or 1.5
+            ),
+            last_message=str(payload.get("last_message") or ""),
+            started_at=_parse_datetime(payload.get("started_at")),
+            ended_at=_parse_datetime(payload.get("ended_at")),
+            estimated_total_count=(
+                int(payload["estimated_total_count"])
+                if isinstance(payload.get("estimated_total_count"), int)
+                else None
+            ),
+            estimated_end_at=_parse_datetime(payload.get("estimated_end_at")),
+            saving=bool(payload.get("saving")),
+        )
 
 
 class CreatorCollectorDialog(QDialog):
@@ -111,29 +144,10 @@ class CreatorCollectorDialog(QDialog):
             QMessageBox.warning(self, "缺少浏览器配置", "请先选择浏览器配置。")
             return
         self._save_defaults()
-        session = CreatorCollectorSession(browser_config)
-        status = session.start(self._build_config(), paused=True)
-        if not status.running:
-            QMessageBox.warning(self, "启动失败", status.last_message)
-            session.shutdown()
-            return
-
-        result = QMessageBox.question(
-            self,
-            "确认开始采集",
-            "请确认浏览器已正常打开，并已完成登录、国家切换、筛选调整等准备。\n\n是否开始采集？",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
-            QMessageBox.StandardButton.Yes,
-        )
-        if result != QMessageBox.StandardButton.Yes:
-            session.shutdown()
-            return
-
         progress_dialog = CreatorCollectorProgressDialog(
             app_service=self._app_service,
             browser_config=browser_config,
-            session=session,
-            auto_start=True,
+            collection_config=self._build_config(),
             parent=self,
         )
         progress_dialog.exec()
@@ -199,28 +213,28 @@ class CreatorCollectorProgressDialog(QDialog):
         *,
         app_service: TaskApplicationService,
         browser_config: BrowserConfig,
-        session: CreatorCollectorSession,
-        auto_start: bool = False,
+        collection_config: CreatorCollectionConfig,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self._app_service = app_service
         self._browser_config = browser_config
-        self._session = session
-        self._auto_start = auto_start
+        self._collection_config = collection_config
+        self._status = _CollectorWorkerStatus.idle()
         self._collection_started = False
-        self._startup_pending = auto_start
+        self._startup_pending = True
         self._handling_interrupt = False
         self._last_interrupt_message: str | None = None
-        self._save_thread: QThread | None = None
-        self._save_worker: _SaveTaskWorker | None = None
-        self._save_target_path: Path | None = None
         self._closing_after_save = False
         self._force_close = False
         self._last_time_label_refresh_at: datetime | None = None
+        self._confirming_start = False
+        self._worker_started = False
+        self._worker_buffer = ""
+        self._process = QProcess(self)
         self.created_task_id: int | None = None
-        self.last_safety_limit = session.status().safety_limit
-        self._last_auto_advance_interval_seconds = session.status().auto_advance_interval_seconds
+        self.last_safety_limit = collection_config.safety_limit
+        self._last_auto_advance_interval_seconds = collection_config.auto_advance_interval_seconds
         self.last_auto_advance_interval_seconds = self._last_auto_advance_interval_seconds
 
         self.setWindowTitle("采集中")
@@ -233,7 +247,7 @@ class CreatorCollectorProgressDialog(QDialog):
         summary_grid = QGridLayout()
         summary_grid.setHorizontalSpacing(24)
         summary_grid.setVerticalSpacing(10)
-        self._status_label = QLabel("启动中" if auto_start else "暂停滚动中")
+        self._status_label = QLabel("启动中")
         self._count_label = QLabel("0")
         self._page_label = QLabel("0")
         self._elapsed_label = QLabel("-")
@@ -294,29 +308,119 @@ class CreatorCollectorProgressDialog(QDialog):
 
         self._timer = QTimer(self)
         self._timer.setInterval(COLLECTION_POLL_INTERVAL_MS)
-        self._timer.timeout.connect(self._refresh_status)
+        self._timer.timeout.connect(self._refresh_time_labels)
         self._timer.start()
-        self._refresh_status()
-        if self._auto_start:
-            QTimer.singleShot(150, self._begin_collection)
+        self._configure_process()
+        self._refresh_from_status()
+        QTimer.singleShot(0, self._start_worker_process)
 
-    def _begin_collection(self) -> None:
-        if self._collection_started:
+    def _configure_process(self) -> None:
+        self._process.setProcessChannelMode(QProcess.ProcessChannelMode.SeparateChannels)
+        self._process.started.connect(self._send_start_command)
+        self._process.readyReadStandardOutput.connect(self._read_worker_output)
+        self._process.finished.connect(self._handle_process_finished)
+        self._process.errorOccurred.connect(self._handle_process_error)
+
+    def _start_worker_process(self) -> None:
+        if getattr(sys, "frozen", False):
+            program = sys.executable
+            arguments = ["--collector-worker"]
+        else:
+            program = sys.executable
+            arguments = ["-m", "link_glancer.main", "--collector-worker"]
+        self._process.start(program, arguments)
+
+    def _send_start_command(self) -> None:
+        self._send_command(
+            {
+                "cmd": "start",
+                "browser_config_id": self._browser_config.config_id,
+                "page_url": self._collection_config.page_url,
+                "safety_limit": self.last_safety_limit,
+                "auto_advance_interval_seconds": self._last_auto_advance_interval_seconds,
+                "paused": True,
+            }
+        )
+
+    def _read_worker_output(self) -> None:
+        self._worker_buffer += bytes(self._process.readAllStandardOutput()).decode(
+            "utf-8",
+            errors="replace",
+        )
+        while "\n" in self._worker_buffer:
+            line, self._worker_buffer = self._worker_buffer.split("\n", 1)
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(payload, dict):
+                self._handle_worker_message(payload)
+
+    def _handle_worker_message(self, payload: dict[str, object]) -> None:
+        message_type = str(payload.get("type") or "")
+        if message_type == "status":
+            raw_status = payload.get("status")
+            if isinstance(raw_status, dict):
+                self._status = _CollectorWorkerStatus.from_payload(raw_status)
+                self.last_safety_limit = self._status.safety_limit
+                self._last_auto_advance_interval_seconds = (
+                    self._status.auto_advance_interval_seconds
+                )
+                self.last_auto_advance_interval_seconds = self._status.auto_advance_interval_seconds
+                if not self._worker_started and self._status.running:
+                    self._worker_started = True
+                    self._send_start_confirmation()
+                self._refresh_from_status()
             return
-        self._collection_started = True
-        self._startup_pending = False
-        self._session.resume()
-        self._refresh_status()
+        if message_type == "saved_and_created":
+            self.created_task_id = int(payload.get("task_id") or 0)
+            QMessageBox.information(
+                self,
+                "已创建任务",
+                f"已保存并创建检查任务 #{self.created_task_id}",
+            )
+            self._send_command({"cmd": "shutdown"})
+            self.accept()
+            return
+        if message_type == "error":
+            message = str(payload.get("message") or "采集进程执行失败。")
+            if not self._worker_started:
+                QMessageBox.warning(self, "启动失败", message)
+                self._force_close = True
+                self.close()
+                return
+            QMessageBox.warning(self, "采集任务失败", message)
+            self._refresh_from_status()
 
-    def _refresh_status(self) -> None:
-        self._session.poll()
-        status = self._session.status()
-        self.last_safety_limit = status.safety_limit
-        self._last_auto_advance_interval_seconds = status.auto_advance_interval_seconds
-        self.last_auto_advance_interval_seconds = status.auto_advance_interval_seconds
+    def _send_start_confirmation(self) -> None:
+        if self._confirming_start or self._collection_started:
+            return
+        self._confirming_start = True
+        result = QMessageBox.question(
+            self,
+            "确认开始采集",
+            "请确认浏览器已正常打开，并已完成登录、国家切换、筛选调整等准备。\n\n是否开始采集？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Yes,
+        )
+        self._confirming_start = False
+        if result == QMessageBox.StandardButton.Yes:
+            self._collection_started = True
+            self._startup_pending = False
+            self._send_command({"cmd": "resume"})
+            return
+        self._send_command({"cmd": "shutdown"})
+        self._force_close = True
+        self.close()
+
+    def _refresh_from_status(self) -> None:
+        status = self._status
         if self._safety_limit_spin.value() != status.safety_limit:
             self._safety_limit_spin.blockSignals(True)
-            self._safety_limit_spin.setValue(status.safety_limit)
+            self._safety_limit_spin.setValue(status.safety_limit or self.last_safety_limit)
             self._safety_limit_spin.blockSignals(False)
         if self._auto_scroll_interval_spin.value() != status.auto_advance_interval_seconds:
             self._auto_scroll_interval_spin.blockSignals(True)
@@ -324,7 +428,7 @@ class CreatorCollectorProgressDialog(QDialog):
             self._auto_scroll_interval_spin.blockSignals(False)
         self._count_label.setText(f"{status.collected_count} 条")
         self._page_label.setText(f"{status.pages_fetched} 页")
-        self._refresh_time_labels_if_needed(status)
+        self._refresh_time_labels_if_needed(status, force=True)
         self._status_label.setText(self._display_status_text(status))
         auto_scroll_active = status.running and not status.completed
         controls_ready = not self._startup_pending
@@ -341,9 +445,17 @@ class CreatorCollectorProgressDialog(QDialog):
         self._auto_scroll_interval_spin.setEnabled(controls_ready and not self._is_saving())
         self._maybe_handle_interrupt(status)
 
-    def _refresh_time_labels_if_needed(self, status) -> None:
+    def _refresh_time_labels(self) -> None:
+        self._refresh_time_labels_if_needed(self._status, force=False)
+
+    def _refresh_time_labels_if_needed(
+        self,
+        status: _CollectorWorkerStatus,
+        *,
+        force: bool,
+    ) -> None:
         now = datetime.now(UTC)
-        should_refresh = self._last_time_label_refresh_at is None
+        should_refresh = force or self._last_time_label_refresh_at is None
         if not should_refresh:
             should_refresh = (now - self._last_time_label_refresh_at) >= timedelta(
                 seconds=TIME_LABEL_REFRESH_INTERVAL_SECONDS
@@ -359,23 +471,22 @@ class CreatorCollectorProgressDialog(QDialog):
         self._last_time_label_refresh_at = now
 
     def _update_safety_limit(self, value: int) -> None:
-        self._session.update_safety_limit(value)
         self.last_safety_limit = value
-        self._refresh_status()
+        self._persist_defaults()
+        self._send_command({"cmd": "update_limit", "value": value})
 
     def _update_auto_scroll_interval(self, value: float) -> None:
-        self._session.update_auto_advance_interval(value)
         self._last_auto_advance_interval_seconds = value
         self.last_auto_advance_interval_seconds = value
-        self._refresh_status()
+        self._persist_defaults()
+        self._send_command({"cmd": "update_interval", "value": value})
 
     def _toggle_auto_scroll(self) -> None:
-        status = self._session.status()
+        status = self._status
         if status.auto_scroll_enabled:
-            self._session.pause_auto_scroll()
+            self._send_command({"cmd": "pause"})
         else:
-            self._session.resume_auto_scroll()
-        self._refresh_status()
+            self._send_command({"cmd": "resume"})
 
     def _stop_collection(self) -> None:
         result = QMessageBox.question(
@@ -385,8 +496,7 @@ class CreatorCollectorProgressDialog(QDialog):
         )
         if result != QMessageBox.StandardButton.Yes:
             return
-        self._session.stop()
-        self._refresh_status()
+        self._send_command({"cmd": "stop"})
 
     def _save_and_create_task(self, *, close_when_cancelled: bool = False) -> None:
         if self._is_saving():
@@ -406,19 +516,17 @@ class CreatorCollectorProgressDialog(QDialog):
         export_path = Path(selected)
         if export_path.suffix.lower() != ".xlsx":
             export_path = export_path.with_suffix(".xlsx")
-        rows = self._session.status().rows
-        if not rows:
+        if self._status.collected_count <= 0:
             QMessageBox.warning(self, "无法保存", "当前没有可保存的采集数据。")
             if close_when_cancelled:
                 self._force_close = True
                 self.close()
             return
         self._save_export_dir(export_path.parent)
-        self._save_target_path = export_path
         self._closing_after_save = close_when_cancelled
-        self._start_save_task(rows, export_path)
+        self._send_command({"cmd": "save_and_create", "export_path": str(export_path)})
 
-    def _maybe_handle_interrupt(self, status) -> None:
+    def _maybe_handle_interrupt(self, status: _CollectorWorkerStatus) -> None:
         if (
             self._handling_interrupt
             or not self._collection_started
@@ -441,21 +549,21 @@ class CreatorCollectorProgressDialog(QDialog):
         )
         self._handling_interrupt = False
         if result == QMessageBox.StandardButton.Yes:
-            self._session.resume_auto_scroll()
+            self._send_command({"cmd": "resume"})
         else:
-            self._session.stop()
-        self._refresh_status()
+            self._send_command({"cmd": "stop"})
 
     def closeEvent(self, event) -> None:
         if self._force_close:
             self._force_close = False
+            self._terminate_worker_process()
             super().closeEvent(event)
             return
         if self._is_saving():
             QMessageBox.information(self, "正在保存", "保存进行中，请等待完成后再关闭窗口。")
             event.ignore()
             return
-        status = self._session.status()
+        status = self._status
         self.last_safety_limit = status.safety_limit
         self.last_auto_advance_interval_seconds = status.auto_advance_interval_seconds
         if not status.auto_scroll_enabled or not status.running or status.completed:
@@ -473,17 +581,23 @@ class CreatorCollectorProgressDialog(QDialog):
             if result != QMessageBox.StandardButton.Yes:
                 event.ignore()
                 return
-            self._session.stop()
+            self._send_command({"cmd": "stop"})
+        self._send_command({"cmd": "shutdown"})
+        self._terminate_worker_process()
         super().closeEvent(event)
 
-    def _format_finish_time(self, estimated_end_at: datetime | None, status) -> str:
+    def _format_finish_time(
+        self,
+        estimated_end_at: datetime | None,
+        status: _CollectorWorkerStatus,
+    ) -> str:
         if status.completed and status.ended_at is not None:
             return status.ended_at.astimezone().strftime("%Y-%m-%d %H:%M:%S")
         if estimated_end_at is None:
             return "-"
         return estimated_end_at.astimezone().strftime("%Y-%m-%d %H:%M:%S")
 
-    def _format_remaining(self, status) -> str:
+    def _format_remaining(self, status: _CollectorWorkerStatus) -> str:
         if status.completed or (not status.running and status.ended_at is not None):
             return "00:00:00"
         if status.estimated_end_at is None:
@@ -496,7 +610,7 @@ class CreatorCollectorProgressDialog(QDialog):
         minutes, seconds = divmod(remainder, 60)
         return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
-    def _display_status_text(self, status) -> str:
+    def _display_status_text(self, status: _CollectorWorkerStatus) -> str:
         if self._is_saving():
             return "保存中"
         if self._startup_pending:
@@ -522,47 +636,55 @@ class CreatorCollectorProgressDialog(QDialog):
     def _save_export_dir(self, directory: Path) -> None:
         self._app_service.save_app_setting("creator_collection_export_dir", str(directory))
 
-    def _start_save_task(self, rows: list[dict[str, object]], export_path: Path) -> None:
-        self._save_thread = QThread(self)
-        self._save_worker = _SaveTaskWorker(
-            rows=rows,
-            export_path=export_path,
-            browser_config_id=self._browser_config.config_id,
-            app_service=self._app_service,
+    def _persist_defaults(self) -> None:
+        self._app_service.save_app_setting(
+            "creator_collection_defaults",
+            {
+                "browser_config_id": self._browser_config.config_id,
+                "page_url": self._collection_config.page_url,
+                "safety_limit": self.last_safety_limit,
+                "auto_advance_interval_seconds": self.last_auto_advance_interval_seconds,
+            },
         )
-        self._save_worker.moveToThread(self._save_thread)
-        self._save_thread.started.connect(self._save_worker.run)
-        self._save_worker.finished.connect(self._handle_save_success)
-        self._save_worker.failed.connect(self._handle_save_failure)
-        self._save_worker.finished.connect(self._save_thread.quit)
-        self._save_worker.failed.connect(self._save_thread.quit)
-        self._save_thread.finished.connect(self._cleanup_save_thread)
-        self._refresh_status()
-        self._save_thread.start()
-
-    def _handle_save_success(self, task_id: int, _saved_path: str) -> None:
-        self.created_task_id = task_id
-        self._session.stop()
-        QMessageBox.information(self, "已创建任务", f"已保存并创建检查任务 #{task_id}")
-        self.accept()
-
-    def _handle_save_failure(self, message: str) -> None:
-        QMessageBox.warning(self, "采集任务创建失败", message)
-        self._refresh_status()
-
-    def _cleanup_save_thread(self) -> None:
-        if self._save_worker is not None:
-            self._save_worker.deleteLater()
-        if self._save_thread is not None:
-            self._save_thread.deleteLater()
-        self._save_worker = None
-        self._save_thread = None
-        self._save_target_path = None
-        self._closing_after_save = False
-        self._refresh_status()
 
     def _is_saving(self) -> bool:
-        return self._save_thread is not None and self._save_thread.isRunning()
+        return self._status.saving
+
+    def _send_command(self, payload: dict[str, object]) -> None:
+        if self._process.state() != QProcess.ProcessState.Running:
+            return
+        self._process.write((json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8"))
+        self._process.waitForBytesWritten(1000)
+
+    def _handle_process_finished(self) -> None:
+        self._status = _CollectorWorkerStatus(
+            running=False,
+            auto_scroll_enabled=False,
+            interrupted=self._status.interrupted,
+            completed=self._status.completed,
+            collected_count=self._status.collected_count,
+            pages_fetched=self._status.pages_fetched,
+            safety_limit=self._status.safety_limit,
+            auto_advance_interval_seconds=self._status.auto_advance_interval_seconds,
+            last_message=self._status.last_message,
+            started_at=self._status.started_at,
+            ended_at=self._status.ended_at,
+            estimated_total_count=self._status.estimated_total_count,
+            estimated_end_at=self._status.estimated_end_at,
+            saving=False,
+        )
+        self._refresh_from_status()
+
+    def _handle_process_error(self, _error: QProcess.ProcessError) -> None:
+        if self._force_close:
+            return
+        QMessageBox.warning(self, "采集进程失败", self._process.errorString())
+
+    def _terminate_worker_process(self) -> None:
+        if self._process.state() == QProcess.ProcessState.NotRunning:
+            return
+        self._process.kill()
+        self._process.waitForFinished(2000)
 
 
 def _create_action_button(text: str) -> QPushButton:
@@ -587,3 +709,15 @@ def _add_summary_row(
     layout.addWidget(value_label, row, column_group * 2 + 1)
     if stretch:
         value_label.setWordWrap(True)
+
+
+def _parse_datetime(value: object) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed

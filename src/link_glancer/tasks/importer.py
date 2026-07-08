@@ -3,7 +3,6 @@ from __future__ import annotations
 from pathlib import Path
 
 from openpyxl import load_workbook
-from openpyxl.worksheet.worksheet import Worksheet
 
 from link_glancer.tasks.models import TaskSnapshot
 
@@ -22,11 +21,7 @@ def read_workbook_headers(workbook_path: Path, *, sheet_name: str, header_row: i
         if sheet_name not in workbook.sheetnames:
             raise ValueError(f"Sheet {sheet_name!r} not found in workbook")
         sheet = workbook[sheet_name]
-        return [
-            str(cell.value or "").strip()
-            for cell in sheet[header_row]
-            if str(cell.value or "").strip()
-        ]
+        return _read_header_values(sheet, header_row)
     finally:
         workbook.close()
 
@@ -41,14 +36,16 @@ def import_task_workbook(
 
         sheet = workbook[task_snapshot.sheet_name]
         header_map = _build_header_map(sheet, task_snapshot.header_row)
-        row_number = task_snapshot.header_row + 1
         rows: list[tuple[int, dict[str, object]]] = []
+        if not header_map:
+            return rows
 
-        max_row = sheet.max_row
-        while row_number <= max_row:
-            row_values = _read_row(sheet, row_number, header_map)
+        for row_number, values in _iter_data_rows(sheet, task_snapshot.header_row):
+            row_values = {
+                header: (values[column_index] if column_index < len(values) else None)
+                for header, column_index in header_map.items()
+            }
             if not any(value not in (None, "") for value in row_values.values()):
-                row_number += 1
                 continue
             normalized = {
                 header: ("" if value is None else value)
@@ -56,7 +53,6 @@ def import_task_workbook(
                 if header.strip()
             }
             rows.append((row_number, normalized))
-            row_number += 1
 
         return rows
     finally:
@@ -75,21 +71,30 @@ def workbook_headers_exist(
     return found, missing
 
 
-def _build_header_map(sheet: Worksheet, header_row: int) -> dict[str, int]:
+def _build_header_map(sheet, header_row: int) -> dict[str, int]:
     header_map: dict[str, int] = {}
-    for cell in sheet[header_row]:
-        header = str(cell.value or "").strip()
+    for column_index, header in enumerate(_read_header_values(sheet, header_row)):
         normalized = _normalize_header(header)
         if normalized and normalized not in header_map:
-            header_map[header] = int(cell.column)
+            header_map[header] = column_index
     return header_map
 
 
-def _read_row(sheet: Worksheet, row_number: int, header_map: dict[str, int]) -> dict[str, object]:
-    return {
-        header: sheet.cell(row=row_number, column=column_index).value
-        for header, column_index in header_map.items()
-    }
+def _read_header_values(sheet, header_row: int) -> list[str]:
+    for row in sheet.iter_rows(
+        min_row=header_row,
+        max_row=header_row,
+        values_only=True,
+    ):
+        return [text for text in (str(cell or "").strip() for cell in row) if text]
+    return []
+
+
+def _iter_data_rows(sheet, header_row: int):
+    yield from enumerate(
+        sheet.iter_rows(min_row=header_row + 1, values_only=True),
+        start=header_row + 1,
+    )
 
 
 def _normalize_header(value: str) -> str:
