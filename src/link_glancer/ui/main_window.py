@@ -292,10 +292,13 @@ class MainWindow(QMainWindow):
         )
         if dialog.exec() != int(QDialog.DialogCode.Accepted):
             return
-        if dialog.created_task_id is None:
+        if dialog.last_created_task_id is None:
             return
-        self._load_task(dialog.created_task_id)
-        self.statusBar().showMessage(f"采集完成并创建任务：#{dialog.created_task_id}", 4000)
+        self._load_task(dialog.last_created_task_id)
+        self.statusBar().showMessage(
+            f"采集完成并创建任务：#{dialog.last_created_task_id}",
+            4000,
+        )
 
     def _edit_task_configuration(self) -> None:
         if not self.task:

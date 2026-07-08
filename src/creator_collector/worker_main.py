@@ -86,8 +86,14 @@ class _CollectorWorkerRuntime:
             value = float(command.get("value") or 0)
             self._call_session(lambda session: session.update_auto_advance_interval(value))
             return
-        if action == "save_and_create":
-            self._handle_save_and_create(command)
+        if action == "checkpoint_save":
+            self._handle_checkpoint_save(command)
+            return
+        if action == "finalize_save_and_shutdown":
+            self._handle_finalize_save_and_shutdown(command)
+            return
+        if action == "clear_batch":
+            self._call_session(lambda session: session.clear_collected_batch())
             return
         if action == "status":
             self._push_status_if_needed(force=True)
@@ -124,7 +130,7 @@ class _CollectorWorkerRuntime:
         if not status.running:
             self._push_message({"type": "error", "message": status.last_message})
 
-    def _handle_save_and_create(self, command: dict[str, object]) -> None:
+    def _handle_checkpoint_save(self, command: dict[str, object]) -> None:
         if self._session is None:
             self._push_message({"type": "error", "message": "采集会话未启动。"})
             return
@@ -148,6 +154,7 @@ class _CollectorWorkerRuntime:
                 source_path=saved_path,
                 browser_config_id=self._browser_config_id,
             )
+            self._session.clear_collected_batch()
         except Exception as exc:  # noqa: BLE001
             self._saving = False
             self._push_message({"type": "error", "message": str(exc)})
@@ -156,12 +163,55 @@ class _CollectorWorkerRuntime:
         self._saving = False
         self._push_message(
             {
-                "type": "saved_and_created",
+                "type": "checkpoint_saved",
                 "task_id": task_id,
                 "saved_path": str(saved_path),
             }
         )
         self._push_status_if_needed(force=True)
+
+    def _handle_finalize_save_and_shutdown(self, command: dict[str, object]) -> None:
+        if self._session is None:
+            self._push_message({"type": "error", "message": "采集会话未启动。"})
+            return
+        export_path_raw = str(command.get("export_path") or "").strip()
+        if not export_path_raw:
+            self._push_message({"type": "error", "message": "缺少导出路径。"})
+            return
+        if not self._browser_config_id:
+            self._push_message({"type": "error", "message": "缺少浏览器配置。"})
+            return
+        status = self._session.status()
+        if status.collected_count <= 0:
+            self._push_message({"type": "error", "message": "当前没有可保存的采集数据。"})
+            return
+        export_path = Path(export_path_raw)
+        self._saving = True
+        self._push_status_if_needed(force=True)
+        try:
+            saved_path = self._session.finish_to_path(export_path)
+            task_id = self._app_service.create_task_from_creator_collection(
+                source_path=saved_path,
+                browser_config_id=self._browser_config_id,
+            )
+            self._session.shutdown()
+            self._session = None
+            self._browser_config_id = None
+        except Exception as exc:  # noqa: BLE001
+            self._saving = False
+            self._push_message({"type": "error", "message": str(exc)})
+            self._push_status_if_needed(force=True)
+            return
+        self._saving = False
+        self._push_message(
+            {
+                "type": "finalized_and_saved",
+                "task_id": task_id,
+                "saved_path": str(saved_path),
+            }
+        )
+        self._push_status_if_needed(force=True)
+        self._stop_event.set()
 
     def _call_session(self, callback) -> None:
         if self._session is None:
@@ -236,6 +286,17 @@ def _serialize_datetime(value: datetime | None) -> str | None:
     return value.isoformat()
 
 
+def _configure_stdio_encoding() -> None:
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        if stream is None:
+            continue
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            reconfigure(encoding="utf-8", errors="strict")
+
+
 def run_worker() -> None:
+    _configure_stdio_encoding()
     runtime = _CollectorWorkerRuntime()
     runtime.run()

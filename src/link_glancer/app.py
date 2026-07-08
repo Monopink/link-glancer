@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import ctypes
+import sys
+
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QIcon, QPalette
-from PySide6.QtWidgets import QApplication, QMessageBox, QStyleFactory
+from PySide6.QtWidgets import QApplication, QMessageBox, QStyleFactory, QSystemTrayIcon
 
 from link_glancer.runtime.paths import bundled_asset_path
 from link_glancer.ui.fonts import apply_application_font
@@ -10,6 +13,7 @@ from link_glancer.ui.main_window import MainWindow
 
 
 def create_application() -> QApplication:
+    _set_windows_app_user_model_id()
     QApplication.setHighDpiScaleFactorRoundingPolicy(
         Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
     )
@@ -19,6 +23,9 @@ def create_application() -> QApplication:
     icon_path = bundled_asset_path("icon.svg")
     if icon_path.exists():
         app.setWindowIcon(QIcon(str(icon_path)))
+    tray_icon = QSystemTrayIcon(app.windowIcon(), app)
+    tray_icon.setToolTip("Link Glancer")
+    tray_icon.show()
     app.setStyle(QStyleFactory.create("Fusion"))
     apply_application_font(app)
     _apply_color_scheme(app)
@@ -74,7 +81,9 @@ def create_application() -> QApplication:
     except Exception as exc:
         QMessageBox.critical(None, "启动失败", str(exc))
         raise SystemExit(1) from exc
+    tray_icon.messageClicked.connect(lambda: _activate_main_window(window))
     app.main_window = window  # type: ignore[attr-defined]
+    app.tray_icon = tray_icon  # type: ignore[attr-defined]
     window.show()
     window.raise_()
     window.activateWindow()
@@ -110,3 +119,21 @@ def _apply_disabled_button_text_palette(app: QApplication, color: QColor) -> Non
     palette = app.palette()
     palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.ButtonText, color)
     app.setPalette(palette)
+
+
+def _set_windows_app_user_model_id() -> None:
+    if sys.platform != "win32":
+        return
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("LinkGlancer.Desktop")
+    except (AttributeError, OSError):
+        return
+
+
+def _activate_main_window(window: MainWindow) -> None:
+    if window.isMinimized():
+        window.showNormal()
+    else:
+        window.show()
+    window.raise_()
+    window.activateWindow()

@@ -132,8 +132,10 @@ class CreatorCollectorSession:
             return self.status()
 
         self._flush_backup(force=False)
-        if len(self._rows) >= self._safety_limit:
-            self._mark_completed(f"已达到安全上限 {self._safety_limit} 条。")
+        if len(self._rows) >= self._safety_limit and not self._interrupted:
+            self._interrupt_with_message(
+                f"已达到上限 {self._safety_limit} 条，可调整上限后继续采集。"
+            )
             return self.status()
 
         if self._consume_pending_responses():
@@ -165,6 +167,12 @@ class CreatorCollectorSession:
     def resume_auto_scroll(self) -> CreatorCollectionStatus:
         if self._context is None:
             self._last_message = "采集会话未启动。"
+            return self.status()
+        if len(self._rows) >= self._safety_limit:
+            self._interrupt_with_message(
+                f"当前已采集 {len(self._rows)} 条，已达到上限 {self._safety_limit} 条。"
+                "请先调高上限后再继续。"
+            )
             return self.status()
         self._auto_scroll_enabled = True
         self._interrupted = False
@@ -223,12 +231,33 @@ class CreatorCollectorSession:
         self._last_message = f"已导出到 {saved_path}"
         return saved_path
 
+    def clear_collected_batch(self) -> CreatorCollectionStatus:
+        self._rows.clear()
+        self._completed = False
+        self._interrupted = False
+        self._waiting_for_response = False
+        self._waiting_started_at = None
+        self._next_action_at = None
+        self._pages_fetched = 0
+        self._repeat_page_hits = 0
+        self._estimated_total_count = None
+        self._backup_path = None
+        self._last_backup_saved_at = None
+        self._rows_dirty = False
+        self._started_at = datetime.now(UTC) if self._context is not None else None
+        self._ended_at = None
+        self._auto_scroll_enabled = False
+        self._last_message = "已保存并创建任务，可继续采集。"
+        return self.status()
+
     def update_safety_limit(self, value: int) -> CreatorCollectionStatus:
         self._safety_limit = max(value, 1)
         if self._config is not None:
             self._config.safety_limit = self._safety_limit
         if len(self._rows) >= self._safety_limit and not self._completed:
-            self._mark_completed(f"已达到安全上限 {self._safety_limit} 条。")
+            self._interrupt_with_message(
+                f"已达到上限 {self._safety_limit} 条，可调整上限后继续采集。"
+            )
         return self.status()
 
     def update_auto_advance_interval(self, value: float) -> CreatorCollectionStatus:
@@ -434,8 +463,6 @@ class CreatorCollectorSession:
             self._row_keys.add(row_key)
             self._rows.append(item)
             added_count += 1
-            if len(self._rows) >= self._safety_limit:
-                break
 
         self._pages_fetched += 1
         next_pagination = payload.get("next_pagination")
@@ -460,7 +487,9 @@ class CreatorCollectorSession:
             self._mark_completed("检测到重复页，已停止继续翻页。")
             return
         if len(self._rows) >= self._safety_limit:
-            self._mark_completed(f"已达到安全上限 {self._safety_limit} 条。")
+            self._interrupt_with_message(
+                f"已达到上限 {self._safety_limit} 条，当前页数据已完整保留。可调整上限后继续采集。"
+            )
             return
         if not _pagination_has_more(next_pagination):
             self._mark_completed("采集完成，可导出或创建任务。")
