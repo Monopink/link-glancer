@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QThread, QTimer, Signal
@@ -30,6 +30,8 @@ from link_glancer.tasks.models import BrowserConfig
 
 DEFAULT_CREATOR_PAGE_URL = ""
 DEFAULT_COLLECTION_EXPORT_NAME = "creator_collection_{timestamp}.xlsx"
+COLLECTION_POLL_INTERVAL_MS = 1000
+TIME_LABEL_REFRESH_INTERVAL_SECONDS = 5
 
 
 class _SaveTaskWorker(QObject):
@@ -207,11 +209,15 @@ class CreatorCollectorProgressDialog(QDialog):
         self._session = session
         self._auto_start = auto_start
         self._collection_started = False
+        self._startup_pending = auto_start
         self._handling_interrupt = False
         self._last_interrupt_message: str | None = None
         self._save_thread: QThread | None = None
         self._save_worker: _SaveTaskWorker | None = None
         self._save_target_path: Path | None = None
+        self._closing_after_save = False
+        self._force_close = False
+        self._last_time_label_refresh_at: datetime | None = None
         self.created_task_id: int | None = None
         self.last_safety_limit = session.status().safety_limit
         self._last_auto_advance_interval_seconds = session.status().auto_advance_interval_seconds
@@ -227,7 +233,7 @@ class CreatorCollectorProgressDialog(QDialog):
         summary_grid = QGridLayout()
         summary_grid.setHorizontalSpacing(24)
         summary_grid.setVerticalSpacing(10)
-        self._status_label = QLabel("暂停滚动中")
+        self._status_label = QLabel("启动中" if auto_start else "暂停滚动中")
         self._count_label = QLabel("0")
         self._page_label = QLabel("0")
         self._elapsed_label = QLabel("-")
@@ -287,17 +293,18 @@ class CreatorCollectorProgressDialog(QDialog):
         root.addLayout(controls_box)
 
         self._timer = QTimer(self)
-        self._timer.setInterval(5000)
+        self._timer.setInterval(COLLECTION_POLL_INTERVAL_MS)
         self._timer.timeout.connect(self._refresh_status)
         self._timer.start()
         self._refresh_status()
         if self._auto_start:
-            QTimer.singleShot(0, self._begin_collection)
+            QTimer.singleShot(150, self._begin_collection)
 
     def _begin_collection(self) -> None:
         if self._collection_started:
             return
         self._collection_started = True
+        self._startup_pending = False
         self._session.resume()
         self._refresh_status()
 
@@ -317,20 +324,39 @@ class CreatorCollectorProgressDialog(QDialog):
             self._auto_scroll_interval_spin.blockSignals(False)
         self._count_label.setText(f"{status.collected_count} 条")
         self._page_label.setText(f"{status.pages_fetched} 页")
-        self._elapsed_label.setText(self._format_finish_time(status.estimated_end_at, status))
-        self._eta_label.setText(self._format_remaining(status))
+        self._refresh_time_labels_if_needed(status)
         self._status_label.setText(self._display_status_text(status))
         auto_scroll_active = status.running and not status.completed
-        self._auto_scroll_button.setEnabled(auto_scroll_active and not self._is_saving())
+        controls_ready = not self._startup_pending
+        self._auto_scroll_button.setEnabled(
+            controls_ready and auto_scroll_active and not self._is_saving()
+        )
         self._auto_scroll_button.setText(
             "暂停自动滚动" if status.auto_scroll_enabled else "继续自动滚动"
         )
-        self._stop_button.setEnabled(status.running and not self._is_saving())
+        self._stop_button.setEnabled(controls_ready and status.running and not self._is_saving())
         has_rows = status.collected_count > 0
-        self._save_create_button.setEnabled(has_rows and not self._is_saving())
-        self._safety_limit_spin.setEnabled(not self._is_saving())
-        self._auto_scroll_interval_spin.setEnabled(not self._is_saving())
+        self._save_create_button.setEnabled(controls_ready and has_rows and not self._is_saving())
+        self._safety_limit_spin.setEnabled(controls_ready and not self._is_saving())
+        self._auto_scroll_interval_spin.setEnabled(controls_ready and not self._is_saving())
         self._maybe_handle_interrupt(status)
+
+    def _refresh_time_labels_if_needed(self, status) -> None:
+        now = datetime.now(UTC)
+        should_refresh = self._last_time_label_refresh_at is None
+        if not should_refresh:
+            should_refresh = (now - self._last_time_label_refresh_at) >= timedelta(
+                seconds=TIME_LABEL_REFRESH_INTERVAL_SECONDS
+            )
+        if status.completed or (not status.running and status.ended_at is not None):
+            should_refresh = True
+        if self._startup_pending:
+            should_refresh = True
+        if not should_refresh:
+            return
+        self._elapsed_label.setText(self._format_finish_time(status.estimated_end_at, status))
+        self._eta_label.setText(self._format_remaining(status))
+        self._last_time_label_refresh_at = now
 
     def _update_safety_limit(self, value: int) -> None:
         self._session.update_safety_limit(value)
@@ -362,7 +388,7 @@ class CreatorCollectorProgressDialog(QDialog):
         self._session.stop()
         self._refresh_status()
 
-    def _save_and_create_task(self) -> None:
+    def _save_and_create_task(self, *, close_when_cancelled: bool = False) -> None:
         if self._is_saving():
             return
         default_path = self._default_export_path()
@@ -373,6 +399,9 @@ class CreatorCollectorProgressDialog(QDialog):
             "Excel Workbook (*.xlsx)",
         )
         if not selected:
+            if close_when_cancelled:
+                self._force_close = True
+                self.close()
             return
         export_path = Path(selected)
         if export_path.suffix.lower() != ".xlsx":
@@ -380,9 +409,13 @@ class CreatorCollectorProgressDialog(QDialog):
         rows = self._session.status().rows
         if not rows:
             QMessageBox.warning(self, "无法保存", "当前没有可保存的采集数据。")
+            if close_when_cancelled:
+                self._force_close = True
+                self.close()
             return
         self._save_export_dir(export_path.parent)
         self._save_target_path = export_path
+        self._closing_after_save = close_when_cancelled
         self._start_save_task(rows, export_path)
 
     def _maybe_handle_interrupt(self, status) -> None:
@@ -414,6 +447,10 @@ class CreatorCollectorProgressDialog(QDialog):
         self._refresh_status()
 
     def closeEvent(self, event) -> None:
+        if self._force_close:
+            self._force_close = False
+            super().closeEvent(event)
+            return
         if self._is_saving():
             QMessageBox.information(self, "正在保存", "保存进行中，请等待完成后再关闭窗口。")
             event.ignore()
@@ -421,6 +458,10 @@ class CreatorCollectorProgressDialog(QDialog):
         status = self._session.status()
         self.last_safety_limit = status.safety_limit
         self.last_auto_advance_interval_seconds = status.auto_advance_interval_seconds
+        if not status.auto_scroll_enabled or not status.running or status.completed:
+            event.ignore()
+            self._save_and_create_task(close_when_cancelled=True)
+            return
         if status.running:
             result = QMessageBox.question(
                 self,
@@ -458,6 +499,8 @@ class CreatorCollectorProgressDialog(QDialog):
     def _display_status_text(self, status) -> str:
         if self._is_saving():
             return "保存中"
+        if self._startup_pending:
+            return "启动中"
         if status.completed or not status.running:
             return "已结束"
         if status.auto_scroll_enabled:
@@ -515,6 +558,7 @@ class CreatorCollectorProgressDialog(QDialog):
         self._save_worker = None
         self._save_thread = None
         self._save_target_path = None
+        self._closing_after_save = False
         self._refresh_status()
 
     def _is_saving(self) -> bool:
