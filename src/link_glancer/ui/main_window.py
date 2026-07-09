@@ -228,6 +228,8 @@ class MainWindow(QMainWindow):
         back_button.clicked.connect(self._show_start_page)
         config_button = QPushButton("任务配置")
         config_button.clicked.connect(self._edit_task_configuration)
+        jump_button = QPushButton("调整进度到这里")
+        jump_button.clicked.connect(self._jump_task_progress_to_selection)
         export_button = QPushButton("导出")
         export_button.clicked.connect(self._export_task_with_dialog)
         delete_button = QPushButton("删除任务")
@@ -236,6 +238,7 @@ class MainWindow(QMainWindow):
         start_button.clicked.connect(self._start_review_flow)
         actions.addWidget(back_button)
         actions.addWidget(config_button)
+        actions.addWidget(jump_button)
         actions.addWidget(export_button)
         actions.addWidget(delete_button)
         actions.addStretch(1)
@@ -245,10 +248,15 @@ class MainWindow(QMainWindow):
         self._task_data_table = QTableWidget(0, 0)
         self._task_data_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self._task_data_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self._task_data_table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
-        self._task_data_table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._task_data_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self._task_data_table.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self._task_data_table.setStyleSheet(
-            "QTableView { outline: 0; } QTableView::item:selected { border: 0px; }"
+            "QTableView { outline: 0; } "
+            "QTableView::item:selected { "
+            "border: 0px; "
+            "background-color: #2563eb; "
+            "color: #ffffff; "
+            "}"
         )
         self._task_data_table.setAlternatingRowColors(True)
         self._task_data_table.horizontalHeader().setSectionsMovable(False)
@@ -325,6 +333,7 @@ class MainWindow(QMainWindow):
             dialog_title="任务配置",
             accept_button_text="保存",
             source_editable=False,
+            review_field_id_editable=False,
             parent=self,
         )
         if dialog.exec() != int(QDialog.DialogCode.Accepted):
@@ -336,15 +345,9 @@ class MainWindow(QMainWindow):
             self.task.task_snapshot,
             dialog.task_snapshot,
         )
-        reset_reviews_required = (
-            self.task.task_snapshot.review_fields != dialog.task_snapshot.review_fields
-        )
-        if reimport_required or reset_reviews_required:
+        if reimport_required:
             message_lines = ["保存后将重置当前任务中的已保存检查结果。"]
-            if reimport_required:
-                message_lines.append("由于修改了 Sheet 或标题行，任务数据将按新配置重新导入。")
-            else:
-                message_lines.append("由于修改了检查项，已有结果将被清空。")
+            message_lines.append("由于修改了 Sheet 或标题行，任务数据将按新配置重新导入。")
             result = QMessageBox.question(
                 self,
                 "确认保存任务配置",
@@ -392,10 +395,15 @@ class MainWindow(QMainWindow):
         self._task_table.clearSelection()
         self._task_table.setRowCount(len(summaries))
         for row, summary in enumerate(summaries):
+            progress_completed = self._display_completed_items(
+                completed_items=summary.completed_items,
+                current_task_index=summary.current_task_index,
+                total_items=summary.total_items,
+            )
             values = [
                 str(summary.task_id),
                 summary.name,
-                f"{summary.completed_items}/{summary.total_items}",
+                f"{progress_completed}/{summary.total_items}",
                 self._task_status_label(summary.status),
                 summary.source_file_name,
                 summary.updated_at,
@@ -469,7 +477,10 @@ class MainWindow(QMainWindow):
             "  ·  ".join(
                 [
                     self._format_task_created_at(self.task.created_at),
-                    f"已完成 {self.task.completed_items}/{self.task.total_items}",
+                    (
+                        f"已完成 "
+                        f"{self._task_progress_completed(self.task)}/{self.task.total_items}"
+                    ),
                     f"状态 {self._task_status_label(self.task.status)}",
                 ]
             )
@@ -582,20 +593,20 @@ class MainWindow(QMainWindow):
     def _refresh_task_data_table(self) -> None:
         if not self.task:
             return
-        export_fields = self.task.task_snapshot.export_fields
         items = self.app_service.list_all_items(self.task.task_id)
         reviews = self.app_service.list_reviews(self.task.task_id)
+        table_fields = self.app_service.task_table_field_names(self.task, items)
         self._task_data_table.clear()
-        self._task_data_table.setColumnCount(len(export_fields))
-        self._task_data_table.setHorizontalHeaderLabels(export_fields)
+        self._task_data_table.setColumnCount(len(table_fields))
+        self._task_data_table.setHorizontalHeaderLabels(table_fields)
         self._task_data_table.setRowCount(len(items))
         self._task_data_table.setVerticalHeaderLabels([str(item.task_index) for item in items])
 
         header = self._task_data_table.horizontalHeader()
-        for column in range(len(export_fields)):
+        for column in range(len(table_fields)):
             header.setSectionResizeMode(column, QHeaderView.ResizeMode.Interactive)
             header.resizeSection(column, 160)
-        if export_fields:
+        if table_fields:
             header.resizeSection(0, 220)
 
         palette = self.palette()
@@ -607,7 +618,7 @@ class MainWindow(QMainWindow):
             review = reviews.get(item.task_item_id)
             is_current = item.task_index == self.task.current_task_index
             is_completed = review is not None
-            for column, field_name in enumerate(export_fields):
+            for column, field_name in enumerate(table_fields):
                 value = self._resolve_table_value(
                     field_name,
                     item.task_data,
@@ -629,8 +640,54 @@ class MainWindow(QMainWindow):
 
         current_row = min(max(self.task.current_task_index - 1, 0), max(len(items) - 1, 0))
         if 0 <= current_row < self._task_data_table.rowCount():
-            self._task_data_table.clearSelection()
-            self._task_data_table.setCurrentCell(-1, -1)
+            self._task_data_table.selectRow(current_row)
+
+    def _jump_task_progress_to_selection(self) -> None:
+        if not self.task:
+            return
+        row = self._task_data_table.currentRow()
+        if row < 0:
+            QMessageBox.information(self, "未选择条目", "请先选择要调整到的条目。")
+            return
+        task_index_label = self._task_data_table.verticalHeaderItem(row)
+        if task_index_label is None:
+            return
+        try:
+            task_index = int(task_index_label.text())
+        except ValueError:
+            return
+        result = QMessageBox.question(
+            self,
+            "确认调整进度",
+            f"将检查进度调整到第 {task_index} 条，并从该条开始继续检查。\n\n是否继续？",
+        )
+        if result != QMessageBox.StandardButton.Yes:
+            return
+        self.task = self.app_service.jump_to_task_index(
+            task_id=self.task.task_id,
+            task_index=task_index,
+        )
+        self._refresh_task_page()
+        self.statusBar().showMessage(f"检查进度已调整到第 {task_index} 条", 4000)
+
+    def _task_progress_completed(self, task: TaskDetail) -> int:
+        return self._display_completed_items(
+            completed_items=task.completed_items,
+            current_task_index=task.current_task_index,
+            total_items=task.total_items,
+        )
+
+    def _display_completed_items(
+        self,
+        *,
+        completed_items: int,
+        current_task_index: int,
+        total_items: int,
+    ) -> int:
+        if total_items <= 0:
+            return 0
+        pointer_completed = max(0, min(current_task_index - 1, total_items))
+        return min(completed_items, pointer_completed)
 
     def _resolve_table_value(
         self,

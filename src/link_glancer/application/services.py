@@ -18,6 +18,16 @@ from link_glancer.tasks.models import (
     TaskSnapshot,
     TaskSummary,
 )
+from link_glancer.tasks.serialization import (
+    review_field_from_dict,
+    review_field_to_dict,
+    task_snapshot_from_dict,
+    task_snapshot_to_dict,
+)
+
+LAST_TASK_DEFAULTS_KEY = "last_task_creation_defaults"
+REVIEW_FIELD_LIBRARY_KEY = "review_field_library"
+TASK_SHORTCUT_DEFAULTS_KEY = "task_shortcut_defaults"
 
 
 @dataclass(slots=True)
@@ -68,9 +78,12 @@ class TaskApplicationService:
         source_path: Path,
         task_snapshot: TaskSnapshot,
     ) -> TaskCreationWarnings:
+        enabled_review_fields = self.enabled_review_fields(task_snapshot)
+        self.validate_review_fields(task_snapshot.review_fields)
+        self.validate_enabled_review_fields(task_snapshot)
         self.validate_shortcuts(
             task_snapshot.shortcuts,
-            task_snapshot.review_fields,
+            enabled_review_fields,
         )
         headers = self._workbook_importer.list_headers(
             source_path,
@@ -78,37 +91,16 @@ class TaskApplicationService:
             header_row=task_snapshot.header_row,
         )
         normalized_headers = {header.casefold(): header for header in headers}
-
-        required_excel_headers = [task_snapshot.url_field, *task_snapshot.display_fields]
-        missing_required = [
-            header
-            for header in required_excel_headers
-            if header.casefold() not in normalized_headers
-        ]
-        if missing_required:
-            raise ValueError(f"Excel 缺少必要列：{', '.join(missing_required)}")
-
-        review_field_names = [field.field_id for field in task_snapshot.review_fields]
-        export_missing = [
-            field
-            for field in task_snapshot.export_fields
-            if field.casefold() not in normalized_headers and field not in review_field_names
-        ]
-        if export_missing:
-            raise ValueError(f"导出字段不存在：{', '.join(export_missing)}")
+        if task_snapshot.url_field.casefold() not in normalized_headers:
+            raise ValueError(f"Excel 缺少必要列：{task_snapshot.url_field}")
 
         overlap = [
             field.field_id
-            for field in task_snapshot.review_fields
+            for field in enabled_review_fields
             if field.field_id.casefold() in normalized_headers
         ]
-        missing_review_export_fields = [
-            field.field_id
-            for field in task_snapshot.review_fields
-            if field.field_id not in task_snapshot.export_fields
-        ]
         return TaskCreationWarnings(
-            missing_review_export_fields=missing_review_export_fields,
+            missing_review_export_fields=[],
             overlapping_export_review_fields=overlap,
             uses_first_task_url_as_confirmation=not bool(task_snapshot.confirm_url),
         )
@@ -118,23 +110,28 @@ class TaskApplicationService:
         *,
         source_path: Path,
         task_snapshot: TaskSnapshot,
+        persist_defaults: bool = True,
     ) -> int:
-        browser_config = self._browser_configs.load_browser_config(task_snapshot.browser_config_id)
-        rows = self._workbook_importer.import_rows(source_path, task_snapshot)
+        normalized_snapshot = self.normalize_task_snapshot(task_snapshot)
+        browser_config = self._browser_configs.load_browser_config(
+            normalized_snapshot.browser_config_id
+        )
+        rows = self._workbook_importer.import_rows(source_path, normalized_snapshot)
         if not rows:
             raise ValueError("未找到可导入的任务行。")
         name = self.build_task_name(source_path)
         task_id = self._tasks.create_task(
             name=name,
             source_file_path=source_path,
-            task_snapshot=task_snapshot,
+            task_snapshot=normalized_snapshot,
             browser_config=browser_config,
             rows=rows,
         )
-        self._tasks.save_last_task_creation_defaults(
-            source_path=source_path,
-            task_snapshot=task_snapshot,
-        )
+        if persist_defaults:
+            self.save_task_creation_defaults(
+                source_path=source_path,
+                task_snapshot=normalized_snapshot,
+            )
         return task_id
 
     def create_task_from_creator_collection(
@@ -147,10 +144,21 @@ class TaskApplicationService:
             source_path=source_path,
             browser_config_id=browser_config_id,
         )
-        return self.create_task(source_path=source_path, task_snapshot=task_snapshot)
+        task_id = self.create_task(
+            source_path=source_path,
+            task_snapshot=task_snapshot,
+            persist_defaults=False,
+        )
+        self.save_task_creation_defaults_from_creator_collection(
+            source_path=source_path,
+            task_snapshot=task_snapshot,
+        )
+        return task_id
 
     def load_task(self, task_id: int) -> TaskDetail:
-        return self._tasks.load_task(task_id)
+        task = self._tasks.load_task(task_id)
+        task.task_snapshot = self.normalize_task_snapshot(task.task_snapshot)
+        return task
 
     def list_tasks(self) -> list[TaskSummary]:
         return self._tasks.list_tasks()
@@ -165,31 +173,32 @@ class TaskApplicationService:
         task_snapshot: TaskSnapshot,
     ) -> TaskDetail:
         task = self.load_task(task_id)
-        self.validate_review_fields(task_snapshot.review_fields)
+        normalized_snapshot = self.normalize_task_snapshot(task_snapshot)
         self.validate_task_snapshot(
             source_path=task.source_file_path,
-            task_snapshot=task_snapshot,
+            task_snapshot=normalized_snapshot,
         )
-        browser_config = self._browser_configs.load_browser_config(task_snapshot.browser_config_id)
+        browser_config = self._browser_configs.load_browser_config(
+            normalized_snapshot.browser_config_id
+        )
 
         source_structure_changed = self._source_structure_changed(
             task.task_snapshot,
-            task_snapshot,
+            normalized_snapshot,
         )
-        review_structure_changed = task.task_snapshot.review_fields != task_snapshot.review_fields
 
         rows: list[tuple[int, dict[str, object]]] | None = None
         if source_structure_changed:
-            rows = self._workbook_importer.import_rows(task.source_file_path, task_snapshot)
+            rows = self._workbook_importer.import_rows(task.source_file_path, normalized_snapshot)
             if not rows:
                 raise ValueError("按新配置重新导入后没有可用任务行。")
 
         self._tasks.update_task_configuration(
             task_id=task_id,
-            task_snapshot=task_snapshot,
+            task_snapshot=normalized_snapshot,
             browser_config=browser_config,
             rows=rows,
-            reset_reviews=review_structure_changed and rows is None,
+            reset_reviews=False,
         )
         return self.load_task(task_id)
 
@@ -199,21 +208,178 @@ class TaskApplicationService:
         task_id: int,
         task_snapshot: TaskSnapshot,
     ) -> TaskDetail:
-        self.validate_review_fields(task_snapshot.review_fields)
+        normalized_snapshot = self.normalize_task_snapshot(task_snapshot)
+        self.validate_review_fields(normalized_snapshot.review_fields)
+        self.validate_enabled_review_fields(normalized_snapshot)
         self.validate_shortcuts(
-            task_snapshot.shortcuts,
-            task_snapshot.review_fields,
+            normalized_snapshot.shortcuts,
+            self.enabled_review_fields(normalized_snapshot),
         )
-        browser_config = self._browser_configs.load_browser_config(task_snapshot.browser_config_id)
+        browser_config = self._browser_configs.load_browser_config(
+            normalized_snapshot.browser_config_id
+        )
         self._tasks.update_task_snapshot(
             task_id=task_id,
-            task_snapshot=task_snapshot,
+            task_snapshot=normalized_snapshot,
             browser_config=browser_config,
         )
         return self.load_task(task_id)
 
     def load_last_task_creation_defaults(self) -> tuple[Path | None, TaskSnapshot | None]:
-        return self._tasks.load_last_task_creation_defaults()
+        raw = self._tasks.load_app_setting(LAST_TASK_DEFAULTS_KEY)
+        source_path: Path | None = None
+        snapshot: TaskSnapshot | None = None
+        if isinstance(raw, dict):
+            source_path_value = raw.get("source_path")
+            snapshot_value = raw.get("task_snapshot")
+            if isinstance(source_path_value, str) and source_path_value.strip():
+                source_path = Path(source_path_value).resolve()
+            if isinstance(snapshot_value, dict):
+                snapshot = task_snapshot_from_dict(snapshot_value)
+        library = self.load_review_field_library()
+        shortcuts = self.load_task_shortcut_defaults()
+        if snapshot is None:
+            if not library:
+                return source_path, None
+            snapshot = TaskSnapshot(
+                sheet_name="",
+                header_row=1,
+                browser_config_id="",
+                open_tab_count=3,
+                confirm_url=None,
+                url_field="url",
+                display_fields=[],
+                review_fields=library,
+                enabled_review_field_ids=[field.field_id for field in library],
+                shortcuts=shortcuts,
+                export_fields=[],
+            )
+            return source_path, snapshot
+
+        snapshot.review_fields = self.merge_review_fields(library, snapshot.review_fields)
+        snapshot.enabled_review_field_ids = self.normalize_enabled_review_field_ids(
+            snapshot.review_fields,
+            snapshot.enabled_review_field_ids,
+        )
+        snapshot.shortcuts = shortcuts
+        return source_path, snapshot
+
+    def load_review_field_library(self) -> list[ReviewField]:
+        raw = self._tasks.load_app_setting(REVIEW_FIELD_LIBRARY_KEY)
+        if not isinstance(raw, list):
+            return []
+        fields = [review_field_from_dict(item) for item in raw if isinstance(item, dict)]
+        if fields:
+            self.validate_review_fields(fields)
+        return fields
+
+    def save_review_field_library(self, review_fields: list[ReviewField]) -> None:
+        normalized = self.merge_review_fields([], review_fields)
+        self.validate_review_fields(normalized)
+        payload = [review_field_to_dict(field) for field in normalized]
+        self._tasks.save_app_setting(REVIEW_FIELD_LIBRARY_KEY, payload)
+
+    def load_task_shortcut_defaults(self) -> ReviewShortcutConfig:
+        raw = self._tasks.load_app_setting(TASK_SHORTCUT_DEFAULTS_KEY)
+        if not isinstance(raw, dict):
+            return ReviewShortcutConfig()
+        return ReviewShortcutConfig(
+            submit=str(raw.get("submit", "Enter")),
+            previous=str(raw.get("previous", "Backspace")),
+            exit=str(raw.get("exit", "Esc")),
+        )
+
+    def save_task_shortcut_defaults(self, shortcuts: ReviewShortcutConfig) -> None:
+        self.validate_shortcuts(shortcuts, [])
+        self._tasks.save_app_setting(
+            TASK_SHORTCUT_DEFAULTS_KEY,
+            {
+                "submit": shortcuts.submit,
+                "previous": shortcuts.previous,
+                "exit": shortcuts.exit,
+            },
+        )
+
+    def save_task_creation_defaults(
+        self,
+        *,
+        source_path: Path | None,
+        task_snapshot: TaskSnapshot,
+    ) -> None:
+        normalized_snapshot = self.normalize_task_snapshot(task_snapshot)
+        self.save_review_field_library(normalized_snapshot.review_fields)
+        self.save_task_shortcut_defaults(normalized_snapshot.shortcuts)
+        payload_snapshot = TaskSnapshot(
+            sheet_name=normalized_snapshot.sheet_name,
+            header_row=normalized_snapshot.header_row,
+            browser_config_id=normalized_snapshot.browser_config_id,
+            open_tab_count=normalized_snapshot.open_tab_count,
+            confirm_url=normalized_snapshot.confirm_url,
+            url_field=normalized_snapshot.url_field,
+            display_fields=list(normalized_snapshot.display_fields),
+            review_fields=[],
+            enabled_review_field_ids=list(normalized_snapshot.enabled_review_field_ids),
+            shortcuts=ReviewShortcutConfig(),
+            export_fields=list(normalized_snapshot.export_fields),
+        )
+        self._tasks.save_app_setting(
+            LAST_TASK_DEFAULTS_KEY,
+            {
+                "source_path": str(source_path) if source_path is not None else None,
+                "task_snapshot": task_snapshot_to_dict(payload_snapshot),
+            },
+        )
+
+    def save_task_creation_defaults_from_creator_collection(
+        self,
+        *,
+        source_path: Path,
+        task_snapshot: TaskSnapshot,
+    ) -> None:
+        current_source_path, current_snapshot = self.load_last_task_creation_defaults()
+        library = self.merge_review_fields(
+            self.load_review_field_library(),
+            task_snapshot.review_fields,
+        )
+        self.save_review_field_library(library)
+        if current_snapshot is None:
+            current_snapshot = TaskSnapshot(
+                sheet_name=task_snapshot.sheet_name,
+                header_row=task_snapshot.header_row,
+                browser_config_id=task_snapshot.browser_config_id,
+                open_tab_count=task_snapshot.open_tab_count,
+                confirm_url=task_snapshot.confirm_url,
+                url_field=task_snapshot.url_field,
+                display_fields=list(task_snapshot.display_fields),
+                review_fields=[],
+                enabled_review_field_ids=[],
+                shortcuts=self.load_task_shortcut_defaults(),
+                export_fields=list(task_snapshot.export_fields),
+            )
+            current_source_path = source_path
+
+        merged_enabled_ids = self._merge_id_order(
+            current_snapshot.enabled_review_field_ids,
+            task_snapshot.enabled_review_field_ids
+            or [field.field_id for field in task_snapshot.review_fields],
+        )
+        updated_snapshot = TaskSnapshot(
+            sheet_name=task_snapshot.sheet_name,
+            header_row=task_snapshot.header_row,
+            browser_config_id=task_snapshot.browser_config_id,
+            open_tab_count=task_snapshot.open_tab_count,
+            confirm_url=task_snapshot.confirm_url,
+            url_field=task_snapshot.url_field,
+            display_fields=list(task_snapshot.display_fields),
+            review_fields=library,
+            enabled_review_field_ids=merged_enabled_ids,
+            shortcuts=self.load_task_shortcut_defaults(),
+            export_fields=list(task_snapshot.export_fields),
+        )
+        self.save_task_creation_defaults(
+            source_path=source_path or current_source_path,
+            task_snapshot=updated_snapshot,
+        )
 
     def build_creator_collection_task_snapshot(
         self,
@@ -225,6 +391,36 @@ class TaskApplicationService:
         if not sheet_names:
             raise ValueError("采集结果中没有可用工作表。")
         sheet_name = sheet_names[0]
+        collector_fields = [
+            ReviewField(
+                field_id="validity",
+                label="是否可用",
+                field_type="single_select",
+                required=True,
+                options=[
+                    ReviewOption(value="是", label="是", shortcut="1"),
+                    ReviewOption(value="否", label="否", shortcut="2"),
+                ],
+            ),
+            ReviewField(
+                field_id="quality",
+                label="达人质量",
+                field_type="single_select",
+                required=False,
+                options=[
+                    ReviewOption(value="好", label="好", shortcut="3"),
+                    ReviewOption(value="中", label="中", shortcut="4"),
+                    ReviewOption(value="差", label="差", shortcut="5"),
+                ],
+            ),
+        ]
+        library = self.merge_review_fields(self.load_review_field_library(), collector_fields)
+        default_snapshot = self.load_last_task_creation_defaults()[1]
+        default_enabled_ids = default_snapshot.enabled_review_field_ids if default_snapshot else []
+        enabled_review_field_ids = self._merge_id_order(
+            default_enabled_ids,
+            [field.field_id for field in collector_fields],
+        )
         return TaskSnapshot(
             sheet_name=sheet_name,
             header_row=1,
@@ -240,34 +436,9 @@ class TaskApplicationService:
                 "units_sold",
                 "category",
             ],
-            review_fields=[
-                ReviewField(
-                    field_id="validity",
-                    label="是否可用",
-                    field_type="single_select",
-                    required=True,
-                    options=[
-                        ReviewOption(value="是", label="是", shortcut="1"),
-                        ReviewOption(value="否", label="否", shortcut="2"),
-                    ],
-                ),
-                ReviewField(
-                    field_id="quality",
-                    label="达人质量",
-                    field_type="single_select",
-                    required=False,
-                    options=[
-                        ReviewOption(value="好", label="好", shortcut="3"),
-                        ReviewOption(value="中", label="中", shortcut="4"),
-                        ReviewOption(value="差", label="差", shortcut="5"),
-                    ],
-                ),
-            ],
-            shortcuts=ReviewShortcutConfig(
-                submit="Enter",
-                previous="Backspace",
-                exit="Esc",
-            ),
+            review_fields=library,
+            enabled_review_field_ids=enabled_review_field_ids,
+            shortcuts=self.load_task_shortcut_defaults(),
             export_fields=[
                 "creator_oecuid",
                 "handle",
@@ -282,8 +453,6 @@ class TaskApplicationService:
                 "category",
                 "top_follower_gender",
                 "url",
-                "validity",
-                "quality",
             ],
         )
 
@@ -385,6 +554,14 @@ class TaskApplicationService:
                 raise ValueError(f"选择类型的检查项必须配置选项：{field.label}")
             seen.add(field.field_id)
 
+    def validate_enabled_review_fields(self, task_snapshot: TaskSnapshot) -> None:
+        if not task_snapshot.enabled_review_field_ids:
+            raise ValueError("至少需要启用一个检查项。")
+        field_ids = {field.field_id for field in task_snapshot.review_fields}
+        for field_id in task_snapshot.enabled_review_field_ids:
+            if field_id not in field_ids:
+                raise ValueError(f"启用的检查项不存在：{field_id}")
+
     def validate_shortcuts(
         self,
         shortcuts: ReviewShortcutConfig,
@@ -408,6 +585,133 @@ class TaskApplicationService:
             for option in field.options:
                 if option.shortcut:
                     register(option.shortcut, f"{field.label} / {option.label}")
+
+    def enabled_review_fields(self, task_snapshot: TaskSnapshot) -> list[ReviewField]:
+        enabled_ids = {
+            field_id
+            for field_id in self.normalize_enabled_review_field_ids(
+                task_snapshot.review_fields,
+                task_snapshot.enabled_review_field_ids,
+            )
+        }
+        return [field for field in task_snapshot.review_fields if field.field_id in enabled_ids]
+
+    def task_display_field_names(
+        self, task: TaskDetail, items: list[TaskItem] | None = None
+    ) -> list[str]:
+        items = items if items is not None else self.list_all_items(task.task_id)
+        available_columns = self._available_task_columns(items)
+        return [
+            field_name
+            for field_name in task.task_snapshot.display_fields
+            if field_name.casefold() in available_columns
+        ]
+
+    def task_table_field_names(
+        self, task: TaskDetail, items: list[TaskItem] | None = None
+    ) -> list[str]:
+        display_fields = self.task_display_field_names(task, items)
+        review_field_ids = [
+            field.field_id for field in self.enabled_review_fields(task.task_snapshot)
+        ]
+        return self._merge_id_order(display_fields, review_field_ids)
+
+    def export_field_names(
+        self, task: TaskDetail, items: list[TaskItem] | None = None
+    ) -> list[str]:
+        items = items if items is not None else self.list_all_items(task.task_id)
+        available_columns = self._available_task_columns(items)
+        enabled_review_ids = [
+            field.field_id for field in self.enabled_review_fields(task.task_snapshot)
+        ]
+        result: list[str] = []
+        seen: set[str] = set()
+        review_id_set = {field_id.casefold() for field_id in enabled_review_ids}
+
+        for field_name in task.task_snapshot.export_fields:
+            normalized = field_name.casefold()
+            if normalized in seen:
+                continue
+            if normalized in review_id_set or normalized in available_columns:
+                result.append(field_name)
+                seen.add(normalized)
+
+        for field_id in enabled_review_ids:
+            normalized = field_id.casefold()
+            if normalized in seen:
+                continue
+            result.append(field_id)
+            seen.add(normalized)
+        return result
+
+    def normalize_task_snapshot(self, task_snapshot: TaskSnapshot) -> TaskSnapshot:
+        review_fields = self.merge_review_fields([], task_snapshot.review_fields)
+        enabled_review_field_ids = self.normalize_enabled_review_field_ids(
+            review_fields,
+            task_snapshot.enabled_review_field_ids,
+        )
+        return TaskSnapshot(
+            sheet_name=task_snapshot.sheet_name,
+            header_row=task_snapshot.header_row,
+            browser_config_id=task_snapshot.browser_config_id,
+            open_tab_count=task_snapshot.open_tab_count,
+            confirm_url=task_snapshot.confirm_url,
+            url_field=task_snapshot.url_field,
+            display_fields=list(task_snapshot.display_fields),
+            review_fields=review_fields,
+            enabled_review_field_ids=enabled_review_field_ids,
+            shortcuts=task_snapshot.shortcuts,
+            export_fields=list(task_snapshot.export_fields),
+        )
+
+    def merge_review_fields(
+        self,
+        base_fields: list[ReviewField],
+        incoming_fields: list[ReviewField],
+    ) -> list[ReviewField]:
+        merged: list[ReviewField] = []
+        field_index: dict[str, int] = {}
+        for field in base_fields:
+            merged.append(field)
+            field_index[field.field_id] = len(merged) - 1
+        for field in incoming_fields:
+            existing_index = field_index.get(field.field_id)
+            if existing_index is None:
+                merged.append(field)
+                field_index[field.field_id] = len(merged) - 1
+            else:
+                merged[existing_index] = field
+        return merged
+
+    def normalize_enabled_review_field_ids(
+        self,
+        review_fields: list[ReviewField],
+        enabled_review_field_ids: list[str],
+    ) -> list[str]:
+        known_ids = [field.field_id for field in review_fields]
+        if not enabled_review_field_ids:
+            return list(known_ids)
+        enabled_set = {field_id for field_id in enabled_review_field_ids}
+        return [field_id for field_id in known_ids if field_id in enabled_set]
+
+    def _available_task_columns(self, items: list[TaskItem]) -> set[str]:
+        return {
+            key.casefold()
+            for item in items
+            for key in item.task_data
+            if isinstance(key, str) and key.strip()
+        }
+
+    def _merge_id_order(self, primary: list[str], secondary: list[str]) -> list[str]:
+        result: list[str] = []
+        seen: set[str] = set()
+        for field_name in [*primary, *secondary]:
+            normalized = field_name.casefold()
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            result.append(field_name)
+        return result
 
     def _source_structure_changed(
         self,

@@ -59,6 +59,7 @@ class TaskSnapshot:
     url_field: str
     display_fields: list[str] = field(default_factory=list)
     review_fields: list[ReviewField] = field(default_factory=list)
+    enabled_review_field_ids: list[str] = field(default_factory=list)
     shortcuts: ReviewShortcutConfig = field(default_factory=ReviewShortcutConfig)
     export_fields: list[str] = field(default_factory=list)
 

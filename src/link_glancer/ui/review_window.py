@@ -98,7 +98,7 @@ class ReviewWindow(QMainWindow):
         self._field_widgets: dict[str, ReviewFieldWidget] = {}
         self._dynamic_shortcuts: list[QShortcut] = []
         self._review_started_at = datetime.now(UTC)
-        self._review_started_completed = self.task.completed_items
+        self._review_started_completed = self._display_completed_items_for(self.task)
         self._handling_browser_block = False
 
         self.setWindowTitle("检查")
@@ -185,7 +185,7 @@ class ReviewWindow(QMainWindow):
             if widget is not None:
                 widget.deleteLater()
         self._field_widgets.clear()
-        for field in self.task.task_snapshot.review_fields:
+        for field in self._app_service.enabled_review_fields(self.task.task_snapshot):
             widget = create_field_widget(
                 field,
                 option_shortcut_handler=self._edit_option_shortcut,
@@ -215,7 +215,7 @@ class ReviewWindow(QMainWindow):
         exit_shortcut.activated.connect(self.close)
         self._dynamic_shortcuts.append(exit_shortcut)
 
-        for field in self.task.task_snapshot.review_fields:
+        for field in self._app_service.enabled_review_fields(self.task.task_snapshot):
             for option in field.options:
                 if not option.shortcut:
                     continue
@@ -246,8 +246,9 @@ class ReviewWindow(QMainWindow):
     def _refresh_view(self) -> None:
         self.task = self._app_service.load_task(self.task.task_id)
         current_index = self.task.current_task_index
-        completed = min(self.task.completed_items, self.task.total_items)
-        self._progress_label.setText(f"{completed} / {self.task.total_items}")
+        completed = self._display_completed_items()
+        percentage = int((completed / self.task.total_items) * 100) if self.task.total_items else 0
+        self._progress_label.setText(f"{completed} / {self.task.total_items} ({percentage}%)")
         self._progress_bar.setMaximum(max(self.task.total_items, 1))
         self._progress_bar.setValue(completed)
         self._progress_bar.setFormat(self._progress_label.text())
@@ -269,15 +270,15 @@ class ReviewWindow(QMainWindow):
         if item is None:
             return "没有更多条目。"
         details: list[str] = []
-        for field_name in self.task.task_snapshot.display_fields:
+        for field_name in self._app_service.task_display_field_names(self.task, [item]):
             if field_name in item.task_data:
                 details.append(f"{field_name}：{item.task_data[field_name]}")
         return "\n".join(details) if details else "当前条目没有可展示字段。"
 
     def _review_time_metrics(self) -> int | None:
         elapsed = max(int((datetime.now(UTC) - self._review_started_at).total_seconds()), 0)
-        completed_in_session = self.task.completed_items - self._review_started_completed
-        remaining = max(self.task.total_items - self.task.completed_items, 0)
+        completed_in_session = self._display_completed_items() - self._review_started_completed
+        remaining = max(self.task.total_items - self._display_completed_items(), 0)
         if completed_in_session <= 0:
             return None
         eta = int(elapsed / completed_in_session * remaining)
@@ -287,7 +288,7 @@ class ReviewWindow(QMainWindow):
         if remaining_seconds is None:
             return "计算中"
         estimated_at = datetime.now().astimezone() + timedelta(seconds=remaining_seconds)
-        return estimated_at.strftime("%H:%M")
+        return estimated_at.strftime("%Y-%m-%d %H:%M")
 
     def _format_duration(self, total_seconds: int) -> str:
         hours, remainder = divmod(max(total_seconds, 0), 3600)
@@ -298,10 +299,19 @@ class ReviewWindow(QMainWindow):
             return f"{minutes}分 {seconds}秒"
         return f"{seconds}秒"
 
+    def _display_completed_items(self) -> int:
+        return self._display_completed_items_for(self.task)
+
+    def _display_completed_items_for(self, task: TaskDetail) -> int:
+        if task.total_items <= 0:
+            return 0
+        pointer_completed = max(0, min(task.current_task_index - 1, task.total_items))
+        return min(task.completed_items, pointer_completed)
+
     def _collect_review_values(self) -> tuple[dict[str, object], list[str]]:
         values: dict[str, object] = {}
         errors: list[str] = []
-        for field in self.task.task_snapshot.review_fields:
+        for field in self._app_service.enabled_review_fields(self.task.task_snapshot):
             widget = self._field_widgets.get(field.field_id)
             if widget is None:
                 continue

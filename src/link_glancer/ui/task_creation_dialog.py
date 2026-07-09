@@ -104,6 +104,7 @@ class TaskCreationDialog(QDialog):
         dialog_title: str = "新建任务",
         accept_button_text: str = "创建",
         source_editable: bool = True,
+        review_field_id_editable: bool = True,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -114,6 +115,7 @@ class TaskCreationDialog(QDialog):
         self._available_headers: list[str] = []
         self._accept_button_text = accept_button_text
         self._source_editable = source_editable
+        self._review_field_id_editable = review_field_id_editable
 
         self.setWindowTitle(dialog_title)
         self.resize(980, 760)
@@ -178,9 +180,9 @@ class TaskCreationDialog(QDialog):
 
         root.addWidget(QLabel("检查项"))
         self._review_fields_table = QTableWidget()
-        self._review_fields_table.setColumnCount(5)
+        self._review_fields_table.setColumnCount(6)
         self._review_fields_table.setHorizontalHeaderLabels(
-            ["结果列名", "问题标题", "类型", "必填", "选项"]
+            ["启用", "结果列名", "问题标题", "类型", "必填", "选项"]
         )
         _setup_table(self._review_fields_table)
         self._review_fields_table.cellClicked.connect(self._handle_review_field_cell_clicked)
@@ -192,12 +194,10 @@ class TaskCreationDialog(QDialog):
         remove_review_button = QPushButton("删除检查项")
         up_review_button = QPushButton("上移")
         down_review_button = QPushButton("下移")
-        add_review_button.clicked.connect(lambda: _add_empty_review_row(self._review_fields_table))
-        remove_review_button.clicked.connect(
-            lambda: _remove_selected_row(self._review_fields_table)
-        )
-        up_review_button.clicked.connect(lambda: _move_selected_row(self._review_fields_table, -1))
-        down_review_button.clicked.connect(lambda: _move_selected_row(self._review_fields_table, 1))
+        add_review_button.clicked.connect(self._add_review_row)
+        remove_review_button.clicked.connect(self._remove_review_row)
+        up_review_button.clicked.connect(lambda: self._move_review_row(-1))
+        down_review_button.clicked.connect(lambda: self._move_review_row(1))
         table_actions.addWidget(add_review_button)
         table_actions.addWidget(remove_review_button)
         table_actions.addWidget(up_review_button)
@@ -231,6 +231,10 @@ class TaskCreationDialog(QDialog):
             self._apply_snapshot(initial_snapshot)
         elif self._review_fields_table.rowCount() == 0:
             _add_empty_review_row(self._review_fields_table)
+            _configure_review_fields_table(
+                self._review_fields_table,
+                field_id_editable=self._review_field_id_editable,
+            )
         self._update_warnings([])
 
     def _load_sheet_names(self) -> None:
@@ -260,7 +264,12 @@ class TaskCreationDialog(QDialog):
         self._submit_shortcut_edit.setKeySequence(QKeySequence(snapshot.shortcuts.submit))
         self._previous_shortcut_edit.setKeySequence(QKeySequence(snapshot.shortcuts.previous))
         self._exit_shortcut_edit.setKeySequence(QKeySequence(snapshot.shortcuts.exit))
-        _fill_review_fields_table(self._review_fields_table, snapshot.review_fields)
+        _fill_review_fields_table(
+            self._review_fields_table,
+            snapshot.review_fields,
+            enabled_review_field_ids=snapshot.enabled_review_field_ids,
+            field_id_editable=self._review_field_id_editable,
+        )
 
     def _set_combo_text(self, combo: QComboBox, value: str) -> None:
         index = combo.findText(value)
@@ -358,6 +367,7 @@ class TaskCreationDialog(QDialog):
             url_field=url_field,
             display_fields=_split_csv(self._display_fields_edit.text()),
             review_fields=_collect_review_fields(self._review_fields_table),
+            enabled_review_field_ids=_collect_enabled_review_field_ids(self._review_fields_table),
             shortcuts=ReviewShortcutConfig(
                 submit=_key_sequence_text(self._submit_shortcut_edit),
                 previous=_key_sequence_text(self._previous_shortcut_edit),
@@ -370,12 +380,33 @@ class TaskCreationDialog(QDialog):
         self._warnings_label.setText("\n".join(warnings))
 
     def _handle_review_field_cell_clicked(self, row: int, column: int) -> None:
-        if column != 4:
+        if column != 5:
             return
         try:
             _edit_options_for_row(self._review_fields_table, row)
         except ValueError as exc:
             QMessageBox.warning(self, "选项无效", str(exc))
+
+    def _add_review_row(self) -> None:
+        _add_empty_review_row(self._review_fields_table)
+        _configure_review_fields_table(
+            self._review_fields_table,
+            field_id_editable=self._review_field_id_editable,
+        )
+
+    def _remove_review_row(self) -> None:
+        _remove_selected_row(self._review_fields_table)
+        _configure_review_fields_table(
+            self._review_fields_table,
+            field_id_editable=self._review_field_id_editable,
+        )
+
+    def _move_review_row(self, direction: int) -> None:
+        _move_selected_row(self._review_fields_table, direction)
+        _configure_review_fields_table(
+            self._review_fields_table,
+            field_id_editable=self._review_field_id_editable,
+        )
 
 
 def _warning_lines(warnings) -> list[str]:
@@ -425,23 +456,26 @@ def _setup_table(table: QTableWidget) -> None:
 def _add_empty_review_row(table: QTableWidget) -> None:
     row = table.rowCount()
     table.insertRow(row)
-    for column in (0, 1):
+    enabled_checkbox = QCheckBox()
+    enabled_checkbox.setChecked(True)
+    table.setCellWidget(row, 0, enabled_checkbox)
+    for column in (1, 2):
         table.setItem(row, column, QTableWidgetItem(""))
     type_combo = QComboBox()
     for label, value in REVIEW_FIELD_TYPE_OPTIONS:
         type_combo.addItem(label, value)
-    table.setCellWidget(row, 2, type_combo)
+    table.setCellWidget(row, 3, type_combo)
     required_checkbox = QCheckBox()
-    table.setCellWidget(row, 3, required_checkbox)
+    table.setCellWidget(row, 4, required_checkbox)
     _set_options_item(table, row, [])
     _configure_review_fields_table(table)
 
 
 def _set_options_item(table: QTableWidget, row: int, options: list[ReviewOption]) -> None:
-    summary_item = table.item(row, 4)
+    summary_item = table.item(row, 5)
     if summary_item is None:
         summary_item = QTableWidgetItem()
-        table.setItem(row, 4, summary_item)
+        table.setItem(row, 5, summary_item)
     summary_item.setText(_options_preview(options))
     summary_item.setToolTip(_options_tooltip(options))
     summary_item.setData(Qt.ItemDataRole.UserRole, list(options))
@@ -449,10 +483,10 @@ def _set_options_item(table: QTableWidget, row: int, options: list[ReviewOption]
 
 
 def _edit_options_for_row(table: QTableWidget, row: int) -> None:
-    field_type = _combo_data(table, row, 2) or "single_select"
+    field_type = _combo_data(table, row, 3) or "single_select"
     if field_type not in {"single_select", "multi_select"}:
         return
-    existing_options = _options_value(table, row, 4)
+    existing_options = _options_value(table, row, 5)
     dialog = ReviewOptionsDialog(existing_options, table)
     if dialog.exec() != int(QDialog.DialogCode.Accepted):
         return
@@ -482,11 +516,11 @@ def _collect_review_fields(table: QTableWidget) -> list[ReviewField]:
     fields: list[ReviewField] = []
     shortcuts: set[str] = set()
     for row in range(table.rowCount()):
-        field_id = _table_text(table, row, 0)
-        label = _table_text(table, row, 1)
-        field_type = _combo_data(table, row, 2) or "single_select"
-        required = _checkbox_value(table, row, 3)
-        options = _options_value(table, row, 4)
+        field_id = _table_text(table, row, 1)
+        label = _table_text(table, row, 2)
+        field_type = _combo_data(table, row, 3) or "single_select"
+        required = _checkbox_value(table, row, 4)
+        options = _options_value(table, row, 5)
         if not field_id and not label:
             continue
         if not field_id or not label:
@@ -513,6 +547,18 @@ def _collect_review_fields(table: QTableWidget) -> list[ReviewField]:
     return fields
 
 
+def _collect_enabled_review_field_ids(table: QTableWidget) -> list[str]:
+    enabled_ids: list[str] = []
+    for row in range(table.rowCount()):
+        field_id = _table_text(table, row, 1)
+        label = _table_text(table, row, 2)
+        if not field_id and not label:
+            continue
+        if _checkbox_value(table, row, 0):
+            enabled_ids.append(field_id)
+    return enabled_ids
+
+
 def _fill_options_table(table: QTableWidget, options: list[ReviewOption]) -> None:
     table.setRowCount(len(options))
     for row, option in enumerate(options):
@@ -524,32 +570,43 @@ def _fill_options_table(table: QTableWidget, options: list[ReviewOption]) -> Non
             editor.setKeySequence(QKeySequence(option.shortcut))
 
 
-def _fill_review_fields_table(table: QTableWidget, fields: list[ReviewField]) -> None:
+def _fill_review_fields_table(
+    table: QTableWidget,
+    fields: list[ReviewField],
+    *,
+    enabled_review_field_ids: list[str],
+    field_id_editable: bool,
+) -> None:
     table.setRowCount(0)
     if not fields:
         _add_empty_review_row(table)
+        _configure_review_fields_table(table, field_id_editable=field_id_editable)
         return
+    enabled_ids = set(enabled_review_field_ids)
     for field in fields:
         _add_empty_review_row(table)
         row = table.rowCount() - 1
-        table.item(row, 0).setText(field.field_id)
-        table.item(row, 1).setText(field.label)
-        type_combo = table.cellWidget(row, 2)
+        enabled_checkbox = table.cellWidget(row, 0)
+        if isinstance(enabled_checkbox, QCheckBox):
+            enabled_checkbox.setChecked(field.field_id in enabled_ids)
+        table.item(row, 1).setText(field.field_id)
+        table.item(row, 2).setText(field.label)
+        type_combo = table.cellWidget(row, 3)
         if isinstance(type_combo, QComboBox):
             combo_index = type_combo.findData(field.field_type)
             if combo_index >= 0:
                 type_combo.setCurrentIndex(combo_index)
-        required_checkbox = table.cellWidget(row, 3)
+        required_checkbox = table.cellWidget(row, 4)
         if isinstance(required_checkbox, QCheckBox):
             required_checkbox.setChecked(field.required)
-        summary_item = table.item(row, 4)
+        summary_item = table.item(row, 5)
         if summary_item is None:
             summary_item = QTableWidgetItem()
-            table.setItem(row, 4, summary_item)
+            table.setItem(row, 5, summary_item)
         summary_item.setText(_options_preview(field.options))
         summary_item.setToolTip(_options_tooltip(field.options))
         _set_options_item(table, row, field.options)
-    _configure_review_fields_table(table)
+    _configure_review_fields_table(table, field_id_editable=field_id_editable)
 
 
 def _add_empty_option_row(table: QTableWidget, row: int | None = None) -> None:
@@ -650,7 +707,7 @@ def _cell_value(table: QTableWidget, row: int, column: int) -> object:
         return widget.currentData()
     if isinstance(widget, QCheckBox):
         return widget.isChecked()
-    if column == 4:
+    if column == 5:
         return _options_value(table, row, column)
     if isinstance(widget, QKeySequenceEdit):
         return widget.keySequence().toString(QKeySequence.SequenceFormat.NativeText).strip()
@@ -666,7 +723,7 @@ def _set_cell_value(table: QTableWidget, row: int, column: int, value: object) -
     if isinstance(widget, QCheckBox):
         widget.setChecked(bool(value))
         return
-    if column == 4:
+    if column == 5:
         options = value if isinstance(value, list) else []
         _set_options_item(
             table,
@@ -680,14 +737,24 @@ def _set_cell_value(table: QTableWidget, row: int, column: int, value: object) -
     table.setItem(row, column, QTableWidgetItem(str(value or "")))
 
 
-def _configure_review_fields_table(table: QTableWidget) -> None:
+def _configure_review_fields_table(table: QTableWidget, *, field_id_editable: bool = True) -> None:
     header = table.horizontalHeader()
     header.setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
-    header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-    header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+    header.setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
+    header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
     header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-    header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
-    table.setColumnWidth(0, 150)
-    table.setColumnWidth(2, 78)
-    table.setColumnWidth(3, 62)
-    table.setColumnWidth(4, 360)
+    header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+    header.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
+    table.setColumnWidth(0, 58)
+    table.setColumnWidth(1, 150)
+    table.setColumnWidth(3, 78)
+    table.setColumnWidth(4, 62)
+    table.setColumnWidth(5, 360)
+    for row in range(table.rowCount()):
+        field_item = table.item(row, 1)
+        if field_item is not None:
+            flags = field_item.flags()
+            if field_id_editable or not field_item.text().strip():
+                field_item.setFlags(flags | Qt.ItemFlag.ItemIsEditable)
+            else:
+                field_item.setFlags(flags & ~Qt.ItemFlag.ItemIsEditable)

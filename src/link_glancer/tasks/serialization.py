@@ -20,6 +20,7 @@ def task_snapshot_to_dict(snapshot: TaskSnapshot) -> dict[str, object]:
         "url_field": snapshot.url_field,
         "display_fields": snapshot.display_fields,
         "review_fields": [review_field_to_dict(field) for field in snapshot.review_fields],
+        "enabled_review_field_ids": snapshot.enabled_review_field_ids,
         "shortcuts": {
             "submit": snapshot.shortcuts.submit,
             "previous": snapshot.shortcuts.previous,
@@ -33,6 +34,9 @@ def task_snapshot_from_dict(data: dict[str, object]) -> TaskSnapshot:
     shortcuts = data.get("shortcuts", {})
     if not isinstance(shortcuts, dict):
         raise ValueError("Task snapshot shortcuts must be an object.")
+    review_fields = [
+        review_field_from_dict(item) for item in _dict_list(data.get("review_fields", []))
+    ]
     return TaskSnapshot(
         sheet_name=str(data["sheet_name"]),
         header_row=int(data["header_row"]),
@@ -41,9 +45,9 @@ def task_snapshot_from_dict(data: dict[str, object]) -> TaskSnapshot:
         confirm_url=str(data.get("confirm_url") or "") or None,
         url_field=str(data["url_field"]),
         display_fields=[str(item) for item in data.get("display_fields", [])],
-        review_fields=[
-            review_field_from_dict(item) for item in _dict_list(data.get("review_fields", []))
-        ],
+        review_fields=review_fields,
+        enabled_review_field_ids=[str(item) for item in data.get("enabled_review_field_ids", [])]
+        or [field.field_id for field in review_fields],
         shortcuts=ReviewShortcutConfig(
             submit=str(shortcuts.get("submit", "Enter")),
             previous=str(shortcuts.get("previous", "Backspace")),

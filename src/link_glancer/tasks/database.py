@@ -559,10 +559,7 @@ def jump_to_task_index(database_path: Path, task_id: int, task_index: int) -> No
     with sqlite3.connect(database_path) as connection:
         total_items = _count_task_items(connection, task_id)
         normalized = 1 if total_items == 0 else max(1, min(task_index, total_items))
-        current_completed = _count_completed_items(connection, task_id)
-        status: TaskStatus = (
-            "completed" if current_completed >= total_items and total_items > 0 else "in_progress"
-        )
+        status: TaskStatus = "ready" if total_items == 0 else "in_progress"
         _update_task_pointer(connection, task_id, normalized, status)
 
 
