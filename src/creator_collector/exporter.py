@@ -41,7 +41,7 @@ def export_collection_to_xlsx(rows: list[dict[str, object]], output_dir: Path) -
             sheet.cell(row=row_index, column=column, value=flattened.get(header, ""))
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    export_path = _unique_path(output_dir / f"creator_collection_{timestamp}.xlsx")
+    export_path = _unique_path(output_dir / f"creator_{timestamp}.xlsx")
     workbook.save(export_path)
     workbook.close()
     return export_path

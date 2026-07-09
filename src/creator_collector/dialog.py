@@ -37,7 +37,7 @@ from link_glancer.runtime.locks import (
 from link_glancer.tasks.models import BrowserConfig
 
 DEFAULT_CREATOR_PAGE_URL = ""
-DEFAULT_COLLECTION_EXPORT_NAME = "creator_collection_{timestamp}.xlsx"
+DEFAULT_COLLECTION_EXPORT_NAME = "creator_{timestamp}.xlsx"
 COLLECTION_POLL_INTERVAL_MS = 1000
 TIME_LABEL_REFRESH_INTERVAL_SECONDS = 5
 

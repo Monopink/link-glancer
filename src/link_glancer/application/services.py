@@ -111,6 +111,7 @@ class TaskApplicationService:
         source_path: Path,
         task_snapshot: TaskSnapshot,
         persist_defaults: bool = True,
+        review_field_library: list[ReviewField] | None = None,
     ) -> int:
         normalized_snapshot = self.normalize_task_snapshot(task_snapshot)
         browser_config = self._browser_configs.load_browser_config(
@@ -131,6 +132,7 @@ class TaskApplicationService:
             self.save_task_creation_defaults(
                 source_path=source_path,
                 task_snapshot=normalized_snapshot,
+                review_field_library=review_field_library,
             )
         return task_id
 
@@ -171,6 +173,7 @@ class TaskApplicationService:
         *,
         task_id: int,
         task_snapshot: TaskSnapshot,
+        review_field_library: list[ReviewField] | None = None,
     ) -> TaskDetail:
         task = self.load_task(task_id)
         normalized_snapshot = self.normalize_task_snapshot(task_snapshot)
@@ -200,6 +203,8 @@ class TaskApplicationService:
             rows=rows,
             reset_reviews=False,
         )
+        if review_field_library is not None:
+            self.save_review_field_library(review_field_library)
         return self.load_task(task_id)
 
     def update_task_snapshot(
@@ -229,6 +234,8 @@ class TaskApplicationService:
         raw = self._tasks.load_app_setting(LAST_TASK_DEFAULTS_KEY)
         source_path: Path | None = None
         snapshot: TaskSnapshot | None = None
+        legacy_review_fields: list[ReviewField] = []
+        legacy_shortcuts: ReviewShortcutConfig | None = None
         if isinstance(raw, dict):
             source_path_value = raw.get("source_path")
             snapshot_value = raw.get("task_snapshot")
@@ -236,8 +243,19 @@ class TaskApplicationService:
                 source_path = Path(source_path_value).resolve()
             if isinstance(snapshot_value, dict):
                 snapshot = task_snapshot_from_dict(snapshot_value)
+                legacy_review_fields = list(snapshot.review_fields)
+                legacy_shortcuts = snapshot.shortcuts
         library = self.load_review_field_library()
+        if legacy_review_fields:
+            library = self.merge_review_fields(library, legacy_review_fields)
+            self.save_review_field_library(library)
         shortcuts = self.load_task_shortcut_defaults()
+        if (
+            legacy_shortcuts is not None
+            and self._tasks.load_app_setting(TASK_SHORTCUT_DEFAULTS_KEY) is None
+        ):
+            self.save_task_shortcut_defaults(legacy_shortcuts)
+            shortcuts = legacy_shortcuts
         if snapshot is None:
             if not library:
                 return source_path, None
@@ -256,12 +274,18 @@ class TaskApplicationService:
             )
             return source_path, snapshot
 
-        snapshot.review_fields = self.merge_review_fields(library, snapshot.review_fields)
+        snapshot.review_fields = list(library)
         snapshot.enabled_review_field_ids = self.normalize_enabled_review_field_ids(
             snapshot.review_fields,
             snapshot.enabled_review_field_ids,
         )
         snapshot.shortcuts = shortcuts
+        if legacy_review_fields:
+            self.save_task_creation_defaults(
+                source_path=source_path,
+                task_snapshot=snapshot,
+                review_field_library=library,
+            )
         return source_path, snapshot
 
     def load_review_field_library(self) -> list[ReviewField]:
@@ -275,7 +299,8 @@ class TaskApplicationService:
 
     def save_review_field_library(self, review_fields: list[ReviewField]) -> None:
         normalized = self.merge_review_fields([], review_fields)
-        self.validate_review_fields(normalized)
+        if normalized:
+            self.validate_review_fields(normalized)
         payload = [review_field_to_dict(field) for field in normalized]
         self._tasks.save_app_setting(REVIEW_FIELD_LIBRARY_KEY, payload)
 
@@ -305,9 +330,11 @@ class TaskApplicationService:
         *,
         source_path: Path | None,
         task_snapshot: TaskSnapshot,
+        review_field_library: list[ReviewField] | None = None,
     ) -> None:
         normalized_snapshot = self.normalize_task_snapshot(task_snapshot)
-        self.save_review_field_library(normalized_snapshot.review_fields)
+        if review_field_library is not None:
+            self.save_review_field_library(review_field_library)
         self.save_task_shortcut_defaults(normalized_snapshot.shortcuts)
         payload_snapshot = TaskSnapshot(
             sheet_name=normalized_snapshot.sheet_name,
@@ -379,6 +406,7 @@ class TaskApplicationService:
         self.save_task_creation_defaults(
             source_path=source_path or current_source_path,
             task_snapshot=updated_snapshot,
+            review_field_library=library,
         )
 
     def build_creator_collection_task_snapshot(
@@ -412,6 +440,13 @@ class TaskApplicationService:
                     ReviewOption(value="中", label="中", shortcut="4"),
                     ReviewOption(value="差", label="差", shortcut="5"),
                 ],
+            ),
+            ReviewField(
+                field_id="remark",
+                label="备注",
+                field_type="text",
+                required=False,
+                options=[],
             ),
         ]
         library = self.merge_review_fields(self.load_review_field_library(), collector_fields)

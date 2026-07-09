@@ -39,7 +39,13 @@ from link_glancer.runtime.locks import (
 )
 from link_glancer.runtime.paths import ensure_browser_environment_dir
 from link_glancer.tasks.database import consume_database_reset_reason
-from link_glancer.tasks.models import BrowserConfig, TaskDetail, TaskSnapshot, TaskStatus
+from link_glancer.tasks.models import (
+    BrowserConfig,
+    ReviewField,
+    TaskDetail,
+    TaskSnapshot,
+    TaskStatus,
+)
 from link_glancer.ui.config_manager_dialog import ConfigManagerDialog
 from link_glancer.ui.review_window import ReviewWindow
 from link_glancer.ui.task_creation_dialog import TaskCreationDialog
@@ -57,6 +63,7 @@ class _TaskMutationWorker(QObject):
         source_path: Path | None = None,
         task_snapshot: TaskSnapshot | None = None,
         task_id: int | None = None,
+        review_field_library: list[ReviewField] | None = None,
     ) -> None:
         super().__init__()
         self._app_service = app_service
@@ -64,6 +71,7 @@ class _TaskMutationWorker(QObject):
         self._source_path = source_path
         self._task_snapshot = task_snapshot
         self._task_id = task_id
+        self._review_field_library = review_field_library
 
     def run(self) -> None:
         try:
@@ -73,6 +81,7 @@ class _TaskMutationWorker(QObject):
                 result_task_id = self._app_service.create_task(
                     source_path=self._source_path,
                     task_snapshot=self._task_snapshot,
+                    review_field_library=self._review_field_library,
                 )
                 self.succeeded.emit(result_task_id, "任务已创建")
                 return
@@ -82,6 +91,7 @@ class _TaskMutationWorker(QObject):
                 self._app_service.update_task_configuration(
                     task_id=self._task_id,
                     task_snapshot=self._task_snapshot,
+                    review_field_library=self._review_field_library,
                 )
                 self.succeeded.emit(self._task_id, "任务配置已保存")
                 return
@@ -290,6 +300,7 @@ class MainWindow(QMainWindow):
             progress_label="正在读取 Excel 并写入任务数据，请稍候...",
             source_path=dialog.source_path,
             task_snapshot=dialog.task_snapshot,
+            review_field_library=dialog.review_field_library,
         )
 
     def _show_browser_configs(self) -> None:
@@ -363,6 +374,7 @@ class MainWindow(QMainWindow):
             progress_label="正在按新配置处理任务数据，请稍候...",
             task_id=self.task.task_id,
             task_snapshot=dialog.task_snapshot,
+            review_field_library=dialog.review_field_library,
         )
 
     def _load_task(self, task_id: int) -> None:
@@ -477,10 +489,7 @@ class MainWindow(QMainWindow):
             "  ·  ".join(
                 [
                     self._format_task_created_at(self.task.created_at),
-                    (
-                        f"已完成 "
-                        f"{self._task_progress_completed(self.task)}/{self.task.total_items}"
-                    ),
+                    (f"已完成 {self._task_progress_completed(self.task)}/{self.task.total_items}"),
                     f"状态 {self._task_status_label(self.task.status)}",
                 ]
             )
@@ -902,6 +911,7 @@ class MainWindow(QMainWindow):
         source_path: Path | None = None,
         task_snapshot: TaskSnapshot | None = None,
         task_id: int | None = None,
+        review_field_library: list[ReviewField] | None = None,
     ) -> None:
         if self._task_worker_thread is not None and self._task_worker_thread.isRunning():
             QMessageBox.information(self, "处理中", "当前已有任务处理进行中，请等待完成。")
@@ -914,6 +924,7 @@ class MainWindow(QMainWindow):
             source_path=source_path,
             task_snapshot=task_snapshot,
             task_id=task_id,
+            review_field_library=review_field_library,
         )
         self._task_worker.moveToThread(self._task_worker_thread)
         self._task_worker_thread.started.connect(self._task_worker.run)

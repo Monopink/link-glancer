@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from dataclasses import dataclass
 from pathlib import Path
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QKeySequence
+from PySide6.QtGui import QColor, QKeySequence
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -42,6 +43,18 @@ REVIEW_FIELD_TYPE_OPTIONS = [
     ("文本", "text"),
     ("布尔", "boolean"),
 ]
+
+ROW_ORIGIN_ROLE = Qt.ItemDataRole.UserRole + 1
+ROW_TASK_OWNED_ROLE = Qt.ItemDataRole.UserRole + 2
+ROW_IS_UNIQUE_ROLE = Qt.ItemDataRole.UserRole + 3
+
+
+@dataclass(slots=True)
+class ReviewFieldRowState:
+    field: ReviewField
+    enabled: bool
+    origin: str
+    task_owned: bool
 
 
 class ReviewOptionsDialog(QDialog):
@@ -110,12 +123,20 @@ class TaskCreationDialog(QDialog):
         super().__init__(parent)
         self.source_path: Path | None = source_path
         self.task_snapshot: TaskSnapshot | None = None
+        self.review_field_library: list[ReviewField] = []
         self._browser_configs = browser_configs
         self._app_service = app_service
         self._available_headers: list[str] = []
         self._accept_button_text = accept_button_text
         self._source_editable = source_editable
         self._review_field_id_editable = review_field_id_editable
+        self._global_review_fields = self._app_service.load_review_field_library()
+        self._suspend_global_sync = False
+        self._initial_task_field_ids: set[str] = (
+            set(field.field_id for field in initial_snapshot.review_fields)
+            if initial_snapshot is not None and not source_editable
+            else set()
+        )
 
         self.setWindowTitle(dialog_title)
         self.resize(980, 760)
@@ -186,6 +207,7 @@ class TaskCreationDialog(QDialog):
         )
         _setup_table(self._review_fields_table)
         self._review_fields_table.cellClicked.connect(self._handle_review_field_cell_clicked)
+        self._review_fields_table.itemChanged.connect(self._handle_review_field_item_changed)
         root.addWidget(self._review_fields_table, stretch=1)
 
         table_actions = QHBoxLayout()
@@ -230,11 +252,16 @@ class TaskCreationDialog(QDialog):
         if initial_snapshot is not None:
             self._apply_snapshot(initial_snapshot)
         elif self._review_fields_table.rowCount() == 0:
-            _add_empty_review_row(self._review_fields_table)
-            _configure_review_fields_table(
-                self._review_fields_table,
-                field_id_editable=self._review_field_id_editable,
-            )
+            rows = [
+                ReviewFieldRowState(
+                    field=deepcopy(field),
+                    enabled=True,
+                    origin="global",
+                    task_owned=False,
+                )
+                for field in self._global_review_fields
+            ]
+            self._render_review_field_rows(rows)
         self._update_warnings([])
 
     def _load_sheet_names(self) -> None:
@@ -264,12 +291,10 @@ class TaskCreationDialog(QDialog):
         self._submit_shortcut_edit.setKeySequence(QKeySequence(snapshot.shortcuts.submit))
         self._previous_shortcut_edit.setKeySequence(QKeySequence(snapshot.shortcuts.previous))
         self._exit_shortcut_edit.setKeySequence(QKeySequence(snapshot.shortcuts.exit))
-        _fill_review_fields_table(
-            self._review_fields_table,
-            snapshot.review_fields,
-            enabled_review_field_ids=snapshot.enabled_review_field_ids,
-            field_id_editable=self._review_field_id_editable,
-        )
+        if self._source_editable:
+            self._render_review_field_rows(self._build_new_task_review_field_rows(snapshot))
+        else:
+            self._render_review_field_rows(self._build_review_field_rows(snapshot))
 
     def _set_combo_text(self, combo: QComboBox, value: str) -> None:
         index = combo.findText(value)
@@ -343,6 +368,7 @@ class TaskCreationDialog(QDialog):
                 return
 
         self.task_snapshot = snapshot
+        self.review_field_library = self._collect_global_review_fields()
         self.accept()
 
     def _collect_task_snapshot(self) -> TaskSnapshot:
@@ -379,34 +405,258 @@ class TaskCreationDialog(QDialog):
     def _update_warnings(self, warnings: list[str]) -> None:
         self._warnings_label.setText("\n".join(warnings))
 
+    def _handle_review_field_item_changed(self, _item: QTableWidgetItem) -> None:
+        self._sync_global_review_field_library()
+
     def _handle_review_field_cell_clicked(self, row: int, column: int) -> None:
+        if self._row_origin(row) == "unique" and column != 0:
+            if self._prompt_add_unique_field_to_global(row):
+                self._configure_review_fields_table()
+            return
         if column != 5:
             return
         try:
             _edit_options_for_row(self._review_fields_table, row)
         except ValueError as exc:
             QMessageBox.warning(self, "选项无效", str(exc))
+            return
+        self._sync_global_review_field_library()
 
     def _add_review_row(self) -> None:
         _add_empty_review_row(self._review_fields_table)
-        _configure_review_fields_table(
-            self._review_fields_table,
-            field_id_editable=self._review_field_id_editable,
-        )
+        row = self._review_fields_table.rowCount() - 1
+        self._set_row_metadata(row, origin="global", task_owned=True)
+        self._bind_review_row_signals(row)
+        self._configure_review_fields_table()
 
     def _remove_review_row(self) -> None:
-        _remove_selected_row(self._review_fields_table)
-        _configure_review_fields_table(
-            self._review_fields_table,
-            field_id_editable=self._review_field_id_editable,
+        row = self._review_fields_table.currentRow()
+        if row < 0:
+            return
+        origin = self._row_origin(row)
+        if origin == "unique":
+            QMessageBox.information(
+                self,
+                "无法删除",
+                "独特检查项不能直接删除。可取消勾选，或点击后添加回全局配置。",
+            )
+            return
+        field_id = _table_text(self._review_fields_table, row, 1)
+        if not field_id:
+            self._review_fields_table.removeRow(row)
+            self._configure_review_fields_table()
+            return
+        result = QMessageBox.question(
+            self,
+            "确认删除",
+            f"将从全局配置删除检查项 `{field_id}`。\n"
+            "已存在于任务中的同名检查项会保留为独特检查项。\n\n是否继续？",
         )
+        if result != QMessageBox.StandardButton.Yes:
+            return
+        updated_library = [
+            field for field in self._collect_global_review_fields() if field.field_id != field_id
+        ]
+        self._app_service.save_review_field_library(updated_library)
+        self._global_review_fields = self._app_service.load_review_field_library()
+        if self._row_task_owned(row) and field_id in self._initial_task_field_ids:
+            self._set_row_metadata(row, origin="unique", task_owned=True)
+            self._configure_review_fields_table()
+            return
+        self._review_fields_table.removeRow(row)
+        self._configure_review_fields_table()
 
     def _move_review_row(self, direction: int) -> None:
         _move_selected_row(self._review_fields_table, direction)
+        self._configure_review_fields_table()
+        self._sync_global_review_field_library()
+
+    def _build_review_field_rows(self, snapshot: TaskSnapshot) -> list[ReviewFieldRowState]:
+        global_map = {field.field_id: deepcopy(field) for field in self._global_review_fields}
+        rows: list[ReviewFieldRowState] = []
+        seen_ids: set[str] = set()
+        enabled_ids = set(snapshot.enabled_review_field_ids)
+        for field in snapshot.review_fields:
+            global_field = global_map.get(field.field_id)
+            if global_field is not None:
+                rows.append(
+                    ReviewFieldRowState(
+                        field=global_field,
+                        enabled=field.field_id in enabled_ids,
+                        origin="global",
+                        task_owned=not self._source_editable,
+                    )
+                )
+            else:
+                rows.append(
+                    ReviewFieldRowState(
+                        field=deepcopy(field),
+                        enabled=field.field_id in enabled_ids,
+                        origin="unique",
+                        task_owned=True,
+                    )
+                )
+            seen_ids.add(field.field_id)
+        for field in self._global_review_fields:
+            if field.field_id in seen_ids:
+                continue
+            rows.append(
+                ReviewFieldRowState(
+                    field=deepcopy(field),
+                    enabled=False,
+                    origin="global",
+                    task_owned=False,
+                )
+            )
+        return rows
+
+    def _build_new_task_review_field_rows(
+        self,
+        snapshot: TaskSnapshot,
+    ) -> list[ReviewFieldRowState]:
+        enabled_ids = set(snapshot.enabled_review_field_ids)
+        return [
+            ReviewFieldRowState(
+                field=deepcopy(field),
+                enabled=field.field_id in enabled_ids if enabled_ids else True,
+                origin="global",
+                task_owned=False,
+            )
+            for field in self._global_review_fields
+        ]
+
+    def _render_review_field_rows(self, rows: list[ReviewFieldRowState]) -> None:
+        self._review_fields_table.setRowCount(0)
+        if not rows:
+            return
+        for row_state in rows:
+            _add_empty_review_row(self._review_fields_table)
+            row = self._review_fields_table.rowCount() - 1
+            enabled_checkbox = self._review_fields_table.cellWidget(row, 0)
+            if isinstance(enabled_checkbox, QCheckBox):
+                enabled_checkbox.setChecked(row_state.enabled)
+            self._review_fields_table.item(row, 1).setText(row_state.field.field_id)
+            self._review_fields_table.item(row, 2).setText(row_state.field.label)
+            type_combo = self._review_fields_table.cellWidget(row, 3)
+            if isinstance(type_combo, QComboBox):
+                combo_index = type_combo.findData(row_state.field.field_type)
+                if combo_index >= 0:
+                    type_combo.setCurrentIndex(combo_index)
+            required_checkbox = self._review_fields_table.cellWidget(row, 4)
+            if isinstance(required_checkbox, QCheckBox):
+                required_checkbox.setChecked(row_state.field.required)
+            _set_options_item(self._review_fields_table, row, row_state.field.options)
+            self._set_row_metadata(
+                row,
+                origin=row_state.origin,
+                task_owned=row_state.task_owned,
+            )
+            self._bind_review_row_signals(row)
+        self._configure_review_fields_table()
+
+    def _collect_global_review_fields(self) -> list[ReviewField]:
+        global_fields: list[ReviewField] = []
+        for row in range(self._review_fields_table.rowCount()):
+            if self._row_origin(row) != "global":
+                continue
+            field = _collect_review_field_at_row(self._review_fields_table, row)
+            if field is not None:
+                global_fields.append(field)
+        return global_fields
+
+    def _set_row_metadata(self, row: int, *, origin: str, task_owned: bool) -> None:
+        for column in (1, 2, 5):
+            item = self._review_fields_table.item(row, column)
+            if item is None:
+                item = QTableWidgetItem("")
+                self._review_fields_table.setItem(row, column, item)
+            item.setData(ROW_ORIGIN_ROLE, origin)
+            item.setData(ROW_TASK_OWNED_ROLE, task_owned)
+            item.setData(ROW_IS_UNIQUE_ROLE, origin == "unique")
+
+    def _row_origin(self, row: int) -> str:
+        item = self._review_fields_table.item(row, 1)
+        if item is None:
+            return "global"
+        value = item.data(ROW_ORIGIN_ROLE)
+        return str(value) if value else "global"
+
+    def _row_task_owned(self, row: int) -> bool:
+        item = self._review_fields_table.item(row, 1)
+        if item is None:
+            return True
+        return bool(item.data(ROW_TASK_OWNED_ROLE))
+
+    def _prompt_add_unique_field_to_global(self, row: int) -> bool:
+        field = _collect_review_field_at_row(self._review_fields_table, row)
+        if field is None:
+            return False
+        existing_ids = {
+            existing_field.field_id for existing_field in self._collect_global_review_fields()
+        }
+        if field.field_id in existing_ids:
+            QMessageBox.warning(
+                self,
+                "无法添加",
+                f"全局配置中已存在同名结果列：{field.field_id}",
+            )
+            return False
+        result = QMessageBox.question(
+            self,
+            "添加检查项",
+            "此检查项当前仅存在于该任务中。\n\n是否添加此检查项到全局配置？",
+        )
+        if result != QMessageBox.StandardButton.Yes:
+            return False
+        updated_library = [*self._collect_global_review_fields(), field]
+        try:
+            self._app_service.save_review_field_library(updated_library)
+        except ValueError as exc:
+            QMessageBox.warning(self, "无法添加", str(exc))
+            return False
+        self._global_review_fields = self._app_service.load_review_field_library()
+        self._set_row_metadata(row, origin="global", task_owned=True)
+        return True
+
+    def _configure_review_fields_table(self) -> None:
+        self._suspend_global_sync = True
         _configure_review_fields_table(
             self._review_fields_table,
-            field_id_editable=self._review_field_id_editable,
+            field_id_editable=True,
         )
+        self._suspend_global_sync = False
+
+    def _bind_review_row_signals(self, row: int) -> None:
+        type_combo = self._review_fields_table.cellWidget(row, 3)
+        required_checkbox = self._review_fields_table.cellWidget(row, 4)
+        if isinstance(type_combo, QComboBox):
+            try:
+                type_combo.currentIndexChanged.disconnect(self._sync_global_review_field_library)
+            except (RuntimeError, TypeError):
+                pass
+            type_combo.currentIndexChanged.connect(self._sync_global_review_field_library)
+        if isinstance(required_checkbox, QCheckBox):
+            try:
+                required_checkbox.checkStateChanged.disconnect(
+                    self._sync_global_review_field_library
+                )
+            except (RuntimeError, TypeError):
+                pass
+            required_checkbox.checkStateChanged.connect(self._sync_global_review_field_library)
+
+    def _sync_global_review_field_library(self) -> None:
+        if self._suspend_global_sync:
+            return
+        try:
+            global_fields = self._collect_global_review_fields()
+        except ValueError:
+            return
+        current_ids = [field.field_id for field in self._global_review_fields]
+        next_ids = [field.field_id for field in global_fields]
+        if current_ids == next_ids and self._global_review_fields == global_fields:
+            return
+        self._app_service.save_review_field_library(global_fields)
+        self._global_review_fields = self._app_service.load_review_field_library()
 
 
 def _warning_lines(warnings) -> list[str]:
@@ -516,35 +766,40 @@ def _collect_review_fields(table: QTableWidget) -> list[ReviewField]:
     fields: list[ReviewField] = []
     shortcuts: set[str] = set()
     for row in range(table.rowCount()):
-        field_id = _table_text(table, row, 1)
-        label = _table_text(table, row, 2)
-        field_type = _combo_data(table, row, 3) or "single_select"
-        required = _checkbox_value(table, row, 4)
-        options = _options_value(table, row, 5)
-        if not field_id and not label:
+        field = _collect_review_field_at_row(table, row)
+        if field is None:
             continue
-        if not field_id or not label:
-            raise ValueError(f"检查项第 {row + 1} 行需要结果列名和问题标题。")
-        if field_type in {"single_select", "multi_select"} and not options:
-            raise ValueError(f"检查项 {label} 需要至少一个选项。")
-        if field_type in {"text", "boolean"}:
-            options = []
-        for option in options:
+        for option in field.options:
             if option.shortcut:
                 normalized = option.shortcut.casefold()
                 if normalized in shortcuts:
                     raise ValueError(f"选项快捷键冲突：{option.shortcut}")
                 shortcuts.add(normalized)
-        fields.append(
-            ReviewField(
-                field_id=field_id,
-                label=label,
-                field_type=str(field_type),  # type: ignore[arg-type]
-                required=required,
-                options=options,
-            )
-        )
+        fields.append(field)
     return fields
+
+
+def _collect_review_field_at_row(table: QTableWidget, row: int) -> ReviewField | None:
+    field_id = _table_text(table, row, 1)
+    label = _table_text(table, row, 2)
+    field_type = _combo_data(table, row, 3) or "single_select"
+    required = _checkbox_value(table, row, 4)
+    options = _options_value(table, row, 5)
+    if not field_id and not label:
+        return None
+    if not field_id or not label:
+        raise ValueError(f"检查项第 {row + 1} 行需要结果列名和问题标题。")
+    if field_type in {"single_select", "multi_select"} and not options:
+        raise ValueError(f"检查项 {label} 需要至少一个选项。")
+    if field_type in {"text", "boolean"}:
+        options = []
+    return ReviewField(
+        field_id=field_id,
+        label=label,
+        field_type=str(field_type),  # type: ignore[arg-type]
+        required=required,
+        options=options,
+    )
 
 
 def _collect_enabled_review_field_ids(table: QTableWidget) -> list[str]:
@@ -707,6 +962,13 @@ def _cell_value(table: QTableWidget, row: int, column: int) -> object:
         return widget.currentData()
     if isinstance(widget, QCheckBox):
         return widget.isChecked()
+    if column == 1:
+        item = table.item(row, column)
+        return {
+            "text": _table_text(table, row, column),
+            "origin": item.data(ROW_ORIGIN_ROLE) if item is not None else "global",
+            "task_owned": bool(item.data(ROW_TASK_OWNED_ROLE)) if item is not None else True,
+        }
     if column == 5:
         return _options_value(table, row, column)
     if isinstance(widget, QKeySequenceEdit):
@@ -722,6 +984,14 @@ def _set_cell_value(table: QTableWidget, row: int, column: int, value: object) -
         return
     if isinstance(widget, QCheckBox):
         widget.setChecked(bool(value))
+        return
+    if column == 1 and isinstance(value, dict):
+        item = QTableWidgetItem(str(value.get("text") or ""))
+        table.setItem(row, column, item)
+        origin = str(value.get("origin") or "global")
+        item.setData(ROW_ORIGIN_ROLE, origin)
+        item.setData(ROW_TASK_OWNED_ROLE, bool(value.get("task_owned")))
+        item.setData(ROW_IS_UNIQUE_ROLE, origin == "unique")
         return
     if column == 5:
         options = value if isinstance(value, list) else []
@@ -751,10 +1021,33 @@ def _configure_review_fields_table(table: QTableWidget, *, field_id_editable: bo
     table.setColumnWidth(4, 62)
     table.setColumnWidth(5, 360)
     for row in range(table.rowCount()):
+        origin_item = table.item(row, 1)
+        is_unique = bool(origin_item.data(ROW_IS_UNIQUE_ROLE)) if origin_item is not None else False
         field_item = table.item(row, 1)
         if field_item is not None:
             flags = field_item.flags()
-            if field_id_editable or not field_item.text().strip():
+            if (field_id_editable or not field_item.text().strip()) and not is_unique:
                 field_item.setFlags(flags | Qt.ItemFlag.ItemIsEditable)
             else:
                 field_item.setFlags(flags & ~Qt.ItemFlag.ItemIsEditable)
+        label_item = table.item(row, 2)
+        if label_item is not None:
+            flags = label_item.flags()
+            if is_unique:
+                label_item.setFlags(flags & ~Qt.ItemFlag.ItemIsEditable)
+            else:
+                label_item.setFlags(flags | Qt.ItemFlag.ItemIsEditable)
+        option_item = table.item(row, 5)
+        if option_item is not None:
+            unique_color = QColor("#9ca3af")
+            default_color = table.palette().text().color()
+            color = unique_color if is_unique else default_color
+            for item in (field_item, label_item, option_item):
+                if item is not None:
+                    item.setForeground(color)
+        type_combo = table.cellWidget(row, 3)
+        required_checkbox = table.cellWidget(row, 4)
+        if isinstance(type_combo, QComboBox):
+            type_combo.setEnabled(not is_unique)
+        if isinstance(required_checkbox, QCheckBox):
+            required_checkbox.setEnabled(not is_unique)
