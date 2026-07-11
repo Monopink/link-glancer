@@ -248,10 +248,10 @@ class ReviewWindow(QMainWindow):
         current_index = self.task.current_task_index
         completed = self._display_completed_items()
         percentage = int((completed / self.task.total_items) * 100) if self.task.total_items else 0
-        self._progress_label.setText(f"{completed} / {self.task.total_items} ({percentage}%)")
+        self._progress_label.setText(f"{completed}/{self.task.total_items}")
         self._progress_bar.setMaximum(max(self.task.total_items, 1))
         self._progress_bar.setValue(completed)
-        self._progress_bar.setFormat(self._progress_label.text())
+        self._progress_bar.setFormat(f"{percentage}%")
         self._refresh_time_labels()
         self._item_details_label.setText(self._build_item_details(current_index))
         self._submit_button.setEnabled(self.task.current_item is not None)
@@ -370,7 +370,6 @@ class ReviewWindow(QMainWindow):
         self._browser.sync_buffer(
             tasks=items,
             url_field=self.task.task_snapshot.url_field,
-            current_task_index=self.task.current_task_index,
         )
         return self._handle_browser_buffer_block()
 
@@ -395,7 +394,6 @@ class ReviewWindow(QMainWindow):
                 self._browser.sync_buffer(
                     tasks=items,
                     url_field=self.task.task_snapshot.url_field,
-                    current_task_index=self.task.current_task_index,
                 )
                 block = self._browser.buffer_block()
             return True

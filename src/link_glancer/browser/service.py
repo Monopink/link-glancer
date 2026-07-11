@@ -123,7 +123,7 @@ class PlaywrightBrowserController(BrowserController):
             pass
         self._confirmation_page = None
 
-    def sync_buffer(self, tasks: list[TaskItem], url_field: str, current_task_index: int) -> None:
+    def sync_buffer(self, tasks: list[TaskItem], url_field: str) -> None:
         if self._context is None:
             return
 
@@ -197,13 +197,6 @@ class PlaywrightBrowserController(BrowserController):
                 )
                 self._pending_pages.append(pending)
                 break
-
-        current_page = self._pages_by_task_index.get(current_task_index)
-        if current_page is not None:
-            try:
-                current_page.bring_to_front()
-            except PlaywrightError:
-                pass
 
     def status(self) -> BrowserStatus:
         return self._status

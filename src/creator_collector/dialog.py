@@ -443,7 +443,7 @@ class CreatorCollectorProgressDialog(QDialog):
         result = QMessageBox.question(
             self,
             "确认开始采集",
-            "请确认浏览器已正常打开，并已完成登录、国家切换、筛选调整等准备。\n\n是否开始采集？",
+            "请确认浏览器已正常打开，并已完成采集准备。\n\n是否开始采集？",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
             QMessageBox.StandardButton.Yes,
         )

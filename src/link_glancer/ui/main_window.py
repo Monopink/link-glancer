@@ -189,7 +189,7 @@ class MainWindow(QMainWindow):
 
         self._task_table = QTableWidget(0, 6)
         self._task_table.setHorizontalHeaderLabels(
-            ["ID", "任务", "进度", "状态", "源文件", "更新时间"]
+            ["ID", "状态", "进度", "任务", "更新时间", "源文件"]
         )
         self._task_table.verticalHeader().setVisible(False)
         self._task_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -209,11 +209,11 @@ class MainWindow(QMainWindow):
         self._task_table.itemSelectionChanged.connect(self._update_start_page_actions)
         header_view = self._task_table.horizontalHeader()
         header_view.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        header_view.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        header_view.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         header_view.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        header_view.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-        header_view.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
-        header_view.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
+        header_view.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        header_view.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        header_view.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
         layout.addWidget(self._task_table, stretch=1)
         return page
 
@@ -223,32 +223,35 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(20, 20, 20, 20)
         layout.setSpacing(12)
 
-        title_box = QVBoxLayout()
-        title_box.setContentsMargins(0, 0, 0, 0)
+        title_row = QHBoxLayout()
+        title_row.setContentsMargins(0, 0, 0, 0)
+        title_row.setSpacing(12)
         self._task_title_label = QLabel("任务")
-        self._task_title_label.setProperty("sectionTitle", True)
+        self._task_title_label.setTextFormat(Qt.TextFormat.PlainText)
         self._task_meta_label = QLabel("-")
         self._task_meta_label.setWordWrap(True)
-        title_box.addWidget(self._task_title_label)
-        title_box.addWidget(self._task_meta_label)
+        title_row.addWidget(self._task_title_label)
+        title_row.addWidget(self._task_meta_label, stretch=1)
+
+        title_box = QVBoxLayout()
+        title_box.setContentsMargins(0, 0, 0, 0)
+        title_box.addLayout(title_row)
         layout.addLayout(title_box)
 
         actions = QHBoxLayout()
-        back_button = QPushButton("返回任务列表")
-        back_button.clicked.connect(self._show_start_page)
+        self._back_to_list_button = QPushButton("返回任务列表")
+        self._back_to_list_button.clicked.connect(self._show_start_page)
         config_button = QPushButton("任务配置")
         config_button.clicked.connect(self._edit_task_configuration)
-        jump_button = QPushButton("调整进度到这里")
-        jump_button.clicked.connect(self._jump_task_progress_to_selection)
         export_button = QPushButton("导出")
         export_button.clicked.connect(self._export_task_with_dialog)
         delete_button = QPushButton("删除任务")
         delete_button.clicked.connect(self._delete_current_task)
         start_button = QPushButton("开始检查")
         start_button.clicked.connect(self._start_review_flow)
-        actions.addWidget(back_button)
+        actions.addWidget(self._back_to_list_button)
+        actions.addSpacing(18)
         actions.addWidget(config_button)
-        actions.addWidget(jump_button)
         actions.addWidget(export_button)
         actions.addWidget(delete_button)
         actions.addStretch(1)
@@ -270,6 +273,7 @@ class MainWindow(QMainWindow):
         )
         self._task_data_table.setAlternatingRowColors(True)
         self._task_data_table.horizontalHeader().setSectionsMovable(False)
+        self._task_data_table.doubleClicked.connect(self._confirm_jump_task_progress_from_table)
         layout.addWidget(self._task_data_table, stretch=1)
         return page
 
@@ -327,7 +331,7 @@ class MainWindow(QMainWindow):
             return
         if dialog.last_created_task_id is None:
             return
-        self._load_task(dialog.last_created_task_id)
+        self._show_start_page(selected_task_id=dialog.last_created_task_id)
         self.statusBar().showMessage(
             f"采集完成并创建任务：#{dialog.last_created_task_id}",
             4000,
@@ -387,13 +391,13 @@ class MainWindow(QMainWindow):
         self._editing_task_index = None
         self._show_task_page()
 
-    def _show_start_page(self) -> None:
+    def _show_start_page(self, *, selected_task_id: int | None = None) -> None:
         self._shutdown_confirmation_browser()
         self.task = None
         self._editing_task_index = None
         self._toolbar.show()
         self._stack.setCurrentWidget(self._start_page)
-        self._refresh_start_page()
+        self._refresh_start_page(selected_task_id=selected_task_id)
 
     def _show_task_page(self) -> None:
         self.task = self.app_service.load_task(self.task.task_id) if self.task else None
@@ -401,10 +405,12 @@ class MainWindow(QMainWindow):
         self._stack.setCurrentWidget(self._task_page)
         self._refresh_task_page()
 
-    def _refresh_start_page(self) -> None:
+    def _refresh_start_page(self, *, selected_task_id: int | None = None) -> None:
+        selected_task_id = (
+            selected_task_id if selected_task_id is not None else self._selected_task_id()
+        )
         summaries = self.app_service.list_tasks()
         self._task_table_ids = [summary.task_id for summary in summaries]
-        self._task_table.clearSelection()
         self._task_table.setRowCount(len(summaries))
         for row, summary in enumerate(summaries):
             progress_completed = self._display_completed_items(
@@ -414,18 +420,35 @@ class MainWindow(QMainWindow):
             )
             values = [
                 str(summary.task_id),
-                summary.name,
+                self._task_status_badge(summary.status),
                 f"{progress_completed}/{summary.total_items}",
-                self._task_status_label(summary.status),
+                summary.name,
+                self._format_task_timestamp(summary.updated_at),
                 summary.source_file_name,
-                summary.updated_at,
             ]
             for column, value in enumerate(values):
                 item = QTableWidgetItem(value)
-                if column in (0, 2, 3):
+                if column in (0, 1, 2):
                     item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                 self._task_table.setItem(row, column, item)
+        self._select_task_in_table(selected_task_id)
         self._update_start_page_actions()
+
+    def _select_task_in_table(self, task_id: int | None) -> None:
+        if task_id is None:
+            task_id = self._selected_task_id()
+        if task_id is None:
+            self._task_table.clearSelection()
+            return
+        try:
+            row = self._task_table_ids.index(task_id)
+        except ValueError:
+            self._task_table.clearSelection()
+            return
+        self._task_table.selectRow(row)
+        item = self._task_table.item(row, 0)
+        if item is not None:
+            self._task_table.scrollToItem(item, QAbstractItemView.ScrollHint.PositionAtCenter)
 
     def _open_selected_task_from_table(self, *_args: object) -> None:
         task_id = self._selected_task_id()
@@ -485,15 +508,7 @@ class MainWindow(QMainWindow):
             return
         self.task = self.app_service.load_task(self.task.task_id)
         self._task_title_label.setText(self.task.name)
-        self._task_meta_label.setText(
-            "  ·  ".join(
-                [
-                    self._format_task_created_at(self.task.created_at),
-                    (f"已完成 {self._task_progress_completed(self.task)}/{self.task.total_items}"),
-                    f"状态 {self._task_status_label(self.task.status)}",
-                ]
-            )
-        )
+        self._task_meta_label.setText(self._task_summary_text(self.task))
         self._refresh_task_data_table()
 
     def _start_review_flow(self) -> None:
@@ -651,12 +666,11 @@ class MainWindow(QMainWindow):
         if 0 <= current_row < self._task_data_table.rowCount():
             self._task_data_table.selectRow(current_row)
 
-    def _jump_task_progress_to_selection(self) -> None:
+    def _confirm_jump_task_progress_from_table(self) -> None:
         if not self.task:
             return
         row = self._task_data_table.currentRow()
         if row < 0:
-            QMessageBox.information(self, "未选择条目", "请先选择要调整到的条目。")
             return
         task_index_label = self._task_data_table.verticalHeaderItem(row)
         if task_index_label is None:
@@ -664,6 +678,8 @@ class MainWindow(QMainWindow):
         try:
             task_index = int(task_index_label.text())
         except ValueError:
+            return
+        if task_index == self.task.current_task_index:
             return
         result = QMessageBox.question(
             self,
@@ -722,14 +738,40 @@ class MainWindow(QMainWindow):
             previous.sheet_name != current.sheet_name or previous.header_row != current.header_row
         )
 
-    def _format_task_created_at(self, value: str) -> str:
+    def _task_summary_text(self, task: TaskDetail) -> str:
+        return "  ·  ".join(
+            [
+                self._task_status_badge(task.status),
+                f"{self._task_progress_completed(task)}/{task.total_items}",
+                self._format_task_timestamp(task.updated_at),
+            ]
+        )
+
+    def _task_status_badge(self, status: TaskStatus) -> str:
+        return f"{self._task_status_emoji(status)} {self._task_status_label(status)}"
+
+    def _task_status_emoji(self, status: TaskStatus) -> str:
+        labels: dict[TaskStatus, str] = {
+            "ready": "📥",
+            "in_progress": "👀",
+            "completed": "✅",
+        }
+        return labels.get(status, "•")
+
+    def _format_task_timestamp(self, value: str) -> str:
         try:
-            created_at = datetime.fromisoformat(value)
+            timestamp = datetime.fromisoformat(value)
         except ValueError:
             return value
-        if created_at.tzinfo is None:
-            created_at = created_at.replace(tzinfo=UTC)
-        return created_at.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.replace(tzinfo=UTC)
+        local_time = timestamp.astimezone()
+        today = datetime.now().astimezone().date()
+        if local_time.date() == today:
+            return local_time.strftime("今天 %H:%M")
+        if local_time.date().toordinal() == today.toordinal() - 1:
+            return local_time.strftime("昨天 %H:%M")
+        return local_time.strftime("%Y-%m-%d %H:%M")
 
     def _resolve_confirmation_url(self) -> str | None:
         if not self.task:
@@ -764,7 +806,6 @@ class MainWindow(QMainWindow):
         self.browser.sync_buffer(
             tasks=items,
             url_field=self.task.task_snapshot.url_field,
-            current_task_index=self.task.current_task_index,
         )
         return self._handle_browser_buffer_block()
 
@@ -791,7 +832,6 @@ class MainWindow(QMainWindow):
                 self.browser.sync_buffer(
                     tasks=items,
                     url_field=self.task.task_snapshot.url_field,
-                    current_task_index=self.task.current_task_index,
                 )
                 block = self.browser.buffer_block()
             return True
