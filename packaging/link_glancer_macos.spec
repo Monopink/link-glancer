@@ -26,10 +26,10 @@ datas, binaries, hiddenimports = merge_collected(
 
 
 a = Analysis(
-    ["src/link_glancer/main.py"],
-    pathex=["."],
+    ["../src/link_glancer/main.py"],
+    pathex=[".."],
     binaries=binaries,
-    datas=datas,
+    datas=datas + [("../packaging/icon.svg", "packaging")],
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
@@ -56,7 +56,7 @@ exe = EXE(
     console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
-    target_arch=None,
+    target_arch="arm64",
     codesign_identity=None,
     entitlements_file=None,
 )
@@ -75,6 +75,6 @@ coll = COLLECT(
 app = BUNDLE(
     coll,
     name="LinkGlancer.app",
-    icon=None,
+    icon="../packaging/icon.icns",
     bundle_identifier="com.linkglancer.app",
 )

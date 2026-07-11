@@ -8,7 +8,7 @@ a = Analysis(
     ["../src/link_glancer/main.py"],
     pathex=[".."],
     binaries=[],
-    datas=[("../icon.svg", ".")],
+    datas=[("../packaging/icon.svg", "packaging")],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},

@@ -8,7 +8,7 @@ from PySide6.QtSvg import QSvgRenderer
 
 def main() -> int:
     project_root = Path(__file__).resolve().parents[1]
-    svg_path = project_root / "icon.svg"
+    svg_path = project_root / "packaging" / "icon.svg"
     ico_path = project_root / "packaging" / "icon.ico"
     if not svg_path.exists():
         raise FileNotFoundError(f"Missing source icon: {svg_path}")

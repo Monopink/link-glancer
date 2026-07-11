@@ -22,7 +22,7 @@ def create_application() -> QApplication:
     app.setApplicationName("Link Glancer")
     app.setOrganizationName("Link Glancer")
     instance_registration = register_instance()
-    icon_path = bundled_asset_path("icon.svg")
+    icon_path = bundled_asset_path("packaging", "icon.svg")
     if icon_path.exists():
         app.setWindowIcon(QIcon(str(icon_path)))
     tray_icon = QSystemTrayIcon(app.windowIcon(), app)

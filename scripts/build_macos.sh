@@ -10,6 +10,11 @@ if [[ "$(uname -s)" != "Darwin" ]]; then
   exit 1
 fi
 
+if [[ "$(uname -m)" != "arm64" ]]; then
+  echo "This build script currently supports Apple Silicon only." >&2
+  exit 1
+fi
+
 if [[ ! -d ".venv" ]]; then
   echo "Missing .venv. Create the project virtual environment first." >&2
   exit 1
@@ -21,6 +26,9 @@ python -m pip install -e ".[build]"
 python -m playwright install
 python -m ruff check .
 python -m compileall -q src
+python scripts/generate_macos_icon.py
+mkdir -p packaging
+iconutil -c icns build/macos/icon.iconset -o packaging/icon.icns
 
 rm -rf build dist
 
