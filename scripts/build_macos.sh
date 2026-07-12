@@ -33,6 +33,7 @@ iconutil -c icns build/macos/icon.iconset -o packaging/icon.icns
 rm -rf build dist
 
 pyinstaller --noconfirm packaging/link_glancer_macos.spec
+python scripts/trim_packaged_distribution.py dist/LinkGlancer.app
 
 echo
 echo "Build complete:"

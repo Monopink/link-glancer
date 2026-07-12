@@ -24,6 +24,7 @@ if (Test-Path dist) {
 }
 
 & .venv\Scripts\pyinstaller.exe --noconfirm packaging/link_glancer_windows.spec
+& .venv\Scripts\python.exe scripts\trim_packaged_distribution.py dist\LinkGlancer
 
 Write-Host ""
 Write-Host "Build complete:"
