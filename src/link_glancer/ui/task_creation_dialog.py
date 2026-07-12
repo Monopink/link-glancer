@@ -21,9 +21,11 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMessageBox,
     QPushButton,
+    QSizePolicy,
     QSpinBox,
     QTableWidget,
     QTableWidgetItem,
+    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -47,6 +49,8 @@ REVIEW_FIELD_TYPE_OPTIONS = [
 ROW_ORIGIN_ROLE = Qt.ItemDataRole.UserRole + 1
 ROW_TASK_OWNED_ROLE = Qt.ItemDataRole.UserRole + 2
 ROW_IS_UNIQUE_ROLE = Qt.ItemDataRole.UserRole + 3
+FORM_FIELD_FULL_WIDTH = 420
+FORM_FIELD_COMPACT_WIDTH = 140
 
 
 @dataclass(slots=True)
@@ -143,17 +147,18 @@ class TaskCreationDialog(QDialog):
 
         root = QVBoxLayout(self)
         form = QFormLayout()
+        form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.DontWrapRows)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
 
         self._source_edit = QLineEdit()
         self._source_edit.setReadOnly(True)
-        source_row = QHBoxLayout()
-        source_row.addWidget(self._source_edit, stretch=1)
         source_button = QPushButton("浏览...")
         source_button.clicked.connect(self._browse_source)
         source_button.setEnabled(source_editable)
-        source_row.addWidget(source_button)
-        source_widget = QWidget()
-        source_widget.setLayout(source_row)
+        source_widget = self._build_compound_field(
+            self._source_edit,
+            source_button,
+        )
 
         self._sheet_combo = QComboBox()
         self._sheet_combo.currentIndexChanged.connect(self._reload_headers)
@@ -170,18 +175,37 @@ class TaskCreationDialog(QDialog):
         self._confirm_url_edit = QLineEdit()
         self._url_field_combo = QComboBox()
         self._url_field_combo.setEditable(True)
-        self._display_fields_edit = QLineEdit()
-        self._export_fields_edit = QLineEdit()
+        self._display_fields_edit = QTextEdit()
+        self._display_fields_edit.setAcceptRichText(False)
+        self._display_fields_edit.setFixedHeight(72)
+        self._export_fields_edit = QTextEdit()
+        self._export_fields_edit.setAcceptRichText(False)
+        self._export_fields_edit.setFixedHeight(72)
 
         form.addRow("Excel 文件", source_widget)
-        form.addRow("Sheet", self._sheet_combo)
-        form.addRow("标题行", self._header_row_spin)
-        form.addRow("浏览器配置", self._browser_combo)
-        form.addRow("标签数", self._open_tab_spin)
-        form.addRow("确认页面", self._confirm_url_edit)
-        form.addRow("URL 列名", self._url_field_combo)
-        form.addRow("展示列名", self._display_fields_edit)
-        form.addRow("导出字段", self._export_fields_edit)
+        form.addRow("确认页 URL", self._expanding_form_field(self._confirm_url_edit))
+        form.addRow(
+            "浏览器配置",
+            self._bounded_form_field(self._browser_combo, FORM_FIELD_COMPACT_WIDTH),
+        )
+        form.addRow(
+            "同时打开标签",
+            self._bounded_form_field(self._open_tab_spin, FORM_FIELD_COMPACT_WIDTH),
+        )
+        form.addRow(
+            "Sheet",
+            self._bounded_form_field(self._sheet_combo, FORM_FIELD_COMPACT_WIDTH),
+        )
+        form.addRow(
+            "标题行",
+            self._bounded_form_field(self._header_row_spin, FORM_FIELD_COMPACT_WIDTH),
+        )
+        form.addRow(
+            "URL 列名",
+            self._bounded_form_field(self._url_field_combo, FORM_FIELD_COMPACT_WIDTH),
+        )
+        form.addRow("展示字段", self._expanding_form_field(self._display_fields_edit))
+        form.addRow("导出字段", self._expanding_form_field(self._export_fields_edit))
         root.addLayout(form)
 
         shortcut_group = QGridLayout()
@@ -242,6 +266,30 @@ class TaskCreationDialog(QDialog):
 
         self._initialize_form(initial_snapshot)
 
+    def _build_compound_field(self, primary: QWidget, secondary: QWidget) -> QWidget:
+        container = QWidget()
+        layout = QHBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+        layout.addWidget(primary, stretch=1)
+        layout.addWidget(secondary)
+        return container
+
+    def _bounded_form_field(self, widget: QWidget, width: int) -> QWidget:
+        widget.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        widget.setFixedWidth(width)
+        container = QWidget()
+        layout = QHBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        layout.addWidget(widget)
+        layout.addStretch(1)
+        return container
+
+    def _expanding_form_field(self, widget: QWidget) -> QWidget:
+        widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        return widget
+
     def _initialize_form(self, initial_snapshot: TaskSnapshot | None) -> None:
         if self.source_path is not None:
             if self.source_path.exists():
@@ -286,8 +334,8 @@ class TaskCreationDialog(QDialog):
         self._confirm_url_edit.setText(snapshot.confirm_url or "")
         self._reload_headers()
         self._url_field_combo.setCurrentText(snapshot.url_field)
-        self._display_fields_edit.setText(", ".join(snapshot.display_fields))
-        self._export_fields_edit.setText(", ".join(snapshot.export_fields))
+        self._display_fields_edit.setPlainText(", ".join(snapshot.display_fields))
+        self._export_fields_edit.setPlainText(", ".join(snapshot.export_fields))
         self._submit_shortcut_edit.setKeySequence(QKeySequence(snapshot.shortcuts.submit))
         self._previous_shortcut_edit.setKeySequence(QKeySequence(snapshot.shortcuts.previous))
         self._exit_shortcut_edit.setKeySequence(QKeySequence(snapshot.shortcuts.exit))
@@ -391,7 +439,7 @@ class TaskCreationDialog(QDialog):
             open_tab_count=int(self._open_tab_spin.value()),
             confirm_url=self._confirm_url_edit.text().strip() or None,
             url_field=url_field,
-            display_fields=_split_csv(self._display_fields_edit.text()),
+            display_fields=_split_csv(self._display_fields_edit.toPlainText()),
             review_fields=_collect_review_fields(self._review_fields_table),
             enabled_review_field_ids=_collect_enabled_review_field_ids(self._review_fields_table),
             shortcuts=ReviewShortcutConfig(
@@ -399,7 +447,7 @@ class TaskCreationDialog(QDialog):
                 previous=_key_sequence_text(self._previous_shortcut_edit),
                 exit=_key_sequence_text(self._exit_shortcut_edit),
             ),
-            export_fields=_split_csv(self._export_fields_edit.text()),
+            export_fields=_split_csv(self._export_fields_edit.toPlainText()),
         )
 
     def _update_warnings(self, warnings: list[str]) -> None:

@@ -58,7 +58,6 @@ def create_application() -> QApplication:
         }
         QTableWidget {
             border: 1px solid palette(mid);
-            border-radius: 10px;
             background: palette(base);
             alternate-background-color: palette(window);
             gridline-color: palette(mid);

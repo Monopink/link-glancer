@@ -42,7 +42,7 @@ class BrowserConfigAdvancedDialog(QDialog):
 
         form.addRow("浏览器名称", QLabel(self.browser_config.name))
         form.addRow("浏览器程序", self._path_label)
-        form.addRow("测试页面", self._test_url_edit)
+        form.addRow("测试页 URL", self._test_url_edit)
         form.addRow("启动参数", self._launch_args_edit)
         form.addRow("当前状态", self._status_label)
         root.addLayout(form)

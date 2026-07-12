@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMessageBox,
     QPushButton,
+    QSizePolicy,
     QSpinBox,
     QVBoxLayout,
     QWidget,
@@ -40,6 +41,9 @@ DEFAULT_CREATOR_PAGE_URL = ""
 DEFAULT_COLLECTION_EXPORT_NAME = "creator_{timestamp}.xlsx"
 COLLECTION_POLL_INTERVAL_MS = 1000
 TIME_LABEL_REFRESH_INTERVAL_SECONDS = 5
+FORM_FIELD_FULL_WIDTH = 420
+FORM_FIELD_MEDIUM_WIDTH = 320
+FORM_FIELD_COMPACT_WIDTH = 140
 
 
 @dataclass(slots=True)
@@ -141,10 +145,19 @@ class CreatorCollectorDialog(QDialog):
         self._auto_scroll_interval_spin.setSuffix(" 秒")
         self._auto_scroll_interval_spin.setValue(self._prefilled_auto_advance_interval_seconds)
 
-        form.addRow("浏览器配置", self._browser_combo)
-        form.addRow("页面 URL", self._page_url_edit)
-        form.addRow("单次上限", self._safety_limit_spin)
-        form.addRow("自动滚动间隔", self._auto_scroll_interval_spin)
+        form.addRow(
+            "浏览器配置",
+            self._bounded_form_field(self._browser_combo, FORM_FIELD_MEDIUM_WIDTH),
+        )
+        form.addRow("页面 URL", self._expanding_form_field(self._page_url_edit))
+        form.addRow(
+            "单次上限",
+            self._bounded_form_field(self._safety_limit_spin, FORM_FIELD_COMPACT_WIDTH),
+        )
+        form.addRow(
+            "自动滚动间隔",
+            self._bounded_form_field(self._auto_scroll_interval_spin, FORM_FIELD_COMPACT_WIDTH),
+        )
         root.addLayout(form)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel)
@@ -174,6 +187,21 @@ class CreatorCollectorDialog(QDialog):
         self.last_created_task_id = progress_dialog.last_created_task_id
         if self.last_created_task_id is not None:
             self.accept()
+
+    def _bounded_form_field(self, widget: QWidget, width: int) -> QWidget:
+        widget.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        widget.setFixedWidth(width)
+        container = QWidget()
+        layout = QHBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        layout.addWidget(widget)
+        layout.addStretch(1)
+        return container
+
+    def _expanding_form_field(self, widget: QWidget) -> QWidget:
+        widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        return widget
 
     def _selected_browser_config(self) -> BrowserConfig | None:
         selected_id = self._browser_combo.currentData()

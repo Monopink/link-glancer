@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QProcess, Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QColor
+from PySide6.QtGui import QColor, QFontMetrics
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QDialog,
@@ -16,7 +16,6 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressDialog,
     QPushButton,
-    QSizePolicy,
     QStackedWidget,
     QStatusBar,
     QTableWidget,
@@ -101,6 +100,9 @@ class _TaskMutationWorker(QObject):
 
 
 class MainWindow(QMainWindow):
+    _PAGE_LAYOUT_MARGINS = (9, 9, 9, 9)
+    _PAGE_LAYOUT_SPACING = 6
+
     def __init__(self, *, instance_id: int) -> None:
         super().__init__()
         self._instance_id = instance_id
@@ -146,30 +148,7 @@ class MainWindow(QMainWindow):
         self._toolbar = QToolBar("任务")
         self._toolbar.setMovable(False)
         self.addToolBar(self._toolbar)
-
-        new_task = QPushButton("新建任务")
-        new_task.clicked.connect(self._create_task)
-        self._toolbar.addWidget(new_task)
-
-        new_collection_task = QPushButton("新建采集任务")
-        new_collection_task.clicked.connect(self._create_collection_task)
-        self._toolbar.addWidget(new_collection_task)
-
-        browser_configs = QPushButton("浏览器配置")
-        browser_configs.clicked.connect(self._show_browser_configs)
-        self._toolbar.addWidget(browser_configs)
-
-        spacer = QWidget()
-        spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
-        self._toolbar.addWidget(spacer)
-
-        self._open_task_button = QPushButton("打开任务")
-        self._open_task_button.clicked.connect(self._open_selected_task_from_table)
-        self._toolbar.addWidget(self._open_task_button)
-
-        self._delete_task_button = QPushButton("删除任务")
-        self._delete_task_button.clicked.connect(self._delete_selected_task_from_table)
-        self._toolbar.addWidget(self._delete_task_button)
+        self._toolbar.hide()
 
     def _build_pages(self) -> None:
         self._stack = QStackedWidget()
@@ -182,8 +161,7 @@ class MainWindow(QMainWindow):
     def _build_start_page(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
-        layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(6)
+        self._configure_page_layout(layout)
 
         layout.addWidget(QLabel("任务列表"))
 
@@ -192,19 +170,7 @@ class MainWindow(QMainWindow):
             ["ID", "状态", "进度", "任务", "更新时间", "源文件"]
         )
         self._task_table.verticalHeader().setVisible(False)
-        self._task_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self._task_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self._task_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        self._task_table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self._task_table.setStyleSheet(
-            "QTableView { outline: 0; } "
-            "QTableView::item:selected { "
-            "border: 0px; "
-            "background-color: #2563eb; "
-            "color: #ffffff; "
-            "}"
-        )
-        self._task_table.setAlternatingRowColors(True)
+        self._configure_table_widget(self._task_table, focus_policy=Qt.FocusPolicy.NoFocus)
         self._task_table.doubleClicked.connect(self._open_selected_task_from_table)
         self._task_table.itemSelectionChanged.connect(self._update_start_page_actions)
         header_view = self._task_table.horizontalHeader()
@@ -215,55 +181,90 @@ class MainWindow(QMainWindow):
         header_view.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
         header_view.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
         layout.addWidget(self._task_table, stretch=1)
+
+        self._task_empty_state_label = QLabel("暂无任务，请先新建任务或新建采集任务。")
+        self._task_empty_state_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._task_empty_state_label.setWordWrap(True)
+        layout.addWidget(self._task_empty_state_label)
+
+        actions = QHBoxLayout()
+        actions.setContentsMargins(0, 0, 0, 0)
+        actions.setSpacing(8)
+        self._new_task_button = QPushButton("新建任务")
+        self._new_task_button.clicked.connect(self._create_task)
+        actions.addWidget(self._new_task_button)
+        self._new_collection_task_button = QPushButton("开始采集")
+        self._new_collection_task_button.clicked.connect(self._create_collection_task)
+        actions.addWidget(self._new_collection_task_button)
+        self._browser_configs_button = QPushButton("浏览器配置")
+        self._browser_configs_button.clicked.connect(self._show_browser_configs)
+        actions.addWidget(self._browser_configs_button)
+        actions.addStretch(1)
+        self._delete_task_button = QPushButton("删除任务")
+        self._delete_task_button.clicked.connect(self._delete_selected_task_from_table)
+        actions.addWidget(self._delete_task_button)
+        self._open_task_button = QPushButton("打开任务")
+        self._open_task_button.clicked.connect(self._open_selected_task_from_table)
+        self._open_task_button.setAutoDefault(True)
+        self._open_task_button.setDefault(True)
+        actions.addWidget(self._open_task_button)
+        layout.addLayout(actions)
         return page
 
     def _build_task_page(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
-        layout.setContentsMargins(20, 20, 20, 20)
-        layout.setSpacing(12)
+        self._configure_page_layout(layout)
 
-        title_row = QHBoxLayout()
-        title_row.setContentsMargins(0, 0, 0, 0)
-        title_row.setSpacing(12)
         self._task_title_label = QLabel("任务")
         self._task_title_label.setTextFormat(Qt.TextFormat.PlainText)
-        self._task_meta_label = QLabel("-")
-        self._task_meta_label.setWordWrap(True)
-        title_row.addWidget(self._task_title_label)
-        title_row.addWidget(self._task_meta_label, stretch=1)
+        self._task_title_label.setWordWrap(True)
+        layout.addWidget(self._task_title_label)
 
-        title_box = QVBoxLayout()
-        title_box.setContentsMargins(0, 0, 0, 0)
-        title_box.addLayout(title_row)
-        layout.addLayout(title_box)
+        self._task_data_table = QTableWidget(0, 0)
+        self._configure_table_widget(
+            self._task_data_table,
+            focus_policy=Qt.FocusPolicy.StrongFocus,
+        )
+        self._task_data_table.horizontalHeader().setSectionsMovable(False)
+        self._task_data_table.doubleClicked.connect(self._confirm_jump_task_progress_from_table)
+        layout.addWidget(self._task_data_table, stretch=1)
 
         actions = QHBoxLayout()
+        actions.setContentsMargins(0, 0, 0, 0)
+        actions.setSpacing(8)
         self._back_to_list_button = QPushButton("返回任务列表")
         self._back_to_list_button.clicked.connect(self._show_start_page)
         config_button = QPushButton("任务配置")
         config_button.clicked.connect(self._edit_task_configuration)
-        export_button = QPushButton("导出")
+        export_button = QPushButton("导出表格")
         export_button.clicked.connect(self._export_task_with_dialog)
         delete_button = QPushButton("删除任务")
         delete_button.clicked.connect(self._delete_current_task)
         start_button = QPushButton("开始检查")
         start_button.clicked.connect(self._start_review_flow)
+        start_button.setAutoDefault(True)
+        start_button.setDefault(True)
         actions.addWidget(self._back_to_list_button)
-        actions.addSpacing(18)
         actions.addWidget(config_button)
+        actions.addStretch(1)
         actions.addWidget(export_button)
         actions.addWidget(delete_button)
-        actions.addStretch(1)
         actions.addWidget(start_button)
         layout.addLayout(actions)
+        return page
 
-        self._task_data_table = QTableWidget(0, 0)
-        self._task_data_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self._task_data_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self._task_data_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        self._task_data_table.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-        self._task_data_table.setStyleSheet(
+    def _configure_table_widget(
+        self,
+        table: QTableWidget,
+        *,
+        focus_policy: Qt.FocusPolicy,
+    ) -> None:
+        table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        table.setFocusPolicy(focus_policy)
+        table.setStyleSheet(
             "QTableView { outline: 0; } "
             "QTableView::item:selected { "
             "border: 0px; "
@@ -271,11 +272,11 @@ class MainWindow(QMainWindow):
             "color: #ffffff; "
             "}"
         )
-        self._task_data_table.setAlternatingRowColors(True)
-        self._task_data_table.horizontalHeader().setSectionsMovable(False)
-        self._task_data_table.doubleClicked.connect(self._confirm_jump_task_progress_from_table)
-        layout.addWidget(self._task_data_table, stretch=1)
-        return page
+        table.setAlternatingRowColors(True)
+
+    def _configure_page_layout(self, layout: QVBoxLayout) -> None:
+        layout.setContentsMargins(*self._PAGE_LAYOUT_MARGINS)
+        layout.setSpacing(self._PAGE_LAYOUT_SPACING)
 
     def _summary_row(self, title: str, value_widget: QLabel) -> QWidget:
         row_widget = QWidget()
@@ -395,7 +396,7 @@ class MainWindow(QMainWindow):
         self._shutdown_confirmation_browser()
         self.task = None
         self._editing_task_index = None
-        self._toolbar.show()
+        self._toolbar.hide()
         self._stack.setCurrentWidget(self._start_page)
         self._refresh_start_page(selected_task_id=selected_task_id)
 
@@ -410,6 +411,7 @@ class MainWindow(QMainWindow):
             selected_task_id if selected_task_id is not None else self._selected_task_id()
         )
         summaries = self.app_service.list_tasks()
+        self._task_empty_state_label.setVisible(not summaries)
         self._task_table_ids = [summary.task_id for summary in summaries]
         self._task_table.setRowCount(len(summaries))
         for row, summary in enumerate(summaries):
@@ -507,8 +509,9 @@ class MainWindow(QMainWindow):
         if not self.task:
             return
         self.task = self.app_service.load_task(self.task.task_id)
-        self._task_title_label.setText(self.task.name)
-        self._task_meta_label.setText(self._task_summary_text(self.task))
+        self._task_title_label.setText(
+            f"#{self.task.task_id}  ·  {self.task.name}  ·  {self._task_summary_text(self.task)}"
+        )
         self._refresh_task_data_table()
 
     def _start_review_flow(self) -> None:
@@ -626,13 +629,6 @@ class MainWindow(QMainWindow):
         self._task_data_table.setRowCount(len(items))
         self._task_data_table.setVerticalHeaderLabels([str(item.task_index) for item in items])
 
-        header = self._task_data_table.horizontalHeader()
-        for column in range(len(table_fields)):
-            header.setSectionResizeMode(column, QHeaderView.ResizeMode.Interactive)
-            header.resizeSection(column, 160)
-        if table_fields:
-            header.resizeSection(0, 220)
-
         palette = self.palette()
         completed_background = palette.alternateBase().color()
         current_background = QColor("#1d4ed8" if self.is_dark_mode() else "#dbeafe")
@@ -662,9 +658,69 @@ class MainWindow(QMainWindow):
                     table_item.setBackground(completed_background)
                 self._task_data_table.setItem(row, column, table_item)
 
+        self._apply_task_table_column_widths(table_fields)
+
         current_row = min(max(self.task.current_task_index - 1, 0), max(len(items) - 1, 0))
         if 0 <= current_row < self._task_data_table.rowCount():
             self._task_data_table.selectRow(current_row)
+
+    def _apply_task_table_column_widths(self, table_fields: list[str]) -> None:
+        header = self._task_data_table.horizontalHeader()
+        header.setStretchLastSection(False)
+        self._task_data_table.resizeColumnsToContents()
+        metrics = QFontMetrics(self._task_data_table.font())
+        padding = max(24, metrics.horizontalAdvance("000"))
+        min_width = max(72, metrics.horizontalAdvance("0000"))
+        max_width = max(220, metrics.horizontalAdvance("0" * 28))
+
+        for column, field_name in enumerate(table_fields):
+            content_width = self._task_data_table.columnWidth(column)
+            sample_width = self._task_table_sample_width(column)
+            target_width = min(
+                max(min_width, content_width, sample_width + padding),
+                max_width,
+            )
+            if self._is_compact_task_table_column(field_name, column):
+                target_width = min(target_width, max(96, metrics.horizontalAdvance("0" * 10)))
+            header.setSectionResizeMode(column, QHeaderView.ResizeMode.Interactive)
+            header.resizeSection(column, target_width)
+
+    def _task_table_sample_width(self, column: int) -> int:
+        header_item = self._task_data_table.horizontalHeaderItem(column)
+        header_text = header_item.text() if header_item is not None else ""
+        sample_texts = [header_text]
+        row_count = min(self._task_data_table.rowCount(), 24)
+        for row in range(row_count):
+            item = self._task_data_table.item(row, column)
+            if item is not None:
+                sample_texts.append(item.text())
+        metrics = QFontMetrics(self._task_data_table.font())
+        return max((metrics.horizontalAdvance(text) for text in sample_texts), default=0)
+
+    def _is_compact_task_table_column(self, field_name: str, column: int) -> bool:
+        values: list[str] = []
+        row_count = self._task_data_table.rowCount()
+        for row in range(row_count):
+            item = self._task_data_table.item(row, column)
+            if item is None:
+                continue
+            text = item.text().strip()
+            if text:
+                values.append(text)
+        if not values:
+            return False
+        if all(len(value) <= 8 for value in values):
+            return True
+        if all(self._is_numeric_like(value) for value in values):
+            return True
+        if all(value.casefold() in {"true", "false", "yes", "no", "0", "1"} for value in values):
+            return True
+        normalized = field_name.casefold()
+        return normalized.endswith("_id") and all(len(value) <= 12 for value in values)
+
+    def _is_numeric_like(self, value: str) -> bool:
+        normalized = value.replace(",", "").replace(".", "").replace("-", "").strip()
+        return bool(normalized) and normalized.isdigit()
 
     def _confirm_jump_task_progress_from_table(self) -> None:
         if not self.task:

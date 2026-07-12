@@ -645,11 +645,7 @@ class TaskApplicationService:
     def task_table_field_names(
         self, task: TaskDetail, items: list[TaskItem] | None = None
     ) -> list[str]:
-        display_fields = self.task_display_field_names(task, items)
-        review_field_ids = [
-            field.field_id for field in self.enabled_review_fields(task.task_snapshot)
-        ]
-        return self._merge_id_order(display_fields, review_field_ids)
+        return self.export_field_names(task, items)
 
     def export_field_names(
         self, task: TaskDetail, items: list[TaskItem] | None = None
