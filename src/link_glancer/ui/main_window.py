@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
 
 from creator_collector import CreatorCollectorDialog
 from creator_enrichment import CreatorEnrichmentDialog
+from creator_enrichment.state import is_terminal_status, normalize_state, setting_key
 from link_glancer.application import TaskApplicationService
 from link_glancer.browser.base import BrowserController, BrowserLaunchRequest, BufferBlock
 from link_glancer.browser.detector import detect_browser
@@ -682,6 +683,20 @@ class MainWindow(QMainWindow):
     def _open_creator_enrichment_dialog(self) -> None:
         if not self.task:
             return
+        if self._is_creator_enrichment_completed(self.task.task_id):
+            result = QMessageBox.question(
+                self,
+                "补充采集已完成",
+                "当前补充采集任务已经完成，是否重新开始？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel,
+            )
+            if result != QMessageBox.StandardButton.Yes:
+                return
+            self.app_service.save_app_setting(
+                setting_key(self.task.task_id),
+                {"version": 1, "statuses": {}, "started_at": None},
+            )
         dialog = CreatorEnrichmentDialog(
             app_service=self.app_service,
             task=self.task,
@@ -689,6 +704,24 @@ class MainWindow(QMainWindow):
         )
         dialog.exec()
         self._refresh_task_page()
+
+    def _is_creator_enrichment_completed(self, task_id: int) -> bool:
+        items = self.app_service.list_all_items(task_id)
+        eligible_indexes = [
+            item.task_index
+            for item in items
+            if str(item.task_data.get("creator_oecuid") or "").strip()
+        ]
+        if not eligible_indexes:
+            return False
+        state = normalize_state(self.app_service.load_app_setting(setting_key(task_id)))
+        statuses = state.get("statuses")
+        if not isinstance(statuses, dict):
+            return False
+        return all(
+            is_terminal_status(str((statuses.get(str(task_index)) or {}).get("status") or ""))
+            for task_index in eligible_indexes
+        )
 
     def _apply_task_table_column_widths(self, table_fields: list[str]) -> None:
         header = self._task_data_table.horizontalHeader()

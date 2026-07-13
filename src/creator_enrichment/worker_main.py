@@ -147,6 +147,7 @@ class _EnrichmentWorkerRuntime:
                 "pause_reason": None,
                 "diagnostic_summary": None,
                 "diagnostic_text": None,
+                "failure_attempts": [],
                 "attention_required": False,
                 "started_at": None,
                 "estimated_end_at": None,
@@ -169,6 +170,14 @@ class _EnrichmentWorkerRuntime:
             "pause_reason": status.pause_reason,
             "diagnostic_summary": status.diagnostic_summary,
             "diagnostic_text": status.diagnostic_text,
+            "failure_attempts": [
+                {
+                    "index": attempt.index,
+                    "summary": attempt.summary,
+                    "diagnostic_text": attempt.diagnostic_text,
+                }
+                for attempt in (status.failure_attempts or [])
+            ],
             "attention_required": status.attention_required,
             "started_at": _serialize_datetime(status.started_at),
             "estimated_end_at": _serialize_datetime(status.estimated_end_at),

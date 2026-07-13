@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -53,6 +54,7 @@ class _EnrichmentWorkerStatus:
     pause_reason: str | None
     diagnostic_summary: str | None
     diagnostic_text: str | None
+    failure_attempts: list[dict[str, object]]
     attention_required: bool
     started_at: datetime | None
     estimated_end_at: datetime | None
@@ -76,6 +78,7 @@ class _EnrichmentWorkerStatus:
             pause_reason=None,
             diagnostic_summary=None,
             diagnostic_text=None,
+            failure_attempts=[],
             attention_required=False,
             started_at=None,
             estimated_end_at=None,
@@ -84,6 +87,7 @@ class _EnrichmentWorkerStatus:
     @classmethod
     def from_payload(cls, payload: dict[str, object]) -> _EnrichmentWorkerStatus:
         remaining_regions = payload.get("remaining_regions")
+        raw_failure_attempts = payload.get("failure_attempts")
         return cls(
             running=bool(payload.get("running")),
             paused=bool(payload.get("paused")),
@@ -116,6 +120,11 @@ class _EnrichmentWorkerStatus:
             ),
             diagnostic_text=(
                 str(payload.get("diagnostic_text")) if payload.get("diagnostic_text") else None
+            ),
+            failure_attempts=(
+                [item for item in raw_failure_attempts if isinstance(item, dict)]
+                if isinstance(raw_failure_attempts, list)
+                else []
             ),
             attention_required=bool(payload.get("attention_required")),
             started_at=_parse_datetime(payload.get("started_at")),
@@ -184,20 +193,20 @@ class CreatorEnrichmentDialog(QDialog):
         actions = QHBoxLayout()
         actions.setContentsMargins(0, 0, 0, 0)
         actions.setSpacing(12)
+        self._skip_button = QPushButton("跳过")
+        self._skip_button.clicked.connect(self._skip_current)
+        self._pause_button = QPushButton("暂停")
+        self._pause_button.clicked.connect(self._pause)
         self._continue_button = QPushButton("继续")
         self._continue_button.clicked.connect(self._resume)
         self._retry_button = QPushButton("重试")
         self._retry_button.clicked.connect(self._retry_current)
-        self._skip_button = QPushButton("跳过当前项")
-        self._skip_button.clicked.connect(self._skip_current)
-        self._pause_button = QPushButton("暂停")
-        self._pause_button.clicked.connect(self._pause)
         close_button = QPushButton("关闭")
         close_button.clicked.connect(self.close)
-        actions.addWidget(self._continue_button)
-        actions.addWidget(self._retry_button)
         actions.addWidget(self._skip_button)
         actions.addWidget(self._pause_button)
+        actions.addWidget(self._continue_button)
+        actions.addWidget(self._retry_button)
         actions.addStretch(1)
         actions.addWidget(close_button)
         root.addLayout(actions)
@@ -429,6 +438,7 @@ class CreatorEnrichmentDialog(QDialog):
             title=self._issue_dialog_title(status),
             user_message=self._issue_dialog_message(status),
             diagnostic_text=status.diagnostic_text,
+            failure_attempts=status.failure_attempts,
             task_name=self._task.name,
             parent=self,
         )
@@ -530,11 +540,13 @@ class _IssueDialog(QDialog):
         title: str,
         user_message: str,
         diagnostic_text: str,
+        failure_attempts: list[dict[str, object]],
         task_name: str,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self._diagnostic_text = diagnostic_text
+        self._failure_attempts = failure_attempts
         self._task_name = task_name
         self.setWindowTitle(title)
         self.resize(860, 620)
@@ -551,11 +563,22 @@ class _IssueDialog(QDialog):
         details_label = QLabel("详细排查信息")
         root.addWidget(details_label)
 
-        text_edit = QPlainTextEdit()
-        text_edit.setPlainText(diagnostic_text)
-        text_edit.setReadOnly(True)
-        root.addWidget(text_edit)
-        self._text_edit = text_edit
+        self._tabs = QTabWidget()
+        self._text_edits: list[QPlainTextEdit] = []
+        if failure_attempts:
+            for index, attempt in enumerate(failure_attempts, start=1):
+                text_edit = QPlainTextEdit()
+                text_edit.setPlainText(str(attempt.get("diagnostic_text") or ""))
+                text_edit.setReadOnly(True)
+                self._tabs.addTab(text_edit, f"第{index}次")
+                self._text_edits.append(text_edit)
+        else:
+            text_edit = QPlainTextEdit()
+            text_edit.setPlainText(diagnostic_text)
+            text_edit.setReadOnly(True)
+            self._tabs.addTab(text_edit, "详情")
+            self._text_edits.append(text_edit)
+        root.addWidget(self._tabs)
 
         actions = QHBoxLayout()
         actions.setContentsMargins(0, 0, 0, 0)
@@ -563,7 +586,7 @@ class _IssueDialog(QDialog):
         copy_button = QPushButton("复制全部")
         copy_button.clicked.connect(self._copy_text)
         select_button = QPushButton("全选")
-        select_button.clicked.connect(self._text_edit.selectAll)
+        select_button.clicked.connect(self._select_current_text)
         export_button = QPushButton("导出")
         export_button.clicked.connect(self._export_text)
         close_button = QPushButton("关闭")
@@ -578,7 +601,12 @@ class _IssueDialog(QDialog):
     def _copy_text(self) -> None:
         clipboard = QGuiApplication.clipboard()
         if clipboard is not None:
-            clipboard.setText(self._diagnostic_text)
+            clipboard.setText(self._export_content())
+
+    def _select_current_text(self) -> None:
+        index = self._tabs.currentIndex()
+        if 0 <= index < len(self._text_edits):
+            self._text_edits[index].selectAll()
 
     def _export_text(self) -> None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -594,5 +622,15 @@ class _IssueDialog(QDialog):
             return
         path = selected if selected.lower().endswith(".txt") else f"{selected}.txt"
         with open(path, "w", encoding="utf-8") as handle:
-            handle.write(self._diagnostic_text)
+            handle.write(self._export_content())
         QMessageBox.information(self, "已导出", f"错误详情已导出到\n{path}")
+
+    def _export_content(self) -> str:
+        if not self._failure_attempts:
+            return self._diagnostic_text
+        sections: list[str] = []
+        for index, attempt in enumerate(self._failure_attempts, start=1):
+            sections.append(f"===== 第{index}次失败 =====")
+            sections.append(str(attempt.get("diagnostic_text") or ""))
+            sections.append("")
+        return "\n".join(sections).rstrip()

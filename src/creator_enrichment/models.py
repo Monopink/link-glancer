@@ -5,6 +5,13 @@ from datetime import datetime
 
 
 @dataclass(slots=True)
+class CreatorEnrichmentFailureAttempt:
+    index: int
+    summary: str
+    diagnostic_text: str
+
+
+@dataclass(slots=True)
 class CreatorEnrichmentStatus:
     running: bool
     paused: bool
@@ -22,6 +29,7 @@ class CreatorEnrichmentStatus:
     pause_reason: str | None = None
     diagnostic_summary: str | None = None
     diagnostic_text: str | None = None
+    failure_attempts: list[CreatorEnrichmentFailureAttempt] | None = None
     attention_required: bool = False
     started_at: datetime | None = None
     estimated_end_at: datetime | None = None

@@ -15,6 +15,7 @@ from creator_enrichment.constants import (
     CONTACT_BADGE_WAIT_SECONDS,
     CONTACT_WAIT_SECONDS,
     DETAIL_URL_TEMPLATE,
+    FAILURE_RETRY_LIMIT,
     KNOWN_CONTACT_FIELD_MAP,
     PAUSE_REASON_CAPTCHA,
     PAUSE_REASON_MANUAL_ACTION,
@@ -29,7 +30,7 @@ from creator_enrichment.constants import (
     STATE_STATUS_SKIPPED,
     STATE_STATUS_SUCCESS,
 )
-from creator_enrichment.models import CreatorEnrichmentStatus
+from creator_enrichment.models import CreatorEnrichmentFailureAttempt, CreatorEnrichmentStatus
 from creator_enrichment.state import is_terminal_status, normalize_state, now_iso, update_item_state
 from link_glancer.application import TaskApplicationService
 from link_glancer.browser.detector import detect_browser
@@ -102,6 +103,7 @@ class CreatorEnrichmentSession:
         self._last_contact_available_raw: object = None
         self._last_contact_badge_detected = False
         self._last_contact_badge_clicked = False
+        self._failure_attempts: list[CreatorEnrichmentFailureAttempt] = []
 
     def start(self) -> CreatorEnrichmentStatus:
         self.shutdown()
@@ -167,7 +169,7 @@ class CreatorEnrichmentSession:
                 if self._recent_profile_activity():
                     self._last_message = self._with_subject("补充采集中。")
                     return self.status()
-                self._pause_manual_for_current(
+                self._handle_retryable_manual_failure(
                     "当前页面未获取到达人资料接口响应，请处理页面后继续，或跳过当前达人。"
                 )
             return self.status()
@@ -177,7 +179,7 @@ class CreatorEnrichmentSession:
                 self._apply_contact()
                 return self.status()
             if self._timed_out(CONTACT_WAIT_SECONDS):
-                self._pause_manual_for_current(
+                self._handle_retryable_manual_failure(
                     "已触发联系方式采集，但联系方式接口未在限定时间内返回，请处理后继续，或跳过当前达人。"
                 )
             return self.status()
@@ -189,7 +191,7 @@ class CreatorEnrichmentSession:
                 self._last_message = self._with_subject("有联系方式，正在采集。")
                 return self.status()
             if self._timed_out(CONTACT_BADGE_WAIT_SECONDS):
-                self._pause_manual_for_current(
+                self._handle_retryable_manual_failure(
                     self._with_subject(
                         "资料显示存在联系方式，但页面未出现可点击的联系方式图标，请处理后继续。"
                     )
@@ -217,6 +219,7 @@ class CreatorEnrichmentSession:
     def skip_current(self) -> CreatorEnrichmentStatus:
         if self._current_task_index is None:
             return self.status()
+        subject = self._current_subject()
         update_item_state(
             self._state,
             task_index=self._current_task_index,
@@ -224,7 +227,7 @@ class CreatorEnrichmentSession:
         )
         self._persist_state()
         self._advance_to_next_pending(open_page=True)
-        self._last_message = self._with_subject("已跳过。")
+        self._last_message = self._message_for_subject(subject, "已跳过。")
         return self.status()
 
     def retry_current(self) -> CreatorEnrichmentStatus:
@@ -236,7 +239,7 @@ class CreatorEnrichmentSession:
             return self.status()
         self._paused = False
         self._pause_reason = None
-        self._start_current_attempt(reload_page=True)
+        self._start_current_attempt(reload_page=True, clear_failure_history=True)
         self._last_message = self._with_subject("正在重试。")
         return self.status()
 
@@ -295,6 +298,7 @@ class CreatorEnrichmentSession:
             pause_reason=self._pause_reason,
             diagnostic_summary=self._diagnostic_summary(),
             diagnostic_text=self._diagnostic_text(),
+            failure_attempts=self._failure_attempts_for_status(),
             attention_required=self._attention_required(),
             started_at=self._started_at,
             estimated_end_at=estimated_end_at,
@@ -320,18 +324,21 @@ class CreatorEnrichmentSession:
         if not pending:
             self._current_task_index = None
             self._current_region = None
+            self._failure_attempts = []
             self._complete("补充采集完成。")
             return
         item = pending[0]
+        if item.task_index != self._current_task_index:
+            self._failure_attempts = []
         self._current_task_index = item.task_index
         self._current_region = _normalized_region(item.task_data.get("selection_region"))
         if open_page:
             self._load_current_detail_page()
 
     def _load_current_detail_page(self) -> None:
-        self._start_current_attempt(reload_page=False)
+        self._start_current_attempt(reload_page=False, clear_failure_history=True)
 
-    def _start_current_attempt(self, *, reload_page: bool) -> None:
+    def _start_current_attempt(self, *, reload_page: bool, clear_failure_history: bool) -> None:
         if self._page is None or self._current_task_index is None:
             return
         item = self._items_by_index.get(self._current_task_index)
@@ -342,6 +349,8 @@ class CreatorEnrichmentSession:
         if not creator_id:
             self.skip_current()
             return
+        if clear_failure_history:
+            self._failure_attempts = []
         self._reset_attempt_state()
         self._captured_profile = None
         self._captured_contact = None
@@ -357,7 +366,9 @@ class CreatorEnrichmentSession:
                 )
             self._page.bring_to_front()
         except PlaywrightError:
-            self._pause_manual_for_current("无法打开达人详情页，请处理后继续，或跳过当前达人。")
+            self._handle_retryable_manual_failure(
+                "无法打开达人详情页，请处理后继续，或跳过当前达人。"
+            )
 
     def _handle_response(self, response: Response) -> None:
         try:
@@ -548,7 +559,7 @@ class CreatorEnrichmentSession:
                 )
                 self._mark_current_paused(STATE_STATUS_PAUSED_REGION_MISMATCH)
                 return
-            self._pause_manual_for_current(
+            self._handle_retryable_manual_failure(
                 "达人资料接口返回异常，请处理页面后继续，或跳过当前达人。"
             )
             return
@@ -588,7 +599,7 @@ class CreatorEnrichmentSession:
             self._mark_no_contact_and_advance()
             return
         if contact_available is not True:
-            self._pause_manual_for_current(
+            self._handle_retryable_manual_failure(
                 self._with_subject(
                     "达人资料已返回，但 contact_info_available 不是明确的 true/false，请人工处理。"
                 )
@@ -618,7 +629,9 @@ class CreatorEnrichmentSession:
             return
         payload = captured.payload
         if int(payload.get("code") or 0) != 0:
-            self._pause_manual_for_current("联系方式接口返回异常，请处理后继续，或跳过当前达人。")
+            self._handle_retryable_manual_failure(
+                "联系方式接口返回异常，请处理后继续，或跳过当前达人。"
+            )
             return
         parsed = _contact_patch(payload)
         if parsed.patch:
@@ -636,23 +649,24 @@ class CreatorEnrichmentSession:
                 region=self._current_region or "",
             )
             self._persist_state()
+            subject = self._current_subject()
             self._advance_to_next_pending(open_page=True)
-            self._last_message = self._with_subject("已保存补充资料。")
+            self._last_message = self._message_for_subject(subject, "已保存补充资料。")
             return
         if parsed.total_entries <= 0:
-            self._pause_manual_for_current(
+            self._handle_retryable_manual_failure(
                 self._with_subject(
                     "资料显示存在联系方式，但联系方式接口未返回任何联系方式数据，请人工处理。"
                 )
             )
             return
         if parsed.valued_entries <= 0:
-            self._pause_manual_for_current(
+            self._handle_retryable_manual_failure(
                 self._with_subject("联系方式接口已返回，但所有联系方式值均为空，请人工处理。")
             )
             return
         if parsed.recognized_entries <= 0:
-            self._pause_manual_for_current(
+            self._handle_retryable_manual_failure(
                 self._with_subject(
                     "联系方式接口已返回，但未解析到可识别的联系方式字段，请人工处理。"
                 )
@@ -717,6 +731,30 @@ class CreatorEnrichmentSession:
     def _pause_manual_for_current(self, message: str) -> None:
         self._pause(PAUSE_REASON_MANUAL_ACTION, message)
         self._mark_current_paused(STATE_STATUS_PAUSED_MANUAL_ACTION)
+
+    def _handle_retryable_manual_failure(self, message: str) -> None:
+        attempt_index = len(self._failure_attempts) + 1
+        self._failure_attempts.append(
+            CreatorEnrichmentFailureAttempt(
+                index=attempt_index,
+                summary=message,
+                diagnostic_text=self._build_diagnostic_text(
+                    message=message,
+                    pause_reason=PAUSE_REASON_MANUAL_ACTION,
+                    pause_step=self._current_step or "idle",
+                ),
+            )
+        )
+        if attempt_index < FAILURE_RETRY_LIMIT:
+            self._paused = False
+            self._pause_reason = None
+            self._pause_step = self._current_step or "idle"
+            self._last_message = self._with_subject(
+                f"补充采集异常，正在进行第 {attempt_index + 1} 次重试。"
+            )
+            self._start_current_attempt(reload_page=True, clear_failure_history=False)
+            return
+        self._pause_manual_for_current(message)
 
     def _mark_current_paused(self, paused_status: str) -> None:
         if self._current_task_index is None:
@@ -797,6 +835,9 @@ class CreatorEnrichmentSession:
 
     def _with_subject(self, message: str) -> str:
         subject = self._current_subject()
+        return self._message_for_subject(subject, message)
+
+    def _message_for_subject(self, subject: str | None, message: str) -> str:
         if not subject:
             return message
         return f"{subject}：{message}"
@@ -804,6 +845,7 @@ class CreatorEnrichmentSession:
     def _mark_no_contact_and_advance(self) -> None:
         if self._current_task_index is None:
             return
+        subject = self._current_subject()
         update_item_state(
             self._state,
             task_index=self._current_task_index,
@@ -812,7 +854,10 @@ class CreatorEnrichmentSession:
         )
         self._persist_state()
         self._advance_to_next_pending(open_page=True)
-        self._last_message = self._with_subject("当前达人没有联系方式，已继续下一条。")
+        self._last_message = self._message_for_subject(
+            subject,
+            "当前达人没有联系方式，已继续下一条。",
+        )
 
     def _status_counts(self) -> dict[str, int]:
         counts = {"completed": 0, "success": 0, "no_contact": 0, "skipped": 0, "paused": 0}
@@ -890,6 +935,26 @@ class CreatorEnrichmentSession:
     def _diagnostic_text(self) -> str | None:
         if not self._attention_required():
             return None
+        if self._failure_attempts:
+            return self._failure_attempts[-1].diagnostic_text
+        return self._build_diagnostic_text(
+            message=self._last_message,
+            pause_reason=self._pause_reason,
+            pause_step=self._pause_step,
+        )
+
+    def _failure_attempts_for_status(self) -> list[CreatorEnrichmentFailureAttempt] | None:
+        if not self._attention_required() or not self._failure_attempts:
+            return None
+        return list(self._failure_attempts)
+
+    def _build_diagnostic_text(
+        self,
+        *,
+        message: str,
+        pause_reason: str | None,
+        pause_step: str | None,
+    ) -> str:
         page_url = "-"
         if self._page is not None:
             try:
@@ -902,10 +967,10 @@ class CreatorEnrichmentSession:
             f"当前条目: {self._current_task_index}",
             f"当前对象: {self._current_subject() or '-'}",
             f"当前区域: {self._current_region or '-'}",
-            f"暂停原因: {self._pause_reason or '-'}",
-            f"暂停阶段: {self._pause_step or '-'}",
+            f"暂停原因: {pause_reason or '-'}",
+            f"暂停阶段: {pause_step or '-'}",
             f"页面URL: {page_url}",
-            f"消息: {self._last_message}",
+            f"消息: {message}",
             f"profile_types: {list(self._last_profile_types)}",
             "contact_info_available 判定: "
             f"{_format_contact_available(self._last_contact_available)}",
