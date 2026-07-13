@@ -15,7 +15,6 @@ from creator_enrichment.constants import (
     CONTACT_BADGE_CLICK_TIMEOUT_MS,
     CONTACT_BADGE_SCROLL_TIMEOUT_MS,
     CONTACT_BADGE_WAIT_SECONDS,
-    CONTACT_CLICK_RETRY_SECONDS,
     CONTACT_WAIT_SECONDS,
     DETAIL_URL_TEMPLATE,
     FAILURE_RETRY_LIMIT,
@@ -120,7 +119,8 @@ class CreatorEnrichmentSession:
         self._last_contact_badge_clicked = False
         self._last_contact_badge_strategy = ""
         self._last_contact_badge_clicked_at: datetime | None = None
-        self._contact_click_retry_performed = False
+        self._contact_positive_signal = False
+        self._profile_patch_applied = False
         self._failure_attempts: list[CreatorEnrichmentFailureAttempt] = []
 
     def start(self) -> CreatorEnrichmentStatus:
@@ -180,8 +180,6 @@ class CreatorEnrichmentSession:
             return self.status()
 
         if self._current_step == "waiting_profile":
-            if self._should_preclick_contact_badge():
-                self._click_contact_badge()
             if self._captured_profile is not None:
                 self._apply_profile()
                 return self.status()
@@ -195,14 +193,21 @@ class CreatorEnrichmentSession:
             return self.status()
 
         if self._current_step == "waiting_contact":
-            if self._captured_contact is not None:
+            if self._captured_profile is not None:
+                self._apply_profile()
+                return self.status()
+            if self._captured_contact is not None and self._profile_patch_applied:
                 self._apply_contact()
                 return self.status()
-            if self._should_retry_contact_click() and self._click_contact_badge():
-                self._contact_click_retry_performed = True
-                self._last_message = self._with_subject("联系方式已展示，正在继续采集。")
+            if not self._profile_patch_applied and self._timed_out(PROFILE_WAIT_SECONDS):
+                if self._recent_profile_activity():
+                    self._last_message = self._with_subject("补充采集中。")
+                    return self.status()
+                self._handle_retryable_manual_failure(
+                    "已确认存在联系方式，但达人资料接口未在限定时间内返回，请处理页面后继续，或跳过当前达人。"
+                )
                 return self.status()
-            if self._timed_out(CONTACT_WAIT_SECONDS):
+            if self._profile_patch_applied and self._timed_out(CONTACT_WAIT_SECONDS):
                 self._handle_retryable_manual_failure(
                     "已触发联系方式采集，但联系方式接口未在限定时间内返回，请处理后继续，或跳过当前达人。"
                 )
@@ -211,12 +216,11 @@ class CreatorEnrichmentSession:
         if self._current_step == "waiting_contact_badge":
             if self._captured_contact is not None:
                 self._current_step = "waiting_contact"
-                self._apply_contact()
+                self._contact_positive_signal = True
                 return self.status()
-            if self._click_contact_badge():
+            if self._last_contact_badge_clicked:
                 self._current_step = "waiting_contact"
                 self._waiting_started_at = datetime.now(UTC)
-                self._last_message = self._with_subject("有联系方式，正在采集。")
                 return self.status()
             if self._timed_out(CONTACT_BADGE_WAIT_SECONDS):
                 self._handle_retryable_manual_failure(
@@ -441,6 +445,7 @@ class CreatorEnrichmentSession:
             self._last_contact_response_url = response.url
             self._last_contact_payload = payload
             if creator_id:
+                self._contact_positive_signal = True
                 self._captured_contact = _CapturedContact(creator_id=creator_id, payload=payload)
 
     def _pull_page_captures(self) -> None:
@@ -453,9 +458,10 @@ class CreatorEnrichmentSession:
                     const root = window.__linkGlancerCapture;
                     const invalidRoot = !root
                         || !Array.isArray(root.profileResponses)
-                        || !Array.isArray(root.contactResponses);
+                        || !Array.isArray(root.contactResponses)
+                        || !Array.isArray(root.badgeEvents);
                     if (invalidRoot) {
-                        return { profileResponses: [], contactResponses: [] };
+                        return { profileResponses: [], contactResponses: [], badgeEvents: [] };
                     }
                     const profileResponses = root.profileResponses.splice(
                         0,
@@ -465,7 +471,11 @@ class CreatorEnrichmentSession:
                         0,
                         root.contactResponses.length,
                     );
-                    return { profileResponses, contactResponses };
+                    const badgeEvents = root.badgeEvents.splice(
+                        0,
+                        root.badgeEvents.length,
+                    );
+                    return { profileResponses, contactResponses, badgeEvents };
                 }
                 """
             )
@@ -481,6 +491,10 @@ class CreatorEnrichmentSession:
         if isinstance(contact_responses, list):
             for entry in contact_responses:
                 self._handle_page_contact_capture(entry)
+        badge_events = captures.get("badgeEvents")
+        if isinstance(badge_events, list):
+            for entry in badge_events:
+                self._handle_page_badge_capture(entry)
 
     def _handle_page_profile_capture(self, entry: object) -> None:
         if not isinstance(entry, dict):
@@ -541,7 +555,34 @@ class CreatorEnrichmentSession:
             return
         self._last_contact_response_url = url
         self._last_contact_payload = payload
+        self._contact_positive_signal = True
         self._captured_contact = _CapturedContact(creator_id=creator_id, payload=payload)
+
+    def _handle_page_badge_capture(self, entry: object) -> None:
+        if not isinstance(entry, dict):
+            return
+        detected = bool(entry.get("detected"))
+        clicked = bool(entry.get("clicked"))
+        strategy = str(entry.get("strategy") or "")
+        if detected:
+            self._last_contact_badge_detected = True
+            self._contact_positive_signal = True
+        if strategy:
+            self._last_contact_badge_strategy = strategy
+        if clicked and not self._last_contact_badge_clicked:
+            self._last_contact_badge_clicked = True
+            self._last_contact_badge_clicked_at = datetime.now(UTC)
+        if not detected:
+            return
+        if not self._last_contact_badge_clicked:
+            self._click_contact_badge()
+        if self._last_contact_badge_clicked and self._current_step in {
+            "waiting_profile",
+            "waiting_contact_badge",
+        }:
+            self._current_step = "waiting_contact"
+            self._waiting_started_at = datetime.now(UTC)
+            self._last_message = self._with_subject("有联系方式，正在采集。")
 
     def _store_captured_profile(
         self,
@@ -613,6 +654,7 @@ class CreatorEnrichmentSession:
         self._last_contact_available_raw = profile.get("contact_info_available")
         contact_available = _contact_info_available(profile.get("contact_info_available"))
         self._last_contact_available = contact_available
+        self._profile_patch_applied = True
         if contact_available is not None:
             patch["contact_info_available"] = "true" if contact_available else "false"
         if patch:
@@ -623,10 +665,17 @@ class CreatorEnrichmentSession:
             )
             self._refresh_items()
 
-        if contact_available is False:
+        has_contact = (
+            contact_available is True
+            or self._contact_positive_signal
+            or self._captured_contact is not None
+            or self._last_contact_badge_clicked
+        )
+
+        if contact_available is False and not has_contact:
             self._mark_no_contact_and_advance()
             return
-        if contact_available is not True:
+        if not has_contact and contact_available is not True:
             self._handle_retryable_manual_failure(
                 self._with_subject(
                     "达人资料已返回，但 contact_info_available 不是明确的 true/false，请人工处理。"
@@ -639,9 +688,15 @@ class CreatorEnrichmentSession:
         self._last_message = self._with_subject("有联系方式，正在采集。")
         if self._captured_contact is not None:
             self._current_step = "waiting_contact"
-            self._apply_contact()
+            self._contact_positive_signal = True
+            return
+        if self._last_contact_badge_clicked:
+            self._current_step = "waiting_contact"
+            self._waiting_started_at = datetime.now(UTC)
+            self._last_message = self._with_subject("有联系方式，正在采集。")
             return
         if self._click_contact_badge():
+            self._contact_positive_signal = True
             self._current_step = "waiting_contact"
             self._waiting_started_at = datetime.now(UTC)
             self._last_message = self._with_subject("有联系方式，正在采集。")
@@ -708,12 +763,15 @@ class CreatorEnrichmentSession:
     def _click_contact_badge(self) -> bool:
         if self._page is None:
             return False
+        if self._last_contact_badge_clicked:
+            return True
         result = self._click_contact_badge_via_dom()
         if result["clicked"]:
             self._last_contact_badge_detected = bool(result["detected"])
             self._last_contact_badge_clicked = True
             self._last_contact_badge_strategy = str(result["strategy"] or "")
             self._last_contact_badge_clicked_at = datetime.now(UTC)
+            self._contact_positive_signal = True
             return True
         self._last_contact_badge_detected = bool(result["detected"])
         if result["strategy"]:
@@ -748,6 +806,7 @@ class CreatorEnrichmentSession:
                 self._last_contact_badge_clicked = True
                 self._last_contact_badge_strategy = f"playwright:{selector}"
                 self._last_contact_badge_clicked_at = datetime.now(UTC)
+                self._contact_positive_signal = True
                 return True
             except PlaywrightError:
                 continue
@@ -851,23 +910,6 @@ class CreatorEnrichmentSession:
             "strategy": str(result.get("strategy") or ""),
         }
 
-    def _should_retry_contact_click(self) -> bool:
-        if self._contact_click_retry_performed or self._last_contact_badge_clicked_at is None:
-            return False
-        elapsed = (datetime.now(UTC) - self._last_contact_badge_clicked_at).total_seconds()
-        return elapsed >= CONTACT_CLICK_RETRY_SECONDS
-
-    def _should_preclick_contact_badge(self) -> bool:
-        if self._last_contact_badge_clicked:
-            return False
-        result = self._click_contact_badge_via_dom(click=False)
-        detected = bool(result.get("detected"))
-        if detected:
-            self._last_contact_badge_detected = True
-            if result.get("strategy"):
-                self._last_contact_badge_strategy = str(result.get("strategy"))
-        return detected
-
     def _timed_out(self, seconds: int) -> bool:
         if self._waiting_started_at is None:
             return False
@@ -946,7 +988,8 @@ class CreatorEnrichmentSession:
         self._last_contact_badge_clicked = False
         self._last_contact_badge_strategy = ""
         self._last_contact_badge_clicked_at = None
-        self._contact_click_retry_performed = False
+        self._contact_positive_signal = False
+        self._profile_patch_applied = False
         if self._page is not None:
             try:
                 self._page.evaluate(
@@ -958,6 +1001,8 @@ class CreatorEnrichmentSession:
                         }
                         root.profileResponses = [];
                         root.contactResponses = [];
+                        root.badgeEvents = [];
+                        root.badgeClickPageUrl = "";
                     }
                     """
                 )
@@ -1228,6 +1273,8 @@ def _network_capture_init_script() -> str:
     window.__linkGlancerCapture = {
         profileResponses: [],
         contactResponses: [],
+        badgeEvents: [],
+        badgeClickPageUrl: "",
     };
     const pushCapture = (kind, entry) => {
         const list = window.__linkGlancerCapture[kind];
@@ -1255,6 +1302,104 @@ def _network_capture_init_script() -> str:
             return [];
         }
         return payload.profile_types;
+    };
+    const contactBadgeKeywords = [
+        "Email",
+        "WhatsApp",
+        "Whatsapp",
+        "Phone",
+        "LINE",
+        "Line",
+        "Viber",
+        "Zalo",
+        "Facebook",
+    ];
+    const isVisible = (element) => {
+        if (!(element instanceof HTMLElement)) {
+            return false;
+        }
+        const style = window.getComputedStyle(element);
+        if (style.display === "none" || style.visibility === "hidden") {
+            return false;
+        }
+        const rect = element.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0;
+    };
+    const resolveClickable = (element, container) => {
+        let current = element;
+        while (current instanceof HTMLElement && current !== container) {
+            const tagName = current.tagName.toLowerCase();
+            if (
+                tagName === "button"
+                || tagName === "a"
+                || current.classList.contains("cursor-pointer")
+                || current.getAttribute("role") === "button"
+                || typeof current.onclick === "function"
+            ) {
+                return current;
+            }
+            current = current.parentElement;
+        }
+        return element instanceof HTMLElement ? element : null;
+    };
+    const reportBadge = (entry) => {
+        pushCapture("badgeEvents", {
+            pageUrl: location.href,
+            detected: Boolean(entry && entry.detected),
+            clicked: Boolean(entry && entry.clicked),
+            strategy: typeof entry?.strategy === "string" ? entry.strategy : "",
+        });
+    };
+    const monitorContactBadge = () => {
+        const root = window.__linkGlancerCapture;
+        const container = document.querySelector("#creator-detail-profile-container");
+        if (!(container instanceof HTMLElement)) {
+            return;
+        }
+        if (root.badgeClickPageUrl === location.href) {
+            return;
+        }
+        const icons = Array.from(
+            container.querySelectorAll("div.cursor-pointer svg[class*='alliance-icon-']"),
+        );
+        for (const icon of icons) {
+            if (!(icon instanceof SVGElement)) {
+                continue;
+            }
+            const className = icon.getAttribute("class") || "";
+            const matchedKeyword = contactBadgeKeywords.find(
+                (keyword) => className.includes(keyword),
+            );
+            if (!matchedKeyword) {
+                continue;
+            }
+            const target = resolveClickable(icon.parentElement || icon, container);
+            if (!(target instanceof HTMLElement) || !isVisible(target)) {
+                reportBadge({
+                    detected: true,
+                    clicked: false,
+                    strategy: `observer:${matchedKeyword}:not_visible`,
+                });
+                return;
+            }
+            try {
+                root.badgeClickPageUrl = location.href;
+                target.click();
+                reportBadge({
+                    detected: true,
+                    clicked: true,
+                    strategy: `observer:${matchedKeyword}:click`,
+                });
+            } catch {
+                root.badgeClickPageUrl = "";
+                reportBadge({
+                    detected: true,
+                    clicked: false,
+                    strategy: `observer:${matchedKeyword}:visible`,
+                });
+            }
+            return;
+        }
     };
     const handlePayload = (url, pageUrl, payload, bodyText) => {
         if (!payload || typeof payload !== "object") {
@@ -1334,6 +1479,15 @@ def _network_capture_init_script() -> str:
         });
         return originalSend.call(this, body);
     };
+    monitorContactBadge();
+    const badgeObserver = new MutationObserver(() => {
+        monitorContactBadge();
+    });
+    badgeObserver.observe(document.documentElement, {
+        childList: true,
+        subtree: true,
+        attributes: true,
+    });
 })();
 """
 
