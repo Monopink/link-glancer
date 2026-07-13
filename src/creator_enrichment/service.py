@@ -12,7 +12,10 @@ from playwright.sync_api import Playwright, Response, sync_playwright
 
 from creator_enrichment.constants import (
     CONTACT_API_PATH,
+    CONTACT_BADGE_CLICK_TIMEOUT_MS,
+    CONTACT_BADGE_SCROLL_TIMEOUT_MS,
     CONTACT_BADGE_WAIT_SECONDS,
+    CONTACT_CLICK_RETRY_SECONDS,
     CONTACT_WAIT_SECONDS,
     DETAIL_URL_TEMPLATE,
     FAILURE_RETRY_LIMIT,
@@ -36,6 +39,18 @@ from link_glancer.application import TaskApplicationService
 from link_glancer.browser.detector import detect_browser
 from link_glancer.runtime.paths import ensure_browser_environment_dir
 from link_glancer.tasks.models import BrowserConfig, TaskItem
+
+CONTACT_ICON_CLASS_KEYWORDS = (
+    "Email",
+    "WhatsApp",
+    "Whatsapp",
+    "Phone",
+    "LINE",
+    "Line",
+    "Viber",
+    "Zalo",
+    "Facebook",
+)
 
 
 @dataclass(slots=True)
@@ -103,6 +118,9 @@ class CreatorEnrichmentSession:
         self._last_contact_available_raw: object = None
         self._last_contact_badge_detected = False
         self._last_contact_badge_clicked = False
+        self._last_contact_badge_strategy = ""
+        self._last_contact_badge_clicked_at: datetime | None = None
+        self._contact_click_retry_performed = False
         self._failure_attempts: list[CreatorEnrichmentFailureAttempt] = []
 
     def start(self) -> CreatorEnrichmentStatus:
@@ -162,6 +180,8 @@ class CreatorEnrichmentSession:
             return self.status()
 
         if self._current_step == "waiting_profile":
+            if self._should_preclick_contact_badge():
+                self._click_contact_badge()
             if self._captured_profile is not None:
                 self._apply_profile()
                 return self.status()
@@ -178,6 +198,10 @@ class CreatorEnrichmentSession:
             if self._captured_contact is not None:
                 self._apply_contact()
                 return self.status()
+            if self._should_retry_contact_click() and self._click_contact_badge():
+                self._contact_click_retry_performed = True
+                self._last_message = self._with_subject("联系方式已展示，正在继续采集。")
+                return self.status()
             if self._timed_out(CONTACT_WAIT_SECONDS):
                 self._handle_retryable_manual_failure(
                     "已触发联系方式采集，但联系方式接口未在限定时间内返回，请处理后继续，或跳过当前达人。"
@@ -185,6 +209,10 @@ class CreatorEnrichmentSession:
             return self.status()
 
         if self._current_step == "waiting_contact_badge":
+            if self._captured_contact is not None:
+                self._current_step = "waiting_contact"
+                self._apply_contact()
+                return self.status()
             if self._click_contact_badge():
                 self._current_step = "waiting_contact"
                 self._waiting_started_at = datetime.now(UTC)
@@ -609,6 +637,10 @@ class CreatorEnrichmentSession:
         self._current_step = "waiting_contact_badge"
         self._waiting_started_at = datetime.now(UTC)
         self._last_message = self._with_subject("有联系方式，正在采集。")
+        if self._captured_contact is not None:
+            self._current_step = "waiting_contact"
+            self._apply_contact()
+            return
         if self._click_contact_badge():
             self._current_step = "waiting_contact"
             self._waiting_started_at = datetime.now(UTC)
@@ -676,44 +708,165 @@ class CreatorEnrichmentSession:
     def _click_contact_badge(self) -> bool:
         if self._page is None:
             return False
-        selector = (
-            "#creator-detail-profile-container "
-            "[data-e2e='0af7a642-88d7-376d'] "
-            "[data-e2e='f9158724-e9b3-bca4']"
-        )
+        result = self._click_contact_badge_via_dom()
+        if result["clicked"]:
+            self._last_contact_badge_detected = bool(result["detected"])
+            self._last_contact_badge_clicked = True
+            self._last_contact_badge_strategy = str(result["strategy"] or "")
+            self._last_contact_badge_clicked_at = datetime.now(UTC)
+            return True
+        self._last_contact_badge_detected = bool(result["detected"])
+        if result["strategy"]:
+            self._last_contact_badge_strategy = str(result["strategy"])
         try:
             container = self._page.locator("#creator-detail-profile-container").first
             if container.count() <= 0:
+                self._last_contact_badge_strategy = "playwright:container_missing"
                 return False
-            locator = self._page.locator(selector).first
-            if locator.count() <= 0:
-                return False
-            self._last_contact_badge_detected = True
-            locator.scroll_into_view_if_needed(timeout=1000)
-            locator.click(timeout=1200, force=True)
-            self._last_contact_badge_clicked = True
-            return True
         except PlaywrightError:
+            self._last_contact_badge_strategy = "playwright:container_error"
+            return False
+        selectors = [
+            f"div.cursor-pointer svg[class*='alliance-icon-{keyword}']"
+            for keyword in CONTACT_ICON_CLASS_KEYWORDS
+        ]
+        for selector in selectors:
             try:
-                result = self._page.evaluate(
-                    f"""
-                    () => {{
-                        const target = document.querySelector({selector!r});
-                        if (!(target instanceof HTMLElement)) {{
-                            return {{ detected: false, clicked: false }};
-                        }}
-                        target.click();
-                        return {{ detected: true, clicked: true }};
-                    }}
-                    """
+                locator = container.locator(selector).first
+                if locator.count() <= 0:
+                    continue
+                self._last_contact_badge_detected = True
+                try:
+                    locator.scroll_into_view_if_needed(timeout=CONTACT_BADGE_SCROLL_TIMEOUT_MS)
+                except PlaywrightError:
+                    pass
+                target = locator.locator(
+                    "xpath=ancestor::div[contains(@class, 'cursor-pointer')][1]"
                 )
-                detected = isinstance(result, dict) and bool(result.get("detected"))
-                clicked = isinstance(result, dict) and bool(result.get("clicked"))
-                self._last_contact_badge_detected = detected
-                self._last_contact_badge_clicked = clicked
-                return clicked
+                clickable = target.first if target.count() > 0 else locator
+                clickable.click(timeout=CONTACT_BADGE_CLICK_TIMEOUT_MS, force=True)
+                self._last_contact_badge_clicked = True
+                self._last_contact_badge_strategy = f"playwright:{selector}"
+                self._last_contact_badge_clicked_at = datetime.now(UTC)
+                return True
             except PlaywrightError:
-                return False
+                continue
+        if not self._last_contact_badge_strategy:
+            self._last_contact_badge_strategy = "playwright:not_found"
+        return False
+
+    def _click_contact_badge_via_dom(self, *, click: bool = True) -> dict[str, object]:
+        if self._page is None:
+            return {"detected": False, "clicked": False, "strategy": "dom:no_page"}
+        try:
+            result = self._page.evaluate(
+                """
+                ({ keywords, click }) => {
+                    const container = document.querySelector("#creator-detail-profile-container");
+                    if (!(container instanceof HTMLElement)) {
+                        return {
+                            detected: false,
+                            clicked: false,
+                            strategy: "dom:container_missing",
+                        };
+                    }
+                    const isVisible = (element) => {
+                        if (!(element instanceof HTMLElement)) {
+                            return false;
+                        }
+                        const style = window.getComputedStyle(element);
+                        if (style.display === "none" || style.visibility === "hidden") {
+                            return false;
+                        }
+                        const rect = element.getBoundingClientRect();
+                        return rect.width > 0 && rect.height > 0;
+                    };
+                    const resolveClickable = (element) => {
+                        let current = element;
+                        while (current instanceof HTMLElement && current !== container) {
+                            const tagName = current.tagName.toLowerCase();
+                            if (
+                                tagName === "button"
+                                || tagName === "a"
+                                || current.classList.contains("cursor-pointer")
+                                || current.getAttribute("role") === "button"
+                                || typeof current.onclick === "function"
+                            ) {
+                                return current;
+                            }
+                            current = current.parentElement;
+                        }
+                        return element instanceof HTMLElement ? element : null;
+                    };
+                    const icons = Array.from(
+                        container.querySelectorAll(
+                            "div.cursor-pointer svg[class*='alliance-icon-']",
+                        ),
+                    );
+                    for (const icon of icons) {
+                        if (!(icon instanceof SVGElement)) {
+                            continue;
+                        }
+                        const className = icon.getAttribute("class") || "";
+                        const matchedKeyword = keywords.find(
+                            (keyword) => className.includes(keyword),
+                        );
+                        if (!matchedKeyword) {
+                            continue;
+                        }
+                        const target = resolveClickable(icon.parentElement || icon);
+                        if (!(target instanceof HTMLElement) || !isVisible(target)) {
+                            return {
+                                detected: true,
+                                clicked: false,
+                                strategy: `dom:${matchedKeyword}:not_visible`,
+                            };
+                        }
+                        if (!click) {
+                            return {
+                                detected: true,
+                                clicked: false,
+                                strategy: `dom:${matchedKeyword}:visible`,
+                            };
+                        }
+                        target.click();
+                        return {
+                            detected: true,
+                            clicked: true,
+                            strategy: `dom:${matchedKeyword}`,
+                        };
+                    }
+                    return { detected: false, clicked: false, strategy: "dom:not_found" };
+                }
+                """,
+                {"keywords": list(CONTACT_ICON_CLASS_KEYWORDS), "click": click},
+            )
+        except PlaywrightError:
+            return {"detected": False, "clicked": False, "strategy": "dom:error"}
+        if not isinstance(result, dict):
+            return {"detected": False, "clicked": False, "strategy": "dom:invalid"}
+        return {
+            "detected": bool(result.get("detected")),
+            "clicked": bool(result.get("clicked")),
+            "strategy": str(result.get("strategy") or ""),
+        }
+
+    def _should_retry_contact_click(self) -> bool:
+        if self._contact_click_retry_performed or self._last_contact_badge_clicked_at is None:
+            return False
+        elapsed = (datetime.now(UTC) - self._last_contact_badge_clicked_at).total_seconds()
+        return elapsed >= CONTACT_CLICK_RETRY_SECONDS
+
+    def _should_preclick_contact_badge(self) -> bool:
+        if self._last_contact_badge_clicked:
+            return False
+        result = self._click_contact_badge_via_dom(click=False)
+        detected = bool(result.get("detected"))
+        if detected:
+            self._last_contact_badge_detected = True
+            if result.get("strategy"):
+                self._last_contact_badge_strategy = str(result.get("strategy"))
+        return detected
 
     def _timed_out(self, seconds: int) -> bool:
         if self._waiting_started_at is None:
@@ -791,6 +944,9 @@ class CreatorEnrichmentSession:
         self._last_contact_available_raw = None
         self._last_contact_badge_detected = False
         self._last_contact_badge_clicked = False
+        self._last_contact_badge_strategy = ""
+        self._last_contact_badge_clicked_at = None
+        self._contact_click_retry_performed = False
         if self._page is not None:
             try:
                 self._page.evaluate(
@@ -978,6 +1134,7 @@ class CreatorEnrichmentSession:
             f"{pformat(self._last_contact_available_raw, width=100)}",
             f"联系方式图标是否发现: {'是' if self._last_contact_badge_detected else '否'}",
             f"联系方式图标是否点击: {'是' if self._last_contact_badge_clicked else '否'}",
+            f"联系方式图标点击策略: {self._last_contact_badge_strategy or '-'}",
             "",
             "最近一次 profile 请求:",
             self._last_profile_response_url or "-",
