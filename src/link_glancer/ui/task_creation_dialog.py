@@ -730,8 +730,6 @@ class TaskCreationDialog(QDialog):
 
 def _warning_lines(warnings) -> list[str]:
     lines: list[str] = []
-    if warnings.uses_first_task_url_as_confirmation:
-        lines.append("确认页面为空，将使用第一条任务 URL 作为确认页面。")
     if warnings.missing_review_export_fields:
         lines.append(
             "导出字段未包含以下检查结果列：" + ", ".join(warnings.missing_review_export_fields)

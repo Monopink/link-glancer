@@ -34,7 +34,6 @@ TASK_SHORTCUT_DEFAULTS_KEY = "task_shortcut_defaults"
 class TaskCreationWarnings:
     missing_review_export_fields: list[str]
     overlapping_export_review_fields: list[str]
-    uses_first_task_url_as_confirmation: bool
 
 
 class TaskApplicationService:
@@ -103,7 +102,6 @@ class TaskApplicationService:
         return TaskCreationWarnings(
             missing_review_export_fields=[],
             overlapping_export_review_fields=overlap,
-            uses_first_task_url_as_confirmation=not bool(task_snapshot.confirm_url),
         )
 
     def create_task(
