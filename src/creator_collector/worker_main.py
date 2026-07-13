@@ -145,6 +145,7 @@ class _CollectorWorkerRuntime:
         if status.collected_count <= 0:
             self._push_message({"type": "error", "message": "当前没有可保存的采集数据。"})
             return
+        _require_safe_text(export_path_raw, field_name="导出路径")
         export_path = Path(export_path_raw)
         self._saving = True
         self._push_status_if_needed(force=True)
@@ -185,6 +186,7 @@ class _CollectorWorkerRuntime:
         if status.collected_count <= 0:
             self._push_message({"type": "error", "message": "当前没有可保存的采集数据。"})
             return
+        _require_safe_text(export_path_raw, field_name="导出路径")
         export_path = Path(export_path_raw)
         self._saving = True
         self._push_status_if_needed(force=True)
@@ -274,7 +276,7 @@ class _CollectorWorkerRuntime:
         }
 
     def _push_message(self, payload: dict[str, object]) -> None:
-        sys.stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        sys.stdout.write(json.dumps(_sanitize_payload(payload), ensure_ascii=False) + "\n")
         sys.stdout.flush()
 
 
@@ -287,13 +289,39 @@ def _serialize_datetime(value: datetime | None) -> str | None:
 
 
 def _configure_stdio_encoding() -> None:
-    for stream_name in ("stdout", "stderr"):
+    for stream_name in ("stdin", "stdout", "stderr"):
         stream = getattr(sys, stream_name, None)
         if stream is None:
             continue
         reconfigure = getattr(stream, "reconfigure", None)
         if callable(reconfigure):
-            reconfigure(encoding="utf-8", errors="strict")
+            errors = "strict" if stream_name == "stdin" else "backslashreplace"
+            reconfigure(encoding="utf-8", errors=errors)
+
+
+def _contains_surrogates(value: str) -> bool:
+    return any(0xD800 <= ord(char) <= 0xDFFF for char in value)
+
+
+def _require_safe_text(value: str, *, field_name: str) -> None:
+    if _contains_surrogates(value):
+        raise ValueError(f"{field_name}包含无法编码的字符，请更换导出位置或文件名后重试。")
+
+
+def _sanitize_text(value: str) -> str:
+    if not _contains_surrogates(value):
+        return value
+    return value.encode("utf-8", errors="backslashreplace").decode("utf-8")
+
+
+def _sanitize_payload(value: object) -> object:
+    if isinstance(value, str):
+        return _sanitize_text(value)
+    if isinstance(value, dict):
+        return {str(key): _sanitize_payload(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_sanitize_payload(item) for item in value]
+    return value
 
 
 def run_worker() -> None:

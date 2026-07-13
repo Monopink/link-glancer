@@ -69,6 +69,7 @@ class TaskApplicationService:
         )
 
     def build_task_name(self, source_path: Path, *, created_at: datetime | None = None) -> str:
+        self._validate_path_text(source_path)
         timestamp = (created_at or datetime.now()).strftime("%Y%m%d_%H%M%S")
         return f"{source_path.stem}_{timestamp}"
 
@@ -113,6 +114,7 @@ class TaskApplicationService:
         persist_defaults: bool = True,
         review_field_library: list[ReviewField] | None = None,
     ) -> int:
+        self._validate_path_text(source_path)
         normalized_snapshot = self.normalize_task_snapshot(task_snapshot)
         browser_config = self._browser_configs.load_browser_config(
             normalized_snapshot.browser_config_id
@@ -743,6 +745,15 @@ class TaskApplicationService:
             seen.add(normalized)
             result.append(field_name)
         return result
+
+    def _validate_path_text(self, path: Path) -> None:
+        for field_name, value in (
+            ("文件路径", str(path)),
+            ("文件名", path.name),
+            ("文件名", path.stem),
+        ):
+            if any(0xD800 <= ord(char) <= 0xDFFF for char in value):
+                raise ValueError(f"{field_name}包含无法编码的字符，请更换导出位置或文件名后重试。")
 
     def _source_structure_changed(
         self,
