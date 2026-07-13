@@ -51,6 +51,7 @@ ROW_TASK_OWNED_ROLE = Qt.ItemDataRole.UserRole + 2
 ROW_IS_UNIQUE_ROLE = Qt.ItemDataRole.UserRole + 3
 FORM_FIELD_FULL_WIDTH = 420
 FORM_FIELD_COMPACT_WIDTH = 140
+MAX_AUTO_EXPORT_FIELDS = 50
 
 
 @dataclass(slots=True)
@@ -136,6 +137,8 @@ class TaskCreationDialog(QDialog):
         self._review_field_id_editable = review_field_id_editable
         self._global_review_fields = self._app_service.load_review_field_library()
         self._suspend_global_sync = False
+        self._suspend_export_field_tracking = False
+        self._export_fields_auto_mode = initial_snapshot is None and source_editable
         self._initial_task_field_ids: set[str] = (
             set(field.field_id for field in initial_snapshot.review_fields)
             if initial_snapshot is not None and not source_editable
@@ -181,6 +184,7 @@ class TaskCreationDialog(QDialog):
         self._export_fields_edit = QTextEdit()
         self._export_fields_edit.setAcceptRichText(False)
         self._export_fields_edit.setFixedHeight(72)
+        self._export_fields_edit.textChanged.connect(self._handle_export_fields_changed)
 
         form.addRow("Excel 文件", source_widget)
         form.addRow("确认页 URL", self._expanding_form_field(self._confirm_url_edit))
@@ -327,6 +331,7 @@ class TaskCreationDialog(QDialog):
         self._reload_headers()
 
     def _apply_snapshot(self, snapshot: TaskSnapshot) -> None:
+        self._export_fields_auto_mode = False
         self._set_combo_text(self._sheet_combo, snapshot.sheet_name)
         self._header_row_spin.setValue(snapshot.header_row)
         self._set_browser_config(snapshot.browser_config_id)
@@ -389,6 +394,22 @@ class TaskCreationDialog(QDialog):
             self._url_field_combo.setCurrentText(current_url)
         elif headers:
             self._url_field_combo.setCurrentText(headers[0])
+        self._apply_auto_export_fields(headers)
+
+    def _handle_export_fields_changed(self) -> None:
+        if self._suspend_export_field_tracking:
+            return
+        self._export_fields_auto_mode = False
+
+    def _apply_auto_export_fields(self, headers: list[str]) -> None:
+        if not self._export_fields_auto_mode:
+            return
+        export_fields = headers[:MAX_AUTO_EXPORT_FIELDS]
+        self._suspend_export_field_tracking = True
+        try:
+            self._export_fields_edit.setPlainText(", ".join(export_fields))
+        finally:
+            self._suspend_export_field_tracking = False
 
     def _accept(self) -> None:
         try:
