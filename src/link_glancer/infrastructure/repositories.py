@@ -92,6 +92,20 @@ class TaskRepository:
             advance_pointer=advance_pointer,
         )
 
+    def update_task_item_data(
+        self,
+        *,
+        task_id: int,
+        task_index: int,
+        task_data_patch: dict[str, object],
+    ) -> None:
+        database.update_task_item_data(
+            self.database_path,
+            task_id=task_id,
+            task_index=task_index,
+            task_data_patch=task_data_patch,
+        )
+
     def jump_to_task_index(self, *, task_id: int, task_index: int) -> None:
         database.jump_to_task_index(self.database_path, task_id, task_index)
 

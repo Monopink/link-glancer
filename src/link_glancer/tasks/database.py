@@ -79,7 +79,7 @@ def ensure_app_database() -> Path:
         except OSError as exc:
             raise RuntimeError(
                 "检测到不兼容的旧数据库，但无法重建数据库文件。"
-                "请关闭正在运行的 Link Glancer 或占用 app.db 的程序后重试。"
+                "请关闭正在运行的 LinkGlancer 或占用 app.db 的程序后重试。"
             ) from exc
         _LAST_DATABASE_RESET_REASON = reset_reason
 
@@ -553,6 +553,32 @@ def save_review(
             next_index = min(task_index + 1, total_items + 1)
             status = "completed" if task_index >= total_items else "in_progress"
             _update_task_pointer(connection, task_id, next_index, status)
+
+
+def update_task_item_data(
+    database_path: Path,
+    *,
+    task_id: int,
+    task_index: int,
+    task_data_patch: dict[str, object],
+) -> None:
+    if not task_data_patch:
+        return
+    now = _now_iso()
+    with sqlite3.connect(database_path) as connection:
+        item = load_task_item_by_index(connection, task_id, task_index)
+        if item is None:
+            raise ValueError(f"Task item not found: task_id={task_id}, task_index={task_index}")
+        updated = dict(item.task_data)
+        updated.update(task_data_patch)
+        connection.execute(
+            "UPDATE task_items SET task_data_json = ? WHERE id = ?",
+            (_json(updated), item.task_item_id),
+        )
+        connection.execute(
+            "UPDATE tasks SET updated_at = ? WHERE id = ?",
+            (now, task_id),
+        )
 
 
 def jump_to_task_index(database_path: Path, task_id: int, task_index: int) -> None:

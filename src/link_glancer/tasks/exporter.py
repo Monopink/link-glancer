@@ -6,7 +6,8 @@ from pathlib import Path
 from openpyxl import Workbook
 
 from link_glancer.tasks.database import list_all_items, list_reviews, load_task_detail
-from link_glancer.tasks.models import ReviewField, ReviewRecord, TaskItem
+from link_glancer.tasks.export_fields import resolve_export_fields
+from link_glancer.tasks.models import ReviewRecord, TaskItem
 
 
 def export_task_results(
@@ -19,7 +20,7 @@ def export_task_results(
     workbook = Workbook()
     sheet = workbook.active
     sheet.title = "Results"
-    export_fields = _resolved_export_fields(
+    export_fields = resolve_export_fields(
         task.task_snapshot.review_fields,
         task.task_snapshot.enabled_review_field_ids,
         items,
@@ -55,7 +56,7 @@ def export_task_results_to_path(database_path: Path, task_id: int, export_path: 
     workbook = Workbook()
     sheet = workbook.active
     sheet.title = "Results"
-    export_fields = _resolved_export_fields(
+    export_fields = resolve_export_fields(
         task.task_snapshot.review_fields,
         task.task_snapshot.enabled_review_field_ids,
         items,
@@ -85,51 +86,6 @@ def _resolve_export_value(field_name: str, item: TaskItem, review: ReviewRecord 
     if field_name in item.task_data:
         return item.task_data[field_name]
     return ""
-
-
-def _resolved_export_fields(
-    review_fields: list[ReviewField],
-    enabled_review_field_ids: list[str],
-    items: list[TaskItem],
-    export_fields: list[str],
-) -> list[str]:
-    available_columns = {
-        key.casefold()
-        for item in items
-        for key in item.task_data
-        if isinstance(key, str) and key.strip()
-    }
-    enabled_ids = _enabled_review_field_ids(review_fields, enabled_review_field_ids)
-    enabled_set = {field_id.casefold() for field_id in enabled_ids}
-    resolved: list[str] = []
-    seen: set[str] = set()
-
-    for field_name in export_fields:
-        normalized = field_name.casefold()
-        if normalized in seen:
-            continue
-        if normalized in available_columns or normalized in enabled_set:
-            resolved.append(field_name)
-            seen.add(normalized)
-
-    for field_id in enabled_ids:
-        normalized = field_id.casefold()
-        if normalized in seen:
-            continue
-        resolved.append(field_id)
-        seen.add(normalized)
-    return resolved
-
-
-def _enabled_review_field_ids(
-    review_fields: list[ReviewField],
-    enabled_review_field_ids: list[str],
-) -> list[str]:
-    known_ids = [field.field_id for field in review_fields]
-    if not enabled_review_field_ids:
-        return known_ids
-    enabled_set = {field_id for field_id in enabled_review_field_ids}
-    return [field_id for field_id in known_ids if field_id in enabled_set]
 
 
 def _safe_filename(value: str) -> str:

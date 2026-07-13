@@ -1,0 +1,446 @@
+from __future__ import annotations
+
+import json
+import sys
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+
+from PySide6.QtCore import QProcess, Qt, QTimer
+from PySide6.QtWidgets import (
+    QApplication,
+    QDialog,
+    QGridLayout,
+    QHBoxLayout,
+    QLabel,
+    QMessageBox,
+    QProgressBar,
+    QPushButton,
+    QVBoxLayout,
+    QWidget,
+)
+
+from link_glancer.application import TaskApplicationService
+from link_glancer.runtime.locks import (
+    RuntimeLockConflictError,
+    RuntimeLockHandle,
+    acquire_profile_lock,
+    acquire_task_lock,
+)
+from link_glancer.tasks.models import TaskDetail
+
+COLLECTION_POLL_INTERVAL_MS = 1000
+TIME_LABEL_REFRESH_INTERVAL_SECONDS = 5
+
+
+@dataclass(slots=True)
+class _EnrichmentWorkerStatus:
+    running: bool
+    paused: bool
+    completed: bool
+    total_count: int
+    completed_count: int
+    success_count: int
+    no_contact_count: int
+    skipped_count: int
+    failed_count: int
+    current_task_index: int | None
+    current_region: str | None
+    remaining_regions: list[str]
+    last_message: str
+    pause_reason: str | None
+    started_at: datetime | None
+    estimated_end_at: datetime | None
+
+    @classmethod
+    def idle(cls) -> _EnrichmentWorkerStatus:
+        return cls(
+            running=False,
+            paused=True,
+            completed=False,
+            total_count=0,
+            completed_count=0,
+            success_count=0,
+            no_contact_count=0,
+            skipped_count=0,
+            failed_count=0,
+            current_task_index=None,
+            current_region=None,
+            remaining_regions=[],
+            last_message="补充采集会话未启动。",
+            pause_reason=None,
+            started_at=None,
+            estimated_end_at=None,
+        )
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, object]) -> _EnrichmentWorkerStatus:
+        remaining_regions = payload.get("remaining_regions")
+        return cls(
+            running=bool(payload.get("running")),
+            paused=bool(payload.get("paused")),
+            completed=bool(payload.get("completed")),
+            total_count=int(payload.get("total_count") or 0),
+            completed_count=int(payload.get("completed_count") or 0),
+            success_count=int(payload.get("success_count") or 0),
+            no_contact_count=int(payload.get("no_contact_count") or 0),
+            skipped_count=int(payload.get("skipped_count") or 0),
+            failed_count=int(payload.get("failed_count") or 0),
+            current_task_index=(
+                int(payload["current_task_index"])
+                if isinstance(payload.get("current_task_index"), int)
+                else None
+            ),
+            current_region=(
+                str(payload.get("current_region")) if payload.get("current_region") else None
+            ),
+            remaining_regions=(
+                [str(item) for item in remaining_regions if item]
+                if isinstance(remaining_regions, list)
+                else []
+            ),
+            last_message=str(payload.get("last_message") or ""),
+            pause_reason=str(payload.get("pause_reason") or "") or None,
+            started_at=_parse_datetime(payload.get("started_at")),
+            estimated_end_at=_parse_datetime(payload.get("estimated_end_at")),
+        )
+
+
+class CreatorEnrichmentDialog(QDialog):
+    def __init__(
+        self,
+        *,
+        app_service: TaskApplicationService,
+        task: TaskDetail,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._app_service = app_service
+        self._task = task
+        self._status = _EnrichmentWorkerStatus.idle()
+        self._startup_pending = True
+        self._worker_started = False
+        self._worker_buffer = ""
+        self._expected_process_exit = False
+        self._force_close = False
+        self._last_time_label_refresh_at: datetime | None = None
+        self._last_notified_message = ""
+        self._process = QProcess(self)
+        self._profile_lock: RuntimeLockHandle | None = None
+        self._task_lock: RuntimeLockHandle | None = None
+
+        self.setWindowTitle(f"补充采集 · 任务 #{task.task_id}")
+        self.resize(720, 280)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(16, 16, 16, 16)
+        root.setSpacing(12)
+
+        summary_grid = QGridLayout()
+        summary_grid.setHorizontalSpacing(24)
+        summary_grid.setVerticalSpacing(10)
+        self._status_label = QLabel("启动中")
+        self._count_label = QLabel("0 / 0")
+        self._region_label = QLabel("-")
+        self._remaining_region_label = QLabel("-")
+        self._elapsed_label = QLabel("-")
+        self._eta_label = QLabel("-")
+        _add_summary_row(summary_grid, 0, 0, "状态", self._status_label, stretch=True)
+        _add_summary_row(summary_grid, 0, 1, "进度", self._count_label)
+        _add_summary_row(summary_grid, 0, 2, "当前区域", self._region_label)
+        _add_summary_row(summary_grid, 1, 0, "剩余区域", self._remaining_region_label, stretch=True)
+        _add_summary_row(summary_grid, 1, 1, "预计结束", self._elapsed_label)
+        _add_summary_row(summary_grid, 1, 2, "剩余时间", self._eta_label)
+        root.addLayout(summary_grid)
+
+        self._progress = QProgressBar()
+        self._progress.setRange(0, 100)
+        self._progress.setValue(0)
+        root.addWidget(self._progress)
+
+        self._message_label = QLabel("启动中")
+        self._message_label.setWordWrap(True)
+        root.addWidget(self._message_label)
+        root.addStretch(1)
+
+        actions = QHBoxLayout()
+        actions.setContentsMargins(0, 0, 0, 0)
+        actions.setSpacing(12)
+        self._continue_button = QPushButton("继续")
+        self._continue_button.clicked.connect(self._resume)
+        self._skip_button = QPushButton("跳过当前项")
+        self._skip_button.clicked.connect(self._skip_current)
+        self._pause_button = QPushButton("暂停")
+        self._pause_button.clicked.connect(self._pause)
+        close_button = QPushButton("关闭")
+        close_button.clicked.connect(self.close)
+        actions.addWidget(self._continue_button)
+        actions.addWidget(self._skip_button)
+        actions.addWidget(self._pause_button)
+        actions.addStretch(1)
+        actions.addWidget(close_button)
+        root.addLayout(actions)
+
+        self._timer = QTimer(self)
+        self._timer.setInterval(COLLECTION_POLL_INTERVAL_MS)
+        self._timer.timeout.connect(self._refresh_time_labels)
+        self._timer.start()
+        self._configure_process()
+        self._refresh_from_status()
+        QTimer.singleShot(0, self._start_worker_process)
+
+    def _configure_process(self) -> None:
+        self._process.setProcessChannelMode(QProcess.ProcessChannelMode.SeparateChannels)
+        self._process.started.connect(self._send_start_command)
+        self._process.readyReadStandardOutput.connect(self._read_worker_output)
+        self._process.finished.connect(self._handle_process_finished)
+        self._process.errorOccurred.connect(self._handle_process_error)
+
+    def _start_worker_process(self) -> None:
+        try:
+            self._task_lock = acquire_task_lock(
+                self._task.task_id,
+                owner_label=f"补充采集任务 - {self._task.browser_config.name}",
+            )
+            self._profile_lock = acquire_profile_lock(
+                self._task.browser_config.profile_id,
+                owner_label=f"补充采集任务 - {self._task.browser_config.name}",
+            )
+        except RuntimeLockConflictError as exc:
+            QMessageBox.warning(self, "无法开始补充采集", str(exc))
+            self._force_close = True
+            self.close()
+            return
+        if getattr(sys, "frozen", False):
+            program = sys.executable
+            arguments = ["--creator-enrichment-worker"]
+        else:
+            program = sys.executable
+            arguments = ["-m", "link_glancer.main", "--creator-enrichment-worker"]
+        self._process.start(program, arguments)
+
+    def _send_start_command(self) -> None:
+        self._send_command({"cmd": "start", "task_id": self._task.task_id})
+
+    def _read_worker_output(self) -> None:
+        self._worker_buffer += bytes(self._process.readAllStandardOutput()).decode(
+            "utf-8",
+            errors="replace",
+        )
+        while "\n" in self._worker_buffer:
+            line, self._worker_buffer = self._worker_buffer.split("\n", 1)
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(payload, dict):
+                self._handle_worker_message(payload)
+
+    def _handle_worker_message(self, payload: dict[str, object]) -> None:
+        message_type = str(payload.get("type") or "")
+        if message_type == "status":
+            raw_status = payload.get("status")
+            if isinstance(raw_status, dict):
+                self._status = _EnrichmentWorkerStatus.from_payload(raw_status)
+                if not self._worker_started and self._status.running:
+                    self._worker_started = True
+                    self._confirm_start()
+                self._refresh_from_status()
+                self._notify_status_change()
+            return
+        if message_type == "error":
+            message = str(payload.get("message") or "补充采集进程执行失败。")
+            QMessageBox.warning(self, "补充采集失败", message)
+
+    def _confirm_start(self) -> None:
+        region_text = self._status.current_region or "未知区域"
+        result = QMessageBox.question(
+            self,
+            "确认开始补充采集",
+            "请确认浏览器已正常打开，并已完成采集准备。\n"
+            f"即将采集的商店区域：{region_text}\n\n"
+            "是否开始补充采集？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Yes,
+        )
+        self._startup_pending = False
+        if result == QMessageBox.StandardButton.Yes:
+            self._send_command({"cmd": "resume"})
+            return
+        self._expected_process_exit = True
+        self._send_command({"cmd": "shutdown"})
+        self._force_close = True
+        self.close()
+
+    def _refresh_from_status(self) -> None:
+        status = self._status
+        self._count_label.setText(f"{status.completed_count} / {status.total_count}")
+        self._region_label.setText(status.current_region or "-")
+        self._remaining_region_label.setText(", ".join(status.remaining_regions) or "-")
+        self._message_label.setText(status.last_message or "-")
+        progress = 0
+        if status.total_count > 0:
+            progress = int(status.completed_count * 100 / status.total_count)
+        self._progress.setValue(progress)
+        self._status_label.setText(self._display_status_text(status))
+        self._refresh_time_labels_if_needed(force=True)
+        controls_ready = not self._startup_pending
+        self._continue_button.setEnabled(controls_ready and status.running and status.paused)
+        self._skip_button.setEnabled(
+            controls_ready
+            and status.running
+            and not status.completed
+            and status.current_task_index is not None
+        )
+        self._pause_button.setEnabled(
+            controls_ready and status.running and not status.completed and not status.paused
+        )
+
+    def _refresh_time_labels(self) -> None:
+        self._refresh_time_labels_if_needed(force=False)
+
+    def _refresh_time_labels_if_needed(self, *, force: bool) -> None:
+        now = datetime.now(UTC)
+        should_refresh = force or self._last_time_label_refresh_at is None
+        if not should_refresh:
+            should_refresh = (now - self._last_time_label_refresh_at) >= timedelta(
+                seconds=TIME_LABEL_REFRESH_INTERVAL_SECONDS
+            )
+        if not should_refresh:
+            return
+        self._elapsed_label.setText(self._format_finish_time())
+        self._eta_label.setText(self._format_remaining())
+        self._last_time_label_refresh_at = now
+
+    def _format_finish_time(self) -> str:
+        estimated_end_at = self._status.estimated_end_at
+        if estimated_end_at is None:
+            return "-"
+        return estimated_end_at.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+
+    def _format_remaining(self) -> str:
+        estimated_end_at = self._status.estimated_end_at
+        if estimated_end_at is None:
+            return "-"
+        remaining = max(int((estimated_end_at - datetime.now(UTC)).total_seconds()), 0)
+        hours, remainder = divmod(remaining, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+    def _display_status_text(self, status: _EnrichmentWorkerStatus) -> str:
+        if self._startup_pending:
+            return "启动中"
+        if status.completed:
+            return "已完成"
+        if status.paused:
+            return "已暂停"
+        return "采集中"
+
+    def _notify_status_change(self) -> None:
+        status = self._status
+        if not status.last_message or status.last_message == self._last_notified_message:
+            return
+        self._last_notified_message = status.last_message
+        if status.completed:
+            self._show_system_notification("补充采集完成", status.last_message)
+            return
+        if status.paused:
+            title = "补充采集已暂停"
+            if status.pause_reason == "captcha":
+                title = "需要验证码"
+            elif status.pause_reason == "region_mismatch":
+                title = "需要切换区域"
+            self._show_system_notification(title, status.last_message)
+
+    def _show_system_notification(self, title: str, message: str) -> None:
+        app = QApplication.instance()
+        if app is None or app.applicationState() == Qt.ApplicationState.ApplicationActive:
+            return
+        tray_icon = getattr(app, "tray_icon", None)
+        if tray_icon is None:
+            return
+        tray_icon.showMessage(title, message, tray_icon.MessageIcon.Information, 8000)
+
+    def _resume(self) -> None:
+        self._send_command({"cmd": "resume"})
+
+    def _skip_current(self) -> None:
+        result = QMessageBox.question(
+            self,
+            "确认跳过",
+            "是否跳过当前达人并继续后续补充采集？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if result == QMessageBox.StandardButton.Yes:
+            self._send_command({"cmd": "skip"})
+
+    def _pause(self) -> None:
+        self._send_command({"cmd": "pause"})
+
+    def _send_command(self, payload: dict[str, object]) -> None:
+        if self._process.state() != QProcess.ProcessState.Running:
+            return
+        self._process.write((json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8"))
+        self._process.waitForBytesWritten(1000)
+
+    def _handle_process_finished(self) -> None:
+        self._release_locks()
+        if self._force_close:
+            self._force_close = False
+            self.close()
+
+    def _handle_process_error(self, _error: QProcess.ProcessError) -> None:
+        if self._force_close or self._expected_process_exit:
+            return
+        QMessageBox.warning(self, "补充采集进程失败", self._process.errorString())
+
+    def _shutdown_worker_process(self) -> None:
+        if self._process.state() == QProcess.ProcessState.NotRunning:
+            return
+        self._expected_process_exit = True
+        self._send_command({"cmd": "shutdown"})
+        if not self._process.waitForFinished(3000):
+            self._process.kill()
+            self._process.waitForFinished(2000)
+
+    def _release_locks(self) -> None:
+        if self._task_lock is not None:
+            self._task_lock.release()
+            self._task_lock = None
+        if self._profile_lock is not None:
+            self._profile_lock.release()
+            self._profile_lock = None
+
+    def closeEvent(self, event) -> None:
+        self._shutdown_worker_process()
+        self._release_locks()
+        super().closeEvent(event)
+
+
+def _add_summary_row(
+    grid: QGridLayout,
+    row: int,
+    column_group: int,
+    label_text: str,
+    value_label: QLabel,
+    *,
+    stretch: bool = False,
+) -> None:
+    base_column = column_group * 2
+    label = QLabel(label_text)
+    grid.addWidget(label, row, base_column)
+    grid.addWidget(value_label, row, base_column + 1)
+    if stretch:
+        grid.setColumnStretch(base_column + 1, 1)
+
+
+def _parse_datetime(raw: object) -> datetime | None:
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    try:
+        return datetime.fromisoformat(raw)
+    except ValueError:
+        return None

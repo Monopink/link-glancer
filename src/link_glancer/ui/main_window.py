@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
 )
 
 from creator_collector import CreatorCollectorDialog
+from creator_enrichment import CreatorEnrichmentDialog
 from link_glancer.application import TaskApplicationService
 from link_glancer.browser.base import BrowserController, BrowserLaunchRequest, BufferBlock
 from link_glancer.browser.detector import detect_browser
@@ -241,12 +242,15 @@ class MainWindow(QMainWindow):
         export_button.clicked.connect(self._export_task_with_dialog)
         delete_button = QPushButton("删除任务")
         delete_button.clicked.connect(self._delete_current_task)
+        self._creator_enrichment_button = QPushButton("补充采集")
+        self._creator_enrichment_button.clicked.connect(self._open_creator_enrichment_dialog)
         start_button = QPushButton("开始检查")
         start_button.clicked.connect(self._start_review_flow)
         start_button.setAutoDefault(True)
         start_button.setDefault(True)
         actions.addWidget(self._back_to_list_button)
         actions.addWidget(config_button)
+        actions.addWidget(self._creator_enrichment_button)
         actions.addStretch(1)
         actions.addWidget(export_button)
         actions.addWidget(delete_button)
@@ -513,6 +517,7 @@ class MainWindow(QMainWindow):
             f"#{self.task.task_id}  ·  {self.task.name}  ·  {self._task_summary_text(self.task)}"
         )
         self._refresh_task_data_table()
+        self._update_creator_enrichment_button()
 
     def _start_review_flow(self) -> None:
         if not self.task:
@@ -663,6 +668,27 @@ class MainWindow(QMainWindow):
         current_row = min(max(self.task.current_task_index - 1, 0), max(len(items) - 1, 0))
         if 0 <= current_row < self._task_data_table.rowCount():
             self._task_data_table.selectRow(current_row)
+
+    def _update_creator_enrichment_button(self) -> None:
+        if not hasattr(self, "_creator_enrichment_button") or not self.task:
+            return
+        items = self.app_service.list_all_items(self.task.task_id)
+        has_creator_id = any(
+            str(item.task_data.get("creator_oecuid") or "").strip() for item in items
+        )
+        self._creator_enrichment_button.setVisible(has_creator_id)
+        self._creator_enrichment_button.setEnabled(has_creator_id)
+
+    def _open_creator_enrichment_dialog(self) -> None:
+        if not self.task:
+            return
+        dialog = CreatorEnrichmentDialog(
+            app_service=self.app_service,
+            task=self.task,
+            parent=self,
+        )
+        dialog.exec()
+        self._refresh_task_page()
 
     def _apply_task_table_column_widths(self, table_fields: list[str]) -> None:
         header = self._task_data_table.horizontalHeader()
@@ -1132,7 +1158,7 @@ class MainWindow(QMainWindow):
 
     def _update_window_title(self, *, profile_name: str | None = None) -> None:
         suffix = f" {self._instance_id}" if self._instance_id > 1 else ""
-        title = f"Link Glancer{suffix}"
+        title = f"LinkGlancer{suffix}"
         if profile_name:
             title += f" - Profile: {profile_name}"
         self.setWindowTitle(title)

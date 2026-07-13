@@ -38,7 +38,9 @@ def export_collection_to_xlsx(rows: list[dict[str, object]], output_dir: Path) -
     for row_index, source_row in enumerate(rows, start=2):
         flattened = flatten_creator_row(source_row)
         for column, header in enumerate(EXPORT_HEADERS, start=1):
-            sheet.cell(row=row_index, column=column, value=flattened.get(header, ""))
+            cell = sheet.cell(row=row_index, column=column, value=flattened.get(header, ""))
+            if header == "creator_oecuid":
+                cell.number_format = "@"
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     export_path = _unique_path(output_dir / f"creator_{timestamp}.xlsx")
@@ -60,7 +62,9 @@ def export_collection_to_path(rows: list[dict[str, object]], export_path: Path) 
     for row_index, source_row in enumerate(rows, start=2):
         flattened = flatten_creator_row(source_row)
         for column, header in enumerate(EXPORT_HEADERS, start=1):
-            sheet.cell(row=row_index, column=column, value=flattened.get(header, ""))
+            cell = sheet.cell(row=row_index, column=column, value=flattened.get(header, ""))
+            if header == "creator_oecuid":
+                cell.number_format = "@"
 
     workbook.save(export_path)
     workbook.close()
@@ -94,7 +98,7 @@ def flatten_creator_row(item: dict[str, object]) -> dict[str, object]:
     creator_oecuid = _value_of(item.get("creator_oecuid"))
     handle = _value_of(item.get("handle"))
 
-    result["creator_oecuid"] = f'"{creator_oecuid}"' if creator_oecuid else ""
+    result["creator_oecuid"] = creator_oecuid
     result["handle"] = handle
     result["nickname"] = _value_of(item.get("nickname"))
     result["selection_region"] = _value_of(item.get("selection_region"))

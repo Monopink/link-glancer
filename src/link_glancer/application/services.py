@@ -6,6 +6,7 @@ from pathlib import Path
 
 from link_glancer.infrastructure.repositories import BrowserConfigRepository, TaskRepository
 from link_glancer.infrastructure.workbooks import WorkbookImporter
+from link_glancer.tasks.export_fields import resolve_export_fields
 from link_glancer.tasks.models import (
     BrowserConfig,
     BrowserProfile,
@@ -533,6 +534,20 @@ class TaskApplicationService:
         )
         return self.load_task(task_id)
 
+    def update_task_item_data(
+        self,
+        *,
+        task_id: int,
+        task_index: int,
+        task_data_patch: dict[str, object],
+    ) -> TaskDetail:
+        self._tasks.update_task_item_data(
+            task_id=task_id,
+            task_index=task_index,
+            task_data_patch=task_data_patch,
+        )
+        return self.load_task(task_id)
+
     def jump_to_task_index(self, *, task_id: int, task_index: int) -> TaskDetail:
         self._tasks.jump_to_task_index(task_id=task_id, task_index=task_index)
         return self.load_task(task_id)
@@ -651,29 +666,12 @@ class TaskApplicationService:
         self, task: TaskDetail, items: list[TaskItem] | None = None
     ) -> list[str]:
         items = items if items is not None else self.list_all_items(task.task_id)
-        available_columns = self._available_task_columns(items)
-        enabled_review_ids = [
-            field.field_id for field in self.enabled_review_fields(task.task_snapshot)
-        ]
-        result: list[str] = []
-        seen: set[str] = set()
-        review_id_set = {field_id.casefold() for field_id in enabled_review_ids}
-
-        for field_name in task.task_snapshot.export_fields:
-            normalized = field_name.casefold()
-            if normalized in seen:
-                continue
-            if normalized in review_id_set or normalized in available_columns:
-                result.append(field_name)
-                seen.add(normalized)
-
-        for field_id in enabled_review_ids:
-            normalized = field_id.casefold()
-            if normalized in seen:
-                continue
-            result.append(field_id)
-            seen.add(normalized)
-        return result
+        return resolve_export_fields(
+            task.task_snapshot.review_fields,
+            task.task_snapshot.enabled_review_field_ids,
+            items,
+            task.task_snapshot.export_fields,
+        )
 
     def normalize_task_snapshot(self, task_snapshot: TaskSnapshot) -> TaskSnapshot:
         review_fields = self.merge_review_fields([], task_snapshot.review_fields)
