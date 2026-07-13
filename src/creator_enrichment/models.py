@@ -20,5 +20,8 @@ class CreatorEnrichmentStatus:
     remaining_regions: list[str]
     last_message: str
     pause_reason: str | None = None
+    diagnostic_summary: str | None = None
+    diagnostic_text: str | None = None
+    attention_required: bool = False
     started_at: datetime | None = None
     estimated_end_at: datetime | None = None

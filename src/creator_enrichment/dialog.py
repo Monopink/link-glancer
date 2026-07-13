@@ -6,13 +6,16 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 from PySide6.QtCore import QProcess, Qt, QTimer
+from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
+    QFileDialog,
     QGridLayout,
     QHBoxLayout,
     QLabel,
     QMessageBox,
+    QPlainTextEdit,
     QProgressBar,
     QPushButton,
     QVBoxLayout,
@@ -48,6 +51,9 @@ class _EnrichmentWorkerStatus:
     remaining_regions: list[str]
     last_message: str
     pause_reason: str | None
+    diagnostic_summary: str | None
+    diagnostic_text: str | None
+    attention_required: bool
     started_at: datetime | None
     estimated_end_at: datetime | None
 
@@ -68,6 +74,9 @@ class _EnrichmentWorkerStatus:
             remaining_regions=[],
             last_message="补充采集会话未启动。",
             pause_reason=None,
+            diagnostic_summary=None,
+            diagnostic_text=None,
+            attention_required=False,
             started_at=None,
             estimated_end_at=None,
         )
@@ -100,6 +109,15 @@ class _EnrichmentWorkerStatus:
             ),
             last_message=str(payload.get("last_message") or ""),
             pause_reason=str(payload.get("pause_reason") or "") or None,
+            diagnostic_summary=(
+                str(payload.get("diagnostic_summary"))
+                if payload.get("diagnostic_summary")
+                else None
+            ),
+            diagnostic_text=(
+                str(payload.get("diagnostic_text")) if payload.get("diagnostic_text") else None
+            ),
+            attention_required=bool(payload.get("attention_required")),
             started_at=_parse_datetime(payload.get("started_at")),
             estimated_end_at=_parse_datetime(payload.get("estimated_end_at")),
         )
@@ -124,6 +142,7 @@ class CreatorEnrichmentDialog(QDialog):
         self._force_close = False
         self._last_time_label_refresh_at: datetime | None = None
         self._last_notified_message = ""
+        self._last_issue_dialog_key: tuple[object, ...] | None = None
         self._process = QProcess(self)
         self._profile_lock: RuntimeLockHandle | None = None
         self._task_lock: RuntimeLockHandle | None = None
@@ -167,6 +186,8 @@ class CreatorEnrichmentDialog(QDialog):
         actions.setSpacing(12)
         self._continue_button = QPushButton("继续")
         self._continue_button.clicked.connect(self._resume)
+        self._retry_button = QPushButton("重试")
+        self._retry_button.clicked.connect(self._retry_current)
         self._skip_button = QPushButton("跳过当前项")
         self._skip_button.clicked.connect(self._skip_current)
         self._pause_button = QPushButton("暂停")
@@ -174,6 +195,7 @@ class CreatorEnrichmentDialog(QDialog):
         close_button = QPushButton("关闭")
         close_button.clicked.connect(self.close)
         actions.addWidget(self._continue_button)
+        actions.addWidget(self._retry_button)
         actions.addWidget(self._skip_button)
         actions.addWidget(self._pause_button)
         actions.addStretch(1)
@@ -249,6 +271,7 @@ class CreatorEnrichmentDialog(QDialog):
                     self._confirm_start()
                 self._refresh_from_status()
                 self._notify_status_change()
+                self._show_issue_dialog_if_needed()
             return
         if message_type == "error":
             message = str(payload.get("message") or "补充采集进程执行失败。")
@@ -288,6 +311,12 @@ class CreatorEnrichmentDialog(QDialog):
         self._refresh_time_labels_if_needed(force=True)
         controls_ready = not self._startup_pending
         self._continue_button.setEnabled(controls_ready and status.running and status.paused)
+        self._retry_button.setEnabled(
+            controls_ready
+            and status.running
+            and status.paused
+            and status.current_task_index is not None
+        )
         self._skip_button.setEnabled(
             controls_ready
             and status.running
@@ -366,6 +395,9 @@ class CreatorEnrichmentDialog(QDialog):
     def _resume(self) -> None:
         self._send_command({"cmd": "resume"})
 
+    def _retry_current(self) -> None:
+        self._send_command({"cmd": "retry"})
+
     def _skip_current(self) -> None:
         result = QMessageBox.question(
             self,
@@ -379,6 +411,51 @@ class CreatorEnrichmentDialog(QDialog):
 
     def _pause(self) -> None:
         self._send_command({"cmd": "pause"})
+
+    def _show_issue_dialog_if_needed(self) -> None:
+        status = self._status
+        if not status.attention_required or not status.diagnostic_text:
+            return
+        dialog_key = (
+            status.current_task_index,
+            status.pause_reason,
+            status.last_message,
+            status.diagnostic_summary,
+        )
+        if dialog_key == self._last_issue_dialog_key:
+            return
+        self._last_issue_dialog_key = dialog_key
+        dialog = _IssueDialog(
+            title=self._issue_dialog_title(status),
+            user_message=self._issue_dialog_message(status),
+            diagnostic_text=status.diagnostic_text,
+            task_name=self._task.name,
+            parent=self,
+        )
+        dialog.exec()
+
+    def _issue_dialog_title(self, status: _EnrichmentWorkerStatus) -> str:
+        if status.pause_reason == "captcha":
+            return "需要完成验证码"
+        if status.pause_reason == "region_mismatch":
+            return "需要切换店铺区域"
+        return "补充采集需要人工处理"
+
+    def _issue_dialog_message(self, status: _EnrichmentWorkerStatus) -> str:
+        if status.pause_reason == "captcha":
+            return (
+                "程序检测到验证码，当前无法继续自动采集。"
+                "请先在浏览器中完成验证，再返回补充采集窗口点击“继续”。"
+            )
+        if status.pause_reason == "region_mismatch":
+            return (
+                "当前页面的店铺区域与达人数据区域不一致。"
+                "请切换到正确区域后，再返回补充采集窗口点击“继续”。"
+            )
+        return (
+            "当前达人的补充采集出现异常，程序已暂停等待人工处理。"
+            "请根据下方详细信息检查页面和接口情况，处理完成后再点击“重试”或“继续”。"
+        )
 
     def _send_command(self, payload: dict[str, object]) -> None:
         if self._process.state() != QProcess.ProcessState.Running:
@@ -444,3 +521,78 @@ def _parse_datetime(raw: object) -> datetime | None:
         return datetime.fromisoformat(raw)
     except ValueError:
         return None
+
+
+class _IssueDialog(QDialog):
+    def __init__(
+        self,
+        *,
+        title: str,
+        user_message: str,
+        diagnostic_text: str,
+        task_name: str,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._diagnostic_text = diagnostic_text
+        self._task_name = task_name
+        self.setWindowTitle(title)
+        self.resize(860, 620)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(16, 16, 16, 16)
+        root.setSpacing(12)
+
+        summary_label = QLabel(user_message)
+        summary_label.setWordWrap(True)
+        summary_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        root.addWidget(summary_label)
+
+        details_label = QLabel("详细排查信息")
+        root.addWidget(details_label)
+
+        text_edit = QPlainTextEdit()
+        text_edit.setPlainText(diagnostic_text)
+        text_edit.setReadOnly(True)
+        root.addWidget(text_edit)
+        self._text_edit = text_edit
+
+        actions = QHBoxLayout()
+        actions.setContentsMargins(0, 0, 0, 0)
+        actions.setSpacing(12)
+        copy_button = QPushButton("复制全部")
+        copy_button.clicked.connect(self._copy_text)
+        select_button = QPushButton("全选")
+        select_button.clicked.connect(self._text_edit.selectAll)
+        export_button = QPushButton("导出")
+        export_button.clicked.connect(self._export_text)
+        close_button = QPushButton("关闭")
+        close_button.clicked.connect(self.accept)
+        actions.addWidget(copy_button)
+        actions.addWidget(select_button)
+        actions.addWidget(export_button)
+        actions.addStretch(1)
+        actions.addWidget(close_button)
+        root.addLayout(actions)
+
+    def _copy_text(self) -> None:
+        clipboard = QGuiApplication.clipboard()
+        if clipboard is not None:
+            clipboard.setText(self._diagnostic_text)
+
+    def _export_text(self) -> None:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        safe_name = "".join(char if char not in '<>:"/\\|?*' else "_" for char in self._task_name)
+        default_name = f"{safe_name or 'task'}_enrichment_error_{timestamp}.txt"
+        selected, _ = QFileDialog.getSaveFileName(
+            self,
+            "导出错误详情",
+            default_name,
+            "Text File (*.txt)",
+        )
+        if not selected:
+            return
+        path = selected if selected.lower().endswith(".txt") else f"{selected}.txt"
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(self._diagnostic_text)
+        QMessageBox.information(self, "已导出", f"错误详情已导出到\n{path}")

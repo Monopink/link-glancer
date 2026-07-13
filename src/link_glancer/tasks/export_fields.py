@@ -12,7 +12,7 @@ KNOWN_CONTACT_EXPORT_FIELDS = [
     "viber",
     "facebook",
 ]
-KNOWN_ENRICHMENT_EXPORT_FIELDS = ["bio", *KNOWN_CONTACT_EXPORT_FIELDS]
+KNOWN_ENRICHMENT_EXPORT_FIELDS = ["bio", "contact_info_available", *KNOWN_CONTACT_EXPORT_FIELDS]
 _UNKNOWN_CONTACT_PATTERN = re.compile(r"^contact_(\d+)$", re.IGNORECASE)
 
 

@@ -70,6 +70,9 @@ class _EnrichmentWorkerRuntime:
         if action == "pause":
             self._call_session(lambda session: session.stop())
             return
+        if action == "retry":
+            self._call_session(lambda session: session.retry_current())
+            return
         if action == "skip":
             self._call_session(lambda session: session.skip_current())
             return
@@ -142,6 +145,9 @@ class _EnrichmentWorkerRuntime:
                 "remaining_regions": [],
                 "last_message": "补充采集会话未启动。",
                 "pause_reason": None,
+                "diagnostic_summary": None,
+                "diagnostic_text": None,
+                "attention_required": False,
                 "started_at": None,
                 "estimated_end_at": None,
             }
@@ -161,6 +167,9 @@ class _EnrichmentWorkerRuntime:
             "remaining_regions": status.remaining_regions,
             "last_message": status.last_message,
             "pause_reason": status.pause_reason,
+            "diagnostic_summary": status.diagnostic_summary,
+            "diagnostic_text": status.diagnostic_text,
+            "attention_required": status.attention_required,
             "started_at": _serialize_datetime(status.started_at),
             "estimated_end_at": _serialize_datetime(status.estimated_end_at),
         }
