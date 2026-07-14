@@ -5,6 +5,7 @@ import re
 from link_glancer.tasks.models import ReviewField, TaskItem
 
 KNOWN_CONTACT_EXPORT_FIELDS = [
+    "phone",
     "whatsapp",
     "email",
     "line",

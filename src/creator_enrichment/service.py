@@ -771,7 +771,7 @@ class CreatorEnrichmentSession:
                 "联系方式接口返回异常，请处理后继续，或跳过当前达人。"
             )
             return
-        parsed = contact_patch(payload)
+        parsed = contact_patch(payload, self._current_region or "")
         if parsed.patch:
             self._app_service.update_task_item_data(
                 task_id=self._task_id,
