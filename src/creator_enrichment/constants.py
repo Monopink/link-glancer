@@ -21,6 +21,24 @@ PLAYWRIGHT_ALLOWED_DEFAULT_ARGS = [
     "--disable-extensions",
     "--disable-component-extensions-with-background-pages",
 ]
+BLOCKED_RESOURCE_TYPES = {"image", "media"}
+BLOCKED_RESOURCE_HOSTS = {
+    "p16-common-sign.tiktokcdn.com",
+    "p19-common-sign.tiktokcdn.com",
+    "p16-oec-sg.ibyteimg.com",
+    "p16-oec-va.ibyteimg.com",
+    "p19-oec-va.ibyteimg.com",
+}
+BLOCKED_RESOURCE_PATH_MARKERS = (
+    "/tos-alisg-p-0037/",
+    "/tos-alisg-avt-0068/",
+    "/tplv-noop.image",
+    ".webp",
+    ".jpeg",
+    ".jpg",
+    ".png",
+)
+PROFILE_TYPES_ALLOWLIST = {1}
 
 PAUSE_REASON_CAPTCHA = "captcha"
 PAUSE_REASON_REGION_MISMATCH = "region_mismatch"

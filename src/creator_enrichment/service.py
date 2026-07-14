@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import cast
@@ -9,6 +10,9 @@ from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import Playwright, Response, sync_playwright
 
 from creator_enrichment.constants import (
+    BLOCKED_RESOURCE_HOSTS,
+    BLOCKED_RESOURCE_PATH_MARKERS,
+    BLOCKED_RESOURCE_TYPES,
     CONTACT_API_PATH,
     CONTACT_BADGE_CLICK_TIMEOUT_MS,
     CONTACT_BADGE_SCROLL_TIMEOUT_MS,
@@ -22,6 +26,7 @@ from creator_enrichment.constants import (
     PAUSE_REASON_REGION_MISMATCH,
     PLAYWRIGHT_ALLOWED_DEFAULT_ARGS,
     PROFILE_API_PATH,
+    PROFILE_TYPES_ALLOWLIST,
     PROFILE_WAIT_SECONDS,
     STATE_STATUS_NO_CONTACT,
     STATE_STATUS_PAUSED_CAPTCHA,
@@ -32,7 +37,10 @@ from creator_enrichment.constants import (
 )
 from creator_enrichment.diagnostics import build_diagnostic_text
 from creator_enrichment.models import CreatorEnrichmentFailureAttempt, CreatorEnrichmentStatus
-from creator_enrichment.page_script import network_capture_init_script
+from creator_enrichment.page_script import (
+    enrichment_collection_mode_script,
+    network_capture_init_script,
+)
 from creator_enrichment.parsers import (
     contact_info_available,
     contact_patch,
@@ -115,6 +123,9 @@ class CreatorEnrichmentSession:
         self._contact_positive_signal = False
         self._profile_patch_applied = False
         self._failure_attempts: list[CreatorEnrichmentFailureAttempt] = []
+        self._collection_started = False
+        self._route_installed = False
+        self._collection_mode_installed = False
 
     def start(self) -> CreatorEnrichmentStatus:
         self.shutdown()
@@ -146,6 +157,9 @@ class CreatorEnrichmentSession:
             self._completed = False
             self._paused = True
             self._pause_reason = None
+            self._collection_started = False
+            self._route_installed = False
+            self._collection_mode_installed = False
             self._last_message = "请确认浏览器状态后开始采集。"
             self._advance_to_next_pending(open_page=True)
         except PlaywrightError as exc:
@@ -232,6 +246,9 @@ class CreatorEnrichmentSession:
         if self._completed:
             self._last_message = "补充采集已完成。"
             return self.status()
+        self._ensure_resource_blocking()
+        self._collection_started = True
+        self._ensure_collection_mode()
         if self._current_task_index is None:
             self._advance_to_next_pending(open_page=True)
         else:
@@ -292,6 +309,9 @@ class CreatorEnrichmentSession:
         self._captured_profile = None
         self._captured_contact = None
         self._current_step = "idle"
+        self._collection_started = False
+        self._route_installed = False
+        self._collection_mode_installed = False
 
     def status(self) -> CreatorEnrichmentStatus:
         total_count = len(self._eligible_items())
@@ -381,6 +401,8 @@ class CreatorEnrichmentSession:
         self._captured_contact = None
         self._current_step = "waiting_profile"
         self._waiting_started_at = datetime.now(UTC)
+        if self._collection_started:
+            self._collection_mode_installed = False
         try:
             if reload_page:
                 self._page.reload(wait_until="commit")
@@ -390,6 +412,8 @@ class CreatorEnrichmentSession:
                     wait_until="commit",
                 )
             self._page.bring_to_front()
+            if self._collection_started:
+                self._ensure_collection_mode()
         except PlaywrightError:
             self._handle_retryable_manual_failure(
                 "无法打开达人详情页，请处理后继续，或跳过当前达人。"
@@ -440,6 +464,40 @@ class CreatorEnrichmentSession:
             if creator_id:
                 self._contact_positive_signal = True
                 self._captured_contact = _CapturedContact(creator_id=creator_id, payload=payload)
+
+    def _handle_route(self, route) -> None:
+        try:
+            request = route.request
+            if self._collection_started:
+                if request.resource_type in BLOCKED_RESOURCE_TYPES or _should_block_resource_url(
+                    request.url
+                ):
+                    route.abort()
+                    return
+                if _should_block_profile_request(request.url, request.post_data or ""):
+                    route.abort()
+                    return
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            route.continue_()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _ensure_resource_blocking(self) -> None:
+        if self._context is None or self._route_installed:
+            return
+        self._context.route("**/*", self._handle_route)
+        self._route_installed = True
+
+    def _ensure_collection_mode(self) -> None:
+        if self._page is None or self._collection_mode_installed:
+            return
+        try:
+            self._page.evaluate(enrichment_collection_mode_script())
+        except PlaywrightError:
+            return
+        self._collection_mode_installed = True
 
     def _pull_page_captures(self) -> None:
         if self._page is None:
@@ -1188,3 +1246,42 @@ class CreatorEnrichmentSession:
             }
             and self._last_message != "补充采集已暂停。"
         )
+
+
+def _should_block_resource_url(url: str) -> bool:
+    parts = urlsplit(url)
+    host = parts.netloc.casefold()
+    path = parts.path.casefold()
+    if host in BLOCKED_RESOURCE_HOSTS:
+        return True
+    return any(marker in path for marker in BLOCKED_RESOURCE_PATH_MARKERS)
+
+
+def _should_block_profile_request(url: str, post_data: str) -> bool:
+    try:
+        path = urlsplit(url).path
+    except ValueError:
+        return False
+    if not path.endswith(PROFILE_API_PATH):
+        return False
+    creator_id, profile_types = _parse_profile_request_body(post_data)
+    if not creator_id or not profile_types:
+        return False
+    return any(profile_type not in PROFILE_TYPES_ALLOWLIST for profile_type in profile_types)
+
+
+def _parse_profile_request_body(post_data: str) -> tuple[str, tuple[int, ...]]:
+    try:
+        payload = json.loads(post_data)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return "", ()
+    creator_id = str(payload.get("creator_oec_id") or "").strip()
+    raw_profile_types = payload.get("profile_types")
+    profile_types: list[int] = []
+    if isinstance(raw_profile_types, list):
+        for item in raw_profile_types:
+            try:
+                profile_types.append(int(item))
+            except (TypeError, ValueError):
+                continue
+    return creator_id, tuple(profile_types)

@@ -5,6 +5,7 @@ import queue
 import sys
 import threading
 import time
+import traceback
 from datetime import UTC, datetime
 
 from creator_enrichment.constants import POLL_INTERVAL_SECONDS, STATUS_PUSH_INTERVAL_SECONDS
@@ -27,9 +28,20 @@ class _EnrichmentWorkerRuntime:
         self._stdin_thread.start()
         try:
             while not self._stop_event.is_set():
-                self._process_pending_commands()
-                if self._session is not None:
-                    self._session.poll()
+                try:
+                    self._process_pending_commands()
+                    if self._session is not None:
+                        self._session.poll()
+                except Exception as exc:  # noqa: BLE001
+                    self._push_message(
+                        {
+                            "type": "error",
+                            "message": f"补充采集 worker 异常：{exc}",
+                            "details": traceback.format_exc(),
+                        }
+                    )
+                    self._stop_event.set()
+                    break
                 self._push_status_if_needed(force=False)
                 time.sleep(POLL_INTERVAL_SECONDS)
         finally:
@@ -110,7 +122,18 @@ class _EnrichmentWorkerRuntime:
         if self._session is None:
             self._push_message({"type": "error", "message": "补充采集会话未启动。"})
             return
-        callback(self._session)
+        try:
+            callback(self._session)
+        except Exception as exc:  # noqa: BLE001
+            self._push_message(
+                {
+                    "type": "error",
+                    "message": f"补充采集操作失败：{exc}",
+                    "details": traceback.format_exc(),
+                }
+            )
+            self._stop_event.set()
+            return
         self._push_status_if_needed(force=True)
 
     def _shutdown_session(self) -> None:

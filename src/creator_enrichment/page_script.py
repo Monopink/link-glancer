@@ -223,3 +223,166 @@ def network_capture_init_script() -> str:
     }});
 }})();
 """
+
+
+def enrichment_collection_mode_script() -> str:
+    return """
+() => {
+    const installedKey = "__linkGlancerEnrichmentModeInstalled";
+    if (window[installedKey]) {
+        return;
+    }
+    window[installedKey] = true;
+
+    const style = document.createElement("style");
+    style.id = "link-glancer-enrichment-mode";
+    style.textContent = `
+        #im-entry,
+        aside,
+        [data-tid="m4b_page_header"],
+        .entryWrapper-Zd4AJg,
+        .core-modal-wrapper,
+        .core-modal-mask,
+        [data-modal-root="true"],
+        [id^="video_preview_"],
+        #video-roll-root-mask,
+        #feedback-container,
+        .lightcharts-tooltip,
+        .ad-box,
+        tiktok-cookie-banner,
+        [data-e2e="f03cd1ad-3b77-b803"],
+        [data-e2e="3bff47b5-27c3-70bd"],
+        [class*="similar-creator-card__Container"],
+        [class*="similar-creator-card__SaveContainer"] {
+            display: none !important;
+        }
+        #content-container,
+        main,
+        #affiliate_sub_app_container,
+        #modern_sub_app_container_connection {
+            max-width: none !important;
+            width: 100% !important;
+        }
+        #scroll-container,
+        main,
+        #affiliate_sub_app_container {
+            overflow-anchor: none !important;
+        }
+        [data-e2e="e4af3b5a-a87c-dfbd"],
+        [data-e2e="1a71a34c-27e4-2557"],
+        [data-e2e="807bb724-4218-1bc0"],
+        #sales_tab,
+        #collab_history,
+        #video_tab,
+        #live_tab,
+        #followers_tab,
+        #trends_tab,
+        #top_video,
+        section[data-pre],
+        .pulse-tabs,
+        [data-tid="m4b_tabs"] {
+            display: none !important;
+        }
+        *,
+        *::before,
+        *::after {
+            animation: none !important;
+            transition: none !important;
+            scroll-behavior: auto !important;
+        }
+        img,
+        video,
+        canvas {
+            visibility: hidden !important;
+        }
+    `;
+    document.head.appendChild(style);
+
+    const keepNodes = new Set();
+    const updateKeepNodes = () => {
+        keepNodes.clear();
+        const profile = document.querySelector("#creator-detail-profile-container");
+        if (!(profile instanceof HTMLElement)) {
+            return false;
+        }
+        keepNodes.add(profile);
+        let current = profile.parentElement;
+        while (current instanceof HTMLElement) {
+            keepNodes.add(current);
+            current = current.parentElement;
+        }
+        return true;
+    };
+
+    const shouldRemove = (node) => {
+        if (!(node instanceof HTMLElement)) {
+            return false;
+        }
+        if (
+            node.matches(
+                ".core-modal-wrapper, .core-modal-mask, [data-modal-root='true'], "
+                + "[id^='video_preview_'], #video-roll-root-mask, #feedback-container, "
+                + ".lightcharts-tooltip, .ad-box, tiktok-cookie-banner, "
+                + "[data-e2e='e4af3b5a-a87c-dfbd'], [data-e2e='1a71a34c-27e4-2557'], "
+                + "[data-e2e='807bb724-4218-1bc0'], [data-e2e='f03cd1ad-3b77-b803'], "
+                + "[data-e2e='3bff47b5-27c3-70bd'], [class*='similar-creator-card__Container'], "
+                + "[class*='similar-creator-card__SaveContainer'], #sales_tab, #collab_history, "
+                + "#video_tab, #live_tab, #followers_tab, #trends_tab, #top_video, "
+                + "section[data-pre], .pulse-tabs, [data-tid='m4b_tabs']"
+            )
+        ) {
+            return true;
+        }
+        for (const keptNode of keepNodes) {
+            if (keptNode === node || keptNode.contains(node) || node.contains(keptNode)) {
+                return false;
+            }
+        }
+        return (
+            node.closest("#creator-detail-profile-container") === null
+            && !node.querySelector("#creator-detail-profile-container")
+        );
+    };
+
+    const pruneNode = (node) => {
+        if (!(node instanceof HTMLElement)) {
+            return;
+        }
+        if (shouldRemove(node)) {
+            node.remove();
+            return;
+        }
+        for (const img of node.querySelectorAll("img")) {
+            img.removeAttribute("src");
+            img.removeAttribute("srcset");
+            img.loading = "lazy";
+        }
+        for (const media of node.querySelectorAll("video, source")) {
+            media.remove();
+        }
+        for (const preview of node.querySelectorAll("[id^='video_preview_']")) {
+            preview.remove();
+        }
+    };
+
+    if (updateKeepNodes()) {
+        pruneNode(document.body);
+    }
+    const observer = new MutationObserver((mutations) => {
+        const ready = updateKeepNodes();
+        if (!ready) {
+            return;
+        }
+        for (const mutation of mutations) {
+            for (const addedNode of mutation.addedNodes) {
+                pruneNode(addedNode);
+            }
+        }
+    });
+    observer.observe(document.documentElement, {
+        childList: true,
+        subtree: true,
+    });
+    window.__linkGlancerEnrichmentModeObserver = observer;
+}
+"""
