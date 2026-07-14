@@ -77,7 +77,10 @@ class _EnrichmentWorkerRuntime:
             self._handle_start(command)
             return
         if action == "resume":
-            self._call_session(lambda session: session.resume())
+            auto_skip_on_failure = bool(command.get("auto_skip_on_failure"))
+            self._call_session(
+                lambda session: session.resume(auto_skip_on_failure=auto_skip_on_failure)
+            )
             return
         if action == "pause":
             self._call_session(lambda session: session.stop())
@@ -161,6 +164,7 @@ class _EnrichmentWorkerRuntime:
                 "completed_count": 0,
                 "success_count": 0,
                 "no_contact_count": 0,
+                "auto_skipped_count": 0,
                 "skipped_count": 0,
                 "failed_count": 0,
                 "current_task_index": None,
@@ -184,6 +188,7 @@ class _EnrichmentWorkerRuntime:
             "completed_count": status.completed_count,
             "success_count": status.success_count,
             "no_contact_count": status.no_contact_count,
+            "auto_skipped_count": status.auto_skipped_count,
             "skipped_count": status.skipped_count,
             "failed_count": status.failed_count,
             "current_task_index": status.current_task_index,

@@ -9,6 +9,7 @@ from PySide6.QtCore import QProcess, Qt, QTimer
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QDialog,
     QFileDialog,
     QGridLayout,
@@ -45,6 +46,7 @@ class _EnrichmentWorkerStatus:
     completed_count: int
     success_count: int
     no_contact_count: int
+    auto_skipped_count: int
     skipped_count: int
     failed_count: int
     current_task_index: int | None
@@ -69,6 +71,7 @@ class _EnrichmentWorkerStatus:
             completed_count=0,
             success_count=0,
             no_contact_count=0,
+            auto_skipped_count=0,
             skipped_count=0,
             failed_count=0,
             current_task_index=None,
@@ -96,6 +99,7 @@ class _EnrichmentWorkerStatus:
             completed_count=int(payload.get("completed_count") or 0),
             success_count=int(payload.get("success_count") or 0),
             no_contact_count=int(payload.get("no_contact_count") or 0),
+            auto_skipped_count=int(payload.get("auto_skipped_count") or 0),
             skipped_count=int(payload.get("skipped_count") or 0),
             failed_count=int(payload.get("failed_count") or 0),
             current_task_index=(
@@ -157,28 +161,49 @@ class CreatorEnrichmentDialog(QDialog):
         self._task_lock: RuntimeLockHandle | None = None
 
         self.setWindowTitle(f"补充采集 · 任务 #{task.task_id}")
-        self.resize(720, 280)
+        self.resize(860, 320)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(16, 16, 16, 16)
         root.setSpacing(12)
 
-        summary_grid = QGridLayout()
-        summary_grid.setHorizontalSpacing(24)
-        summary_grid.setVerticalSpacing(10)
-        self._status_label = QLabel("启动中")
+        summary_row = QHBoxLayout()
+        summary_row.setContentsMargins(0, 0, 0, 0)
+        summary_row.setSpacing(16)
+
+        left_widget = QWidget()
+        left_grid = QGridLayout(left_widget)
+        left_grid.setContentsMargins(0, 0, 0, 0)
+        left_grid.setHorizontalSpacing(12)
+        left_grid.setVerticalSpacing(10)
+        left_grid.setColumnStretch(1, 1)
+        self._auto_skip_checkbox = QCheckBox("自动跳过")
+        self._auto_skip_checkbox.setChecked(False)
         self._count_label = QLabel("0 / 0")
+        self._success_label = QLabel("0")
+        self._no_contact_label = QLabel("0")
+        self._skipped_label = QLabel("0")
+        _add_summary_row(left_grid, 0, "进度", self._count_label)
+        _add_summary_row(left_grid, 1, "成功", self._success_label)
+        _add_summary_row(left_grid, 2, "无联系方式", self._no_contact_label)
+        _add_summary_row(left_grid, 3, "跳过", self._skipped_label)
+        summary_row.addWidget(left_widget, 3)
+
+        right_widget = QWidget()
+        right_grid = QGridLayout(right_widget)
+        right_grid.setContentsMargins(0, 0, 0, 0)
+        right_grid.setHorizontalSpacing(12)
+        right_grid.setVerticalSpacing(10)
         self._region_label = QLabel("-")
         self._remaining_region_label = QLabel("-")
         self._elapsed_label = QLabel("-")
         self._eta_label = QLabel("-")
-        _add_summary_row(summary_grid, 0, 0, "状态", self._status_label, stretch=True)
-        _add_summary_row(summary_grid, 0, 1, "进度", self._count_label)
-        _add_summary_row(summary_grid, 0, 2, "当前区域", self._region_label)
-        _add_summary_row(summary_grid, 1, 0, "剩余区域", self._remaining_region_label, stretch=True)
-        _add_summary_row(summary_grid, 1, 1, "预计结束", self._elapsed_label)
-        _add_summary_row(summary_grid, 1, 2, "剩余时间", self._eta_label)
-        root.addLayout(summary_grid)
+        _add_summary_row(right_grid, 0, "当前区域", self._region_label)
+        _add_summary_row(right_grid, 1, "剩余区域", self._remaining_region_label, stretch=True)
+        _add_summary_row(right_grid, 2, "预计结束", self._elapsed_label)
+        _add_summary_row(right_grid, 3, "剩余时间", self._eta_label)
+        summary_row.addWidget(right_widget, 4)
+        root.addLayout(summary_row)
 
         self._progress = QProgressBar()
         self._progress.setRange(0, 100)
@@ -188,6 +213,13 @@ class CreatorEnrichmentDialog(QDialog):
         self._message_label = QLabel("启动中")
         self._message_label.setWordWrap(True)
         root.addWidget(self._message_label)
+
+        options_row = QHBoxLayout()
+        options_row.setContentsMargins(0, 0, 0, 0)
+        options_row.setSpacing(12)
+        options_row.addWidget(self._auto_skip_checkbox)
+        options_row.addStretch(1)
+
         root.addStretch(1)
 
         actions = QHBoxLayout()
@@ -209,6 +241,7 @@ class CreatorEnrichmentDialog(QDialog):
         actions.addWidget(self._continue_button)
         actions.addStretch(1)
         actions.addWidget(close_button)
+        root.addLayout(options_row)
         root.addLayout(actions)
 
         self._timer = QTimer(self)
@@ -279,11 +312,18 @@ class CreatorEnrichmentDialog(QDialog):
                     self._worker_started = True
                     self._confirm_start()
                 self._refresh_from_status()
+                if self._should_close_after_browser_shutdown():
+                    self._force_close = True
+                    self.close()
+                    return
                 self._notify_status_change()
                 self._show_issue_dialog_if_needed()
             return
         if message_type == "error":
             message = str(payload.get("message") or "补充采集进程执行失败。")
+            details = str(payload.get("details") or "")
+            if _is_expected_browser_close_message(message, details):
+                return
             QMessageBox.warning(self, "补充采集失败", message)
 
     def _confirm_start(self) -> None:
@@ -299,7 +339,7 @@ class CreatorEnrichmentDialog(QDialog):
         )
         self._startup_pending = False
         if result == QMessageBox.StandardButton.Yes:
-            self._send_command({"cmd": "resume"})
+            self._resume()
             return
         self._expected_process_exit = True
         self._send_command({"cmd": "shutdown"})
@@ -311,12 +351,14 @@ class CreatorEnrichmentDialog(QDialog):
         self._count_label.setText(f"{status.completed_count} / {status.total_count}")
         self._region_label.setText(status.current_region or "-")
         self._remaining_region_label.setText(", ".join(status.remaining_regions) or "-")
+        self._success_label.setText(str(status.success_count))
+        self._no_contact_label.setText(str(status.no_contact_count))
+        self._skipped_label.setText(str(status.skipped_count + status.auto_skipped_count))
         self._message_label.setText(status.last_message or "-")
         progress = 0
         if status.total_count > 0:
             progress = int(status.completed_count * 100 / status.total_count)
         self._progress.setValue(progress)
-        self._status_label.setText(self._display_status_text(status))
         self._refresh_time_labels_if_needed(force=True)
         controls_ready = not self._startup_pending
         is_interrupted = status.attention_required
@@ -401,8 +443,20 @@ class CreatorEnrichmentDialog(QDialog):
             return
         tray_icon.showMessage(title, message, tray_icon.MessageIcon.Information, 8000)
 
+    def _should_close_after_browser_shutdown(self) -> bool:
+        return (
+            self._worker_started
+            and not self._status.running
+            and self._status.last_message == "浏览器已关闭。"
+        )
+
     def _resume(self) -> None:
-        self._send_command({"cmd": "resume"})
+        self._send_command(
+            {
+                "cmd": "resume",
+                "auto_skip_on_failure": self._auto_skip_checkbox.isChecked(),
+            }
+        )
 
     def _retry_current(self) -> None:
         self._send_command({"cmd": "retry"})
@@ -515,18 +569,16 @@ class CreatorEnrichmentDialog(QDialog):
 def _add_summary_row(
     grid: QGridLayout,
     row: int,
-    column_group: int,
     label_text: str,
     value_label: QLabel,
     *,
     stretch: bool = False,
 ) -> None:
-    base_column = column_group * 2
     label = QLabel(label_text)
-    grid.addWidget(label, row, base_column)
-    grid.addWidget(value_label, row, base_column + 1)
+    grid.addWidget(label, row, 0)
+    grid.addWidget(value_label, row, 1)
     if stretch:
-        grid.setColumnStretch(base_column + 1, 1)
+        grid.setColumnStretch(1, 1)
 
 
 def _parse_datetime(raw: object) -> datetime | None:
@@ -536,6 +588,16 @@ def _parse_datetime(raw: object) -> datetime | None:
         return datetime.fromisoformat(raw)
     except ValueError:
         return None
+
+
+def _is_expected_browser_close_message(message: str, details: str) -> bool:
+    content = f"{message}\n{details}"
+    lowered = content.casefold()
+    return (
+        "浏览器已关闭" in content
+        or "target page, context or browser has been closed" in lowered
+        or "browser has been closed" in lowered
+    )
 
 
 class _IssueDialog(QDialog):

@@ -28,6 +28,7 @@ from creator_enrichment.constants import (
     PROFILE_API_PATH,
     PROFILE_TYPES_ALLOWLIST,
     PROFILE_WAIT_SECONDS,
+    STATE_STATUS_AUTO_SKIPPED,
     STATE_STATUS_NO_CONTACT,
     STATE_STATUS_PAUSED_CAPTCHA,
     STATE_STATUS_PAUSED_MANUAL_ACTION,
@@ -126,6 +127,7 @@ class CreatorEnrichmentSession:
         self._collection_started = False
         self._route_installed = False
         self._collection_mode_installed = False
+        self._auto_skip_on_failure = False
 
     def start(self) -> CreatorEnrichmentStatus:
         self.shutdown()
@@ -239,13 +241,14 @@ class CreatorEnrichmentSession:
 
         return self.status()
 
-    def resume(self) -> CreatorEnrichmentStatus:
+    def resume(self, *, auto_skip_on_failure: bool = False) -> CreatorEnrichmentStatus:
         if self._context is None or self._page is None:
             self._last_message = "补充采集会话未启动。"
             return self.status()
         if self._completed:
             self._last_message = "补充采集已完成。"
             return self.status()
+        self._auto_skip_on_failure = auto_skip_on_failure
         self._ensure_resource_blocking()
         self._collection_started = True
         self._ensure_collection_mode()
@@ -334,6 +337,7 @@ class CreatorEnrichmentSession:
             completed_count=counts["completed"],
             success_count=counts["success"],
             no_contact_count=counts["no_contact"],
+            auto_skipped_count=counts["auto_skipped"],
             skipped_count=counts["skipped"],
             failed_count=counts["paused"],
             current_task_index=self._current_task_index,
@@ -1000,6 +1004,9 @@ class CreatorEnrichmentSession:
             )
             self._start_current_attempt(reload_page=True, clear_failure_history=False)
             return
+        if self._auto_skip_on_failure:
+            self._mark_current_auto_skipped(message)
+            return
         self._pause_manual_for_current(message)
 
     def _mark_current_paused(self, paused_status: str) -> None:
@@ -1013,6 +1020,29 @@ class CreatorEnrichmentSession:
             region=self._current_region or "",
         )
         self._persist_state()
+
+    def _mark_current_auto_skipped(self, message: str) -> None:
+        if self._current_task_index is None:
+            return
+        subject = self._current_subject()
+        update_item_state(
+            self._state,
+            task_index=self._current_task_index,
+            status=STATE_STATUS_AUTO_SKIPPED,
+            reason=message,
+            region=self._current_region or "",
+        )
+        self._persist_state()
+        self._paused = False
+        self._pause_reason = None
+        self._pause_step = "idle"
+        self._current_step = "idle"
+        self._waiting_started_at = None
+        self._advance_to_next_pending(open_page=True)
+        self._last_message = self._message_for_subject(
+            subject,
+            "补充采集异常，已自动跳过并继续下一条。",
+        )
 
     def _complete(self, message: str) -> None:
         self._completed = True
@@ -1112,7 +1142,14 @@ class CreatorEnrichmentSession:
         )
 
     def _status_counts(self) -> dict[str, int]:
-        counts = {"completed": 0, "success": 0, "no_contact": 0, "skipped": 0, "paused": 0}
+        counts = {
+            "completed": 0,
+            "success": 0,
+            "no_contact": 0,
+            "auto_skipped": 0,
+            "skipped": 0,
+            "paused": 0,
+        }
         for item in self._eligible_items():
             status = str(self._item_state(item.task_index).get("status") or "")
             if is_terminal_status(status):
@@ -1121,6 +1158,8 @@ class CreatorEnrichmentSession:
                 counts["success"] += 1
             elif status == STATE_STATUS_NO_CONTACT:
                 counts["no_contact"] += 1
+            elif status == STATE_STATUS_AUTO_SKIPPED:
+                counts["auto_skipped"] += 1
             elif status == STATE_STATUS_SKIPPED:
                 counts["skipped"] += 1
             elif status.startswith("paused_"):

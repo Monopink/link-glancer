@@ -20,6 +20,7 @@ class CreatorEnrichmentStatus:
     completed_count: int
     success_count: int
     no_contact_count: int
+    auto_skipped_count: int
     skipped_count: int
     failed_count: int
     current_task_index: int | None
