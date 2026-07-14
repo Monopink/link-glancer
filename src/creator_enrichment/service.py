@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from pprint import pformat
 from typing import cast
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import urlsplit
 
 from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import Playwright, Response, sync_playwright
@@ -15,10 +13,10 @@ from creator_enrichment.constants import (
     CONTACT_BADGE_CLICK_TIMEOUT_MS,
     CONTACT_BADGE_SCROLL_TIMEOUT_MS,
     CONTACT_BADGE_WAIT_SECONDS,
+    CONTACT_ICON_CLASS_KEYWORDS,
     CONTACT_WAIT_SECONDS,
     DETAIL_URL_TEMPLATE,
     FAILURE_RETRY_LIMIT,
-    KNOWN_CONTACT_FIELD_MAP,
     PAUSE_REASON_CAPTCHA,
     PAUSE_REASON_MANUAL_ACTION,
     PAUSE_REASON_REGION_MISMATCH,
@@ -32,24 +30,27 @@ from creator_enrichment.constants import (
     STATE_STATUS_SKIPPED,
     STATE_STATUS_SUCCESS,
 )
+from creator_enrichment.diagnostics import build_diagnostic_text
 from creator_enrichment.models import CreatorEnrichmentFailureAttempt, CreatorEnrichmentStatus
+from creator_enrichment.page_script import network_capture_init_script
+from creator_enrichment.parsers import (
+    contact_info_available,
+    contact_patch,
+    nested_value,
+    normalized_creator_id,
+    normalized_region,
+    parse_datetime,
+    profile_request_metadata,
+    query_param,
+    remaining_regions_from_items,
+    should_capture_profile,
+    sorted_items_by_region,
+)
 from creator_enrichment.state import is_terminal_status, normalize_state, now_iso, update_item_state
 from link_glancer.application import TaskApplicationService
 from link_glancer.browser.detector import detect_browser
 from link_glancer.runtime.paths import ensure_browser_environment_dir
 from link_glancer.tasks.models import BrowserConfig, TaskItem
-
-CONTACT_ICON_CLASS_KEYWORDS = (
-    "Email",
-    "WhatsApp",
-    "Whatsapp",
-    "Phone",
-    "LINE",
-    "Line",
-    "Viber",
-    "Zalo",
-    "Facebook",
-)
 
 
 @dataclass(slots=True)
@@ -64,14 +65,6 @@ class _CapturedProfile:
 class _CapturedContact:
     creator_id: str
     payload: dict[str, object]
-
-
-@dataclass(slots=True)
-class _ParsedContactPayload:
-    patch: dict[str, object]
-    total_entries: int
-    valued_entries: int
-    recognized_entries: int
 
 
 class CreatorEnrichmentSession:
@@ -144,12 +137,12 @@ class CreatorEnrichmentSession:
                 ignore_default_args=PLAYWRIGHT_ALLOWED_DEFAULT_ARGS,
             )
             self._context.on("response", self._handle_response)
-            self._context.add_init_script(_network_capture_init_script())
+            self._context.add_init_script(network_capture_init_script())
             self._page = self._context.new_page()
             if self._state.get("started_at") is None:
                 self._state["started_at"] = now_iso()
                 self._persist_state()
-            self._started_at = _parse_datetime(self._state.get("started_at"))
+            self._started_at = parse_datetime(self._state.get("started_at"))
             self._completed = False
             self._paused = True
             self._pause_reason = None
@@ -339,7 +332,7 @@ class CreatorEnrichmentSession:
     def _eligible_items(self) -> list[TaskItem]:
         items = self._app_service.list_all_items(self._task_id)
         return [
-            item for item in items if _normalized_creator_id(item.task_data.get("creator_oecuid"))
+            item for item in items if normalized_creator_id(item.task_data.get("creator_oecuid"))
         ]
 
     def _pending_items(self) -> list[TaskItem]:
@@ -348,11 +341,11 @@ class CreatorEnrichmentSession:
             status = str(self._item_state(item.task_index).get("status") or "")
             if not is_terminal_status(status):
                 pending.append(item)
-        return _sorted_items_by_region(pending)
+        return sorted_items_by_region(pending)
 
     def _advance_to_next_pending(self, *, open_page: bool) -> None:
         pending = self._pending_items()
-        self._remaining_regions = _remaining_regions_from_items(pending)
+        self._remaining_regions = remaining_regions_from_items(pending)
         if not pending:
             self._current_task_index = None
             self._current_region = None
@@ -363,7 +356,7 @@ class CreatorEnrichmentSession:
         if item.task_index != self._current_task_index:
             self._failure_attempts = []
         self._current_task_index = item.task_index
-        self._current_region = _normalized_region(item.task_data.get("selection_region"))
+        self._current_region = normalized_region(item.task_data.get("selection_region"))
         if open_page:
             self._load_current_detail_page()
 
@@ -377,7 +370,7 @@ class CreatorEnrichmentSession:
         if item is None:
             self._advance_to_next_pending(open_page=True)
             return
-        creator_id = _normalized_creator_id(item.task_data.get("creator_oecuid"))
+        creator_id = normalized_creator_id(item.task_data.get("creator_oecuid"))
         if not creator_id:
             self.skip_current()
             return
@@ -414,8 +407,8 @@ class CreatorEnrichmentSession:
         if not isinstance(payload, dict):
             return
         if path.endswith(PROFILE_API_PATH):
-            creator_id, profile_types = _profile_request_metadata(response)
-            shop_region = _query_param(response.url, "shop_region")
+            creator_id, profile_types = profile_request_metadata(response)
+            shop_region = query_param(response.url, "shop_region")
             self._last_profile_response_url = response.url
             self._last_profile_payload = payload
             self._last_profile_types = profile_types
@@ -423,10 +416,10 @@ class CreatorEnrichmentSession:
             profile = payload.get("creator_profile")
             if not isinstance(profile, dict):
                 profile = {}
-            response_creator_id = _normalized_creator_id(
-                _nested_value(profile.get("creator_oecuid")) or _query_param(self._page.url, "cid")
+            response_creator_id = normalized_creator_id(
+                nested_value(profile.get("creator_oecuid")) or query_param(self._page.url, "cid")
             )
-            should_capture = _should_capture_profile(
+            should_capture = should_capture_profile(
                 profile=profile,
                 request_creator_id=creator_id,
                 response_creator_id=response_creator_id,
@@ -441,7 +434,7 @@ class CreatorEnrichmentSession:
                 )
             return
         if path.endswith(CONTACT_API_PATH):
-            creator_id = _query_param(response.url, "creator_oecuid")
+            creator_id = query_param(response.url, "creator_oecuid")
             self._last_contact_response_url = response.url
             self._last_contact_payload = payload
             if creator_id:
@@ -505,12 +498,12 @@ class CreatorEnrichmentSession:
         profile = payload.get("creator_profile")
         if not isinstance(profile, dict):
             profile = {}
-        creator_id = _normalized_creator_id(_nested_value(profile.get("creator_oecuid")))
+        creator_id = normalized_creator_id(nested_value(profile.get("creator_oecuid")))
         if not creator_id:
-            creator_id = _query_param(str(entry.get("pageUrl") or ""), "cid")
+            creator_id = query_param(str(entry.get("pageUrl") or ""), "cid")
         if not creator_id:
             return
-        shop_region = _query_param(str(entry.get("url") or ""), "shop_region") or _query_param(
+        shop_region = query_param(str(entry.get("url") or ""), "shop_region") or query_param(
             str(entry.get("pageUrl") or ""),
             "shop_region",
         )
@@ -528,7 +521,7 @@ class CreatorEnrichmentSession:
         self._last_profile_payload = payload
         self._last_profile_types = profile_types
         self._last_profile_seen_at = datetime.now(UTC)
-        if _should_capture_profile(
+        if should_capture_profile(
             profile=profile,
             request_creator_id=creator_id,
             response_creator_id=creator_id,
@@ -548,7 +541,7 @@ class CreatorEnrichmentSession:
         if not isinstance(payload, dict):
             return
         url = str(entry.get("url") or "")
-        creator_id = _query_param(url, "creator_oecuid") or _normalized_creator_id(
+        creator_id = query_param(url, "creator_oecuid") or normalized_creator_id(
             entry.get("creatorId")
         )
         if not creator_id:
@@ -606,7 +599,7 @@ class CreatorEnrichmentSession:
         if item is None:
             self._advance_to_next_pending(open_page=True)
             return
-        creator_id = _normalized_creator_id(item.task_data.get("creator_oecuid"))
+        creator_id = normalized_creator_id(item.task_data.get("creator_oecuid"))
         captured = self._captured_profile
         self._captured_profile = None
         if captured.creator_id != creator_id:
@@ -617,9 +610,9 @@ class CreatorEnrichmentSession:
                 self._pause(PAUSE_REASON_CAPTCHA, "检测到人机验证，请先完成验证后继续。")
                 self._mark_current_paused(STATE_STATUS_PAUSED_CAPTCHA)
                 return
-            item_region = _normalized_region(item.task_data.get("selection_region"))
-            request_region = _normalized_region(
-                captured.shop_region or _query_param(self._page.url, "shop_region")
+            item_region = normalized_region(item.task_data.get("selection_region"))
+            request_region = normalized_region(
+                captured.shop_region or query_param(self._page.url, "shop_region")
             )
             if item_region and request_region and item_region != request_region:
                 self._pause(
@@ -633,9 +626,9 @@ class CreatorEnrichmentSession:
             )
             return
 
-        item_region = _normalized_region(item.task_data.get("selection_region"))
-        request_region = _normalized_region(
-            captured.shop_region or _query_param(self._page.url, "shop_region")
+        item_region = normalized_region(item.task_data.get("selection_region"))
+        request_region = normalized_region(
+            captured.shop_region or query_param(self._page.url, "shop_region")
         )
         if item_region and request_region and item_region != request_region:
             self._pause(
@@ -649,10 +642,10 @@ class CreatorEnrichmentSession:
         if not isinstance(profile, dict):
             profile = {}
         patch: dict[str, object] = {}
-        bio = _nested_value(profile.get("bio"))
+        bio = nested_value(profile.get("bio"))
         patch["bio"] = bio or "-"
         self._last_contact_available_raw = profile.get("contact_info_available")
-        contact_available = _contact_info_available(profile.get("contact_info_available"))
+        contact_available = contact_info_available(profile.get("contact_info_available"))
         self._last_contact_available = contact_available
         self._profile_patch_applied = True
         if contact_available is not None:
@@ -709,7 +702,7 @@ class CreatorEnrichmentSession:
         if item is None:
             self._advance_to_next_pending(open_page=True)
             return
-        creator_id = _normalized_creator_id(item.task_data.get("creator_oecuid"))
+        creator_id = normalized_creator_id(item.task_data.get("creator_oecuid"))
         captured = self._captured_contact
         self._captured_contact = None
         if captured.creator_id != creator_id:
@@ -720,7 +713,7 @@ class CreatorEnrichmentSession:
                 "联系方式接口返回异常，请处理后继续，或跳过当前达人。"
             )
             return
-        parsed = _contact_patch(payload)
+        parsed = contact_patch(payload)
         if parsed.patch:
             self._app_service.update_task_item_data(
                 task_id=self._task_id,
@@ -1162,36 +1155,26 @@ class CreatorEnrichmentSession:
                 page_url = self._page.url
             except PlaywrightError:
                 page_url = "-"
-        lines = [
-            f"时间: {datetime.now(UTC).isoformat()}",
-            f"任务ID: {self._task_id}",
-            f"当前条目: {self._current_task_index}",
-            f"当前对象: {self._current_subject() or '-'}",
-            f"当前区域: {self._current_region or '-'}",
-            f"暂停原因: {pause_reason or '-'}",
-            f"暂停阶段: {pause_step or '-'}",
-            f"页面URL: {page_url}",
-            f"消息: {message}",
-            f"profile_types: {list(self._last_profile_types)}",
-            "contact_info_available 判定: "
-            f"{_format_contact_available(self._last_contact_available)}",
-            "contact_info_available 原始值: "
-            f"{pformat(self._last_contact_available_raw, width=100)}",
-            f"联系方式图标是否发现: {'是' if self._last_contact_badge_detected else '否'}",
-            f"联系方式图标是否点击: {'是' if self._last_contact_badge_clicked else '否'}",
-            f"联系方式图标点击策略: {self._last_contact_badge_strategy or '-'}",
-            "",
-            "最近一次 profile 请求:",
-            self._last_profile_response_url or "-",
-            "最近一次 profile 响应:",
-            pformat(self._last_profile_payload, width=100) if self._last_profile_payload else "-",
-            "",
-            "最近一次 contact 请求:",
-            self._last_contact_response_url or "-",
-            "最近一次 contact 响应:",
-            pformat(self._last_contact_payload, width=100) if self._last_contact_payload else "-",
-        ]
-        return "\n".join(lines)
+        return build_diagnostic_text(
+            task_id=self._task_id,
+            current_task_index=self._current_task_index,
+            current_subject=self._current_subject(),
+            current_region=self._current_region,
+            pause_reason=pause_reason,
+            pause_step=pause_step,
+            page_url=page_url,
+            message=message,
+            profile_types=self._last_profile_types,
+            contact_available=self._last_contact_available,
+            contact_available_raw=self._last_contact_available_raw,
+            contact_badge_detected=self._last_contact_badge_detected,
+            contact_badge_clicked=self._last_contact_badge_clicked,
+            contact_badge_strategy=self._last_contact_badge_strategy,
+            last_profile_response_url=self._last_profile_response_url,
+            last_profile_payload=self._last_profile_payload,
+            last_contact_response_url=self._last_contact_response_url,
+            last_contact_payload=self._last_contact_payload,
+        )
 
     def _attention_required(self) -> bool:
         if not self._paused or self._completed:
@@ -1205,385 +1188,3 @@ class CreatorEnrichmentSession:
             }
             and self._last_message != "补充采集已暂停。"
         )
-
-
-def _nested_value(raw: object) -> str:
-    if isinstance(raw, dict):
-        value = raw.get("value")
-        if value is None:
-            return ""
-        return str(value)
-    if raw is None:
-        return ""
-    return str(raw)
-
-
-def _contact_info_available(raw: object) -> bool | None:
-    if not isinstance(raw, dict):
-        return None
-    value = raw.get("value")
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        return value.strip().lower() == "true"
-    return None
-
-
-def _profile_request_metadata(response: Response) -> tuple[str, tuple[int, ...]]:
-    request = response.request
-    try:
-        post_data = request.post_data or ""
-    except PlaywrightError:
-        return "", ()
-    try:
-        payload = json.loads(post_data)
-    except (TypeError, ValueError, json.JSONDecodeError):
-        return "", ()
-    creator_id = payload.get("creator_oec_id")
-    raw_profile_types = payload.get("profile_types")
-    profile_types: list[int] = []
-    if isinstance(raw_profile_types, list):
-        for item in raw_profile_types:
-            try:
-                profile_types.append(int(item))
-            except (TypeError, ValueError):
-                continue
-    return str(creator_id or "").strip(), tuple(profile_types)
-
-
-def _should_capture_profile(
-    *,
-    profile: dict[str, object],
-    request_creator_id: str,
-    response_creator_id: str,
-    profile_types: tuple[int, ...],
-) -> bool:
-    if request_creator_id and 1 in profile_types:
-        return True
-    return "contact_info_available" in profile and bool(response_creator_id)
-
-
-def _network_capture_init_script() -> str:
-    return """
-(() => {
-    if (window.__linkGlancerCaptureInstalled) {
-        return;
-    }
-    window.__linkGlancerCaptureInstalled = true;
-    window.__linkGlancerCapture = {
-        profileResponses: [],
-        contactResponses: [],
-        badgeEvents: [],
-        badgeClickPageUrl: "",
-    };
-    const pushCapture = (kind, entry) => {
-        const list = window.__linkGlancerCapture[kind];
-        if (!Array.isArray(list)) {
-            return;
-        }
-        list.push(entry);
-        if (list.length > 20) {
-            list.splice(0, list.length - 20);
-        }
-    };
-    const parseJsonText = (text) => {
-        if (typeof text !== "string" || !text.trim()) {
-            return null;
-        }
-        try {
-            return JSON.parse(text);
-        } catch {
-            return null;
-        }
-    };
-    const parseProfileTypes = (body) => {
-        const payload = parseJsonText(body);
-        if (!payload || !Array.isArray(payload.profile_types)) {
-            return [];
-        }
-        return payload.profile_types;
-    };
-    const contactBadgeKeywords = [
-        "Email",
-        "WhatsApp",
-        "Whatsapp",
-        "Phone",
-        "LINE",
-        "Line",
-        "Viber",
-        "Zalo",
-        "Facebook",
-    ];
-    const isVisible = (element) => {
-        if (!(element instanceof HTMLElement)) {
-            return false;
-        }
-        const style = window.getComputedStyle(element);
-        if (style.display === "none" || style.visibility === "hidden") {
-            return false;
-        }
-        const rect = element.getBoundingClientRect();
-        return rect.width > 0 && rect.height > 0;
-    };
-    const resolveClickable = (element, container) => {
-        let current = element;
-        while (current instanceof HTMLElement && current !== container) {
-            const tagName = current.tagName.toLowerCase();
-            if (
-                tagName === "button"
-                || tagName === "a"
-                || current.classList.contains("cursor-pointer")
-                || current.getAttribute("role") === "button"
-                || typeof current.onclick === "function"
-            ) {
-                return current;
-            }
-            current = current.parentElement;
-        }
-        return element instanceof HTMLElement ? element : null;
-    };
-    const reportBadge = (entry) => {
-        pushCapture("badgeEvents", {
-            pageUrl: location.href,
-            detected: Boolean(entry && entry.detected),
-            clicked: Boolean(entry && entry.clicked),
-            strategy: typeof entry?.strategy === "string" ? entry.strategy : "",
-        });
-    };
-    const monitorContactBadge = () => {
-        const root = window.__linkGlancerCapture;
-        const container = document.querySelector("#creator-detail-profile-container");
-        if (!(container instanceof HTMLElement)) {
-            return;
-        }
-        if (root.badgeClickPageUrl === location.href) {
-            return;
-        }
-        const icons = Array.from(
-            container.querySelectorAll("div.cursor-pointer svg[class*='alliance-icon-']"),
-        );
-        for (const icon of icons) {
-            if (!(icon instanceof SVGElement)) {
-                continue;
-            }
-            const className = icon.getAttribute("class") || "";
-            const matchedKeyword = contactBadgeKeywords.find(
-                (keyword) => className.includes(keyword),
-            );
-            if (!matchedKeyword) {
-                continue;
-            }
-            const target = resolveClickable(icon.parentElement || icon, container);
-            if (!(target instanceof HTMLElement) || !isVisible(target)) {
-                reportBadge({
-                    detected: true,
-                    clicked: false,
-                    strategy: `observer:${matchedKeyword}:not_visible`,
-                });
-                return;
-            }
-            try {
-                root.badgeClickPageUrl = location.href;
-                target.click();
-                reportBadge({
-                    detected: true,
-                    clicked: true,
-                    strategy: `observer:${matchedKeyword}:click`,
-                });
-            } catch {
-                root.badgeClickPageUrl = "";
-                reportBadge({
-                    detected: true,
-                    clicked: false,
-                    strategy: `observer:${matchedKeyword}:visible`,
-                });
-            }
-            return;
-        }
-    };
-    const handlePayload = (url, pageUrl, payload, bodyText) => {
-        if (!payload || typeof payload !== "object") {
-            return;
-        }
-        let pathname = "";
-        try {
-            pathname = new URL(url, location.href).pathname;
-        } catch {
-            pathname = "";
-        }
-        if (pathname === "/api/v1/oec/affiliate/creator/marketplace/profile") {
-            pushCapture("profileResponses", {
-                url,
-                pageUrl,
-                payload,
-                profileTypes: parseProfileTypes(bodyText),
-            });
-            return;
-        }
-        if (pathname === "/api_sens/v1/affiliate/cmp/contact") {
-            pushCapture("contactResponses", {
-                url,
-                pageUrl,
-                payload,
-                creatorId: new URL(url, location.href).searchParams.get("creator_oecuid") || "",
-            });
-        }
-    };
-
-    const originalFetch = window.fetch.bind(window);
-    window.fetch = async (...args) => {
-        const request = args[0];
-        const init = args[1];
-        let url = "";
-        let bodyText = "";
-        try {
-            if (typeof request === "string") {
-                url = request;
-            } else if (request && typeof request.url === "string") {
-                url = request.url;
-            }
-            if (init && typeof init.body === "string") {
-                bodyText = init.body;
-            } else if (request && typeof request.clone === "function") {
-                const clonedRequest = request.clone();
-                bodyText = await clonedRequest.text();
-            }
-        } catch {}
-        const response = await originalFetch(...args);
-        try {
-            const clonedResponse = response.clone();
-            const payload = await clonedResponse.json();
-            handlePayload(response.url || url, location.href, payload, bodyText);
-        } catch {}
-        return response;
-    };
-
-    const originalOpen = XMLHttpRequest.prototype.open;
-    const originalSend = XMLHttpRequest.prototype.send;
-    XMLHttpRequest.prototype.open = function(method, url, ...rest) {
-        this.__linkGlancerUrl = typeof url === "string" ? url : "";
-        return originalOpen.call(this, method, url, ...rest);
-    };
-    XMLHttpRequest.prototype.send = function(body) {
-        this.__linkGlancerBodyText = typeof body === "string" ? body : "";
-        this.addEventListener("loadend", () => {
-            try {
-                const payload = parseJsonText(this.responseText);
-                handlePayload(
-                    this.responseURL || this.__linkGlancerUrl || "",
-                    location.href,
-                    payload,
-                    this.__linkGlancerBodyText || "",
-                );
-            } catch {}
-        });
-        return originalSend.call(this, body);
-    };
-    monitorContactBadge();
-    const badgeObserver = new MutationObserver(() => {
-        monitorContactBadge();
-    });
-    badgeObserver.observe(document.documentElement, {
-        childList: true,
-        subtree: true,
-        attributes: true,
-    });
-})();
-"""
-
-
-def _query_param(url: str, key: str) -> str:
-    try:
-        values = parse_qs(urlsplit(url).query).get(key)
-    except ValueError:
-        return ""
-    if not values:
-        return ""
-    return str(values[0] or "").strip()
-
-
-def _contact_patch(payload: dict[str, object]) -> _ParsedContactPayload:
-    contact_info = payload.get("contact_info")
-    if not isinstance(contact_info, list):
-        return _ParsedContactPayload(
-            patch={}, total_entries=0, valued_entries=0, recognized_entries=0
-        )
-    grouped: dict[str, list[str]] = {}
-    valued_entries = 0
-    recognized_entries = 0
-    for item in contact_info:
-        if not isinstance(item, dict):
-            continue
-        field = item.get("field")
-        value = str(item.get("value") or "").strip()
-        if not value:
-            continue
-        valued_entries += 1
-        try:
-            field_number = int(field)
-        except (TypeError, ValueError):
-            continue
-        recognized_entries += 1
-        field_name = KNOWN_CONTACT_FIELD_MAP.get(field_number, f"contact_{field_number}")
-        grouped.setdefault(field_name, [])
-        if value not in grouped[field_name]:
-            grouped[field_name].append(value)
-    return _ParsedContactPayload(
-        patch={
-            field_name: values[0] if len(values) == 1 else "; ".join(values)
-            for field_name, values in grouped.items()
-        },
-        total_entries=len(contact_info),
-        valued_entries=valued_entries,
-        recognized_entries=recognized_entries,
-    )
-
-
-def _format_contact_available(value: bool | None) -> str:
-    if value is True:
-        return "true"
-    if value is False:
-        return "false"
-    return "unknown"
-
-
-def _normalized_region(raw: object) -> str:
-    return str(raw or "").strip().upper()
-
-
-def _normalized_creator_id(raw: object) -> str:
-    value = str(raw or "").strip()
-    if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
-        value = value[1:-1].strip()
-    return value
-
-
-def _sorted_items_by_region(items: list[TaskItem]) -> list[TaskItem]:
-    def sort_key(item: TaskItem) -> tuple[int, str, int]:
-        region = _normalized_region(item.task_data.get("selection_region"))
-        if not region:
-            return (1, "ZZZ", item.task_index)
-        return (0, region, item.task_index)
-
-    return sorted(items, key=sort_key)
-
-
-def _remaining_regions_from_items(items: list[TaskItem]) -> list[str]:
-    result: list[str] = []
-    seen: set[str] = set()
-    for item in items:
-        region = _normalized_region(item.task_data.get("selection_region")) or "UNKNOWN"
-        if region in seen:
-            continue
-        seen.add(region)
-        result.append(region)
-    return result
-
-
-def _parse_datetime(raw: object) -> datetime | None:
-    if not isinstance(raw, str) or not raw.strip():
-        return None
-    try:
-        return datetime.fromisoformat(raw)
-    except ValueError:
-        return None
