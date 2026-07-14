@@ -3,17 +3,20 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QProcess, Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QColor, QFontMetrics
+from PySide6.QtCore import QObject, QPoint, QProcess, Qt, QThread, QTimer, Signal
+from PySide6.QtGui import QAction, QColor, QFontMetrics
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QDialog,
     QFileDialog,
     QHBoxLayout,
     QHeaderView,
     QLabel,
     QMainWindow,
+    QMenu,
     QMessageBox,
+    QPlainTextEdit,
     QProgressDialog,
     QPushButton,
     QStackedWidget,
@@ -228,8 +231,20 @@ class MainWindow(QMainWindow):
             self._task_data_table,
             focus_policy=Qt.FocusPolicy.StrongFocus,
         )
+        self._task_data_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectItems)
+        self._task_data_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self._task_data_table.horizontalHeader().setSectionsMovable(False)
-        self._task_data_table.doubleClicked.connect(self._confirm_jump_task_progress_from_table)
+        self._task_data_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._task_data_table.customContextMenuRequested.connect(
+            self._show_task_data_table_context_menu
+        )
+        self._task_data_table.horizontalHeader().sectionClicked.connect(
+            self._select_task_data_table_column
+        )
+        self._task_data_table.verticalHeader().sectionClicked.connect(
+            self._select_task_data_table_row
+        )
+        self._task_data_table.doubleClicked.connect(self._show_task_data_table_full_content)
         layout.addWidget(self._task_data_table, stretch=1)
 
         actions = QHBoxLayout()
@@ -809,6 +824,107 @@ class MainWindow(QMainWindow):
         )
         self._refresh_task_page()
         self.statusBar().showMessage(f"检查进度已调整到第 {task_index} 条", 4000)
+
+    def _select_task_data_table_row(self, row: int) -> None:
+        if row < 0:
+            return
+        self._task_data_table.selectRow(row)
+
+    def _select_task_data_table_column(self, column: int) -> None:
+        if column < 0:
+            return
+        self._task_data_table.selectColumn(column)
+
+    def _show_task_data_table_context_menu(self, position: QPoint) -> None:
+        item = self._task_data_table.itemAt(position)
+        if item is not None:
+            if not item.isSelected():
+                self._task_data_table.clearSelection()
+            self._task_data_table.setCurrentItem(item)
+        menu = QMenu(self)
+        copy_action = QAction("复制", self)
+        copy_action.triggered.connect(self._copy_task_data_table_selection)
+        menu.addAction(copy_action)
+
+        view_action = QAction("查看完整内容", self)
+        current_item = self._task_data_table.currentItem()
+        has_full_text = current_item is not None and bool(current_item.text())
+        view_action.setEnabled(has_full_text)
+        view_action.triggered.connect(self._show_task_data_table_full_content)
+        menu.addAction(view_action)
+
+        jump_action = QAction("调整检查进度到这", self)
+        jump_action.setEnabled(self._can_jump_task_progress_from_table())
+        jump_action.triggered.connect(self._confirm_jump_task_progress_from_table)
+        menu.addAction(jump_action)
+        menu.exec(self._task_data_table.viewport().mapToGlobal(position))
+
+    def _copy_task_data_table_selection(self) -> None:
+        text = self._serialize_task_data_table_selection()
+        if not text:
+            return
+        QApplication.clipboard().setText(text)
+        self.statusBar().showMessage("已复制表格内容", 2000)
+
+    def _serialize_task_data_table_selection(self) -> str:
+        selected_indexes = self._task_data_table.selectedIndexes()
+        if not selected_indexes:
+            current_item = self._task_data_table.currentItem()
+            return current_item.text() if current_item is not None else ""
+
+        rows = sorted({index.row() for index in selected_indexes})
+        columns = sorted({index.column() for index in selected_indexes})
+        selected_positions = {(index.row(), index.column()) for index in selected_indexes}
+        lines: list[str] = []
+        for row in rows:
+            values: list[str] = []
+            for column in columns:
+                if (row, column) not in selected_positions:
+                    values.append("")
+                    continue
+                item = self._task_data_table.item(row, column)
+                values.append("" if item is None else item.text())
+            lines.append("\t".join(values))
+        return "\n".join(lines)
+
+    def _can_jump_task_progress_from_table(self) -> bool:
+        if not self.task:
+            return False
+        row = self._task_data_table.currentRow()
+        if row < 0:
+            return False
+        task_index_label = self._task_data_table.verticalHeaderItem(row)
+        if task_index_label is None:
+            return False
+        try:
+            task_index = int(task_index_label.text())
+        except ValueError:
+            return False
+        return task_index != self.task.current_task_index
+
+    def _show_task_data_table_full_content(self, *_args: object) -> None:
+        current_item = self._task_data_table.currentItem()
+        if current_item is None or not current_item.text():
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle("完整内容")
+        dialog.resize(288, 252)
+        layout = QVBoxLayout(dialog)
+        self._configure_page_layout(layout)
+
+        editor = QPlainTextEdit(current_item.text())
+        editor.setReadOnly(True)
+        editor.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
+        layout.addWidget(editor, stretch=1)
+
+        close_button = QPushButton("关闭")
+        close_button.clicked.connect(dialog.accept)
+        actions = QHBoxLayout()
+        actions.setContentsMargins(0, 0, 0, 0)
+        actions.addStretch(1)
+        actions.addWidget(close_button)
+        layout.addLayout(actions)
+        dialog.exec()
 
     def _task_progress_completed(self, task: TaskDetail) -> int:
         return self._display_completed_items(
