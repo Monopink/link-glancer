@@ -19,14 +19,14 @@ def create_application() -> QApplication:
         Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
     )
     app = QApplication([])
-    app.setApplicationName("Link Glancer")
-    app.setOrganizationName("Link Glancer")
+    app.setApplicationName("LinkGlancer")
+    app.setOrganizationName("LinkGlancer")
     instance_registration = register_instance()
     icon_path = bundled_asset_path("packaging", "icon.svg")
     if icon_path.exists():
         app.setWindowIcon(QIcon(str(icon_path)))
     tray_icon = QSystemTrayIcon(app.windowIcon(), app)
-    tray_icon.setToolTip("Link Glancer")
+    tray_icon.setToolTip("LinkGlancer")
     tray_icon.show()
     app.setStyle(QStyleFactory.create("Fusion"))
     apply_application_font(app)

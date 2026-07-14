@@ -58,7 +58,7 @@ xcrun notarytool submit "$ZIP_PATH" --keychain-profile "$NOTARY_PROFILE" --wait
 xcrun stapler staple "$APP_PATH"
 
 hdiutil create \
-  -volname "Link Glancer" \
+  -volname "LinkGlancer" \
   -srcfolder "$APP_PATH" \
   -ov -format UDZO \
   "$DMG_PATH"

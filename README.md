@@ -1,6 +1,6 @@
-# Link Glancer
+# LinkGlancer
 
-Link Glancer is a desktop application for human URL review.
+LinkGlancer is a desktop application for human URL review.
 
 It imports rows from an `xlsx` workbook into SQLite, opens review targets in a controlled browser session, records manual review results, and exports a new `xlsx` file with the final data.
 
