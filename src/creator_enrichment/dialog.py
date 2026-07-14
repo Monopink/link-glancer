@@ -195,18 +195,18 @@ class CreatorEnrichmentDialog(QDialog):
         actions.setSpacing(12)
         self._skip_button = QPushButton("跳过")
         self._skip_button.clicked.connect(self._skip_current)
+        self._retry_button = QPushButton("重试")
+        self._retry_button.clicked.connect(self._retry_current)
         self._pause_button = QPushButton("暂停")
         self._pause_button.clicked.connect(self._pause)
         self._continue_button = QPushButton("继续")
         self._continue_button.clicked.connect(self._resume)
-        self._retry_button = QPushButton("重试")
-        self._retry_button.clicked.connect(self._retry_current)
         close_button = QPushButton("关闭")
         close_button.clicked.connect(self.close)
         actions.addWidget(self._skip_button)
+        actions.addWidget(self._retry_button)
         actions.addWidget(self._pause_button)
         actions.addWidget(self._continue_button)
-        actions.addWidget(self._retry_button)
         actions.addStretch(1)
         actions.addWidget(close_button)
         root.addLayout(actions)
@@ -319,19 +319,19 @@ class CreatorEnrichmentDialog(QDialog):
         self._status_label.setText(self._display_status_text(status))
         self._refresh_time_labels_if_needed(force=True)
         controls_ready = not self._startup_pending
-        self._continue_button.setEnabled(controls_ready and status.running and status.paused)
-        self._retry_button.setEnabled(
-            controls_ready
-            and status.running
-            and status.paused
-            and status.current_task_index is not None
+        is_interrupted = status.attention_required
+        is_manual_pause = (
+            status.running and status.paused and not status.completed and not is_interrupted
         )
-        self._skip_button.setEnabled(
+        can_handle_current = (
             controls_ready
             and status.running
             and not status.completed
             and status.current_task_index is not None
         )
+        self._continue_button.setEnabled(controls_ready and is_manual_pause)
+        self._retry_button.setEnabled(can_handle_current and is_interrupted)
+        self._skip_button.setEnabled(can_handle_current and (is_interrupted or is_manual_pause))
         self._pause_button.setEnabled(
             controls_ready and status.running and not status.completed and not status.paused
         )
@@ -423,7 +423,7 @@ class CreatorEnrichmentDialog(QDialog):
 
     def _show_issue_dialog_if_needed(self) -> None:
         status = self._status
-        if not status.attention_required or not status.diagnostic_text:
+        if not status.attention_required:
             return
         dialog_key = (
             status.current_task_index,
@@ -434,6 +434,16 @@ class CreatorEnrichmentDialog(QDialog):
         if dialog_key == self._last_issue_dialog_key:
             return
         self._last_issue_dialog_key = dialog_key
+        if status.pause_reason in {"captcha", "region_mismatch"}:
+            QMessageBox.information(
+                self,
+                self._issue_dialog_title(status),
+                self._issue_dialog_message(status),
+            )
+            self._send_command({"cmd": "retry"})
+            return
+        if not status.diagnostic_text:
+            return
         dialog = _IssueDialog(
             title=self._issue_dialog_title(status),
             user_message=self._issue_dialog_message(status),
@@ -453,19 +463,14 @@ class CreatorEnrichmentDialog(QDialog):
 
     def _issue_dialog_message(self, status: _EnrichmentWorkerStatus) -> str:
         if status.pause_reason == "captcha":
-            return (
-                "程序检测到验证码，当前无法继续自动采集。"
-                "请先在浏览器中完成验证，再返回补充采集窗口点击“继续”。"
-            )
+            return "请在浏览器中完成验证。\n是否准备好重试？"
         if status.pause_reason == "region_mismatch":
+            target_region = status.current_region or "目标区域"
             return (
-                "当前页面的店铺区域与达人数据区域不一致。"
-                "请切换到正确区域后，再返回补充采集窗口点击“继续”。"
+                f"当前页面的店铺区域与达人数据区域不一致，请切换区域：{target_region}。\n"
+                "是否准备好重试？"
             )
-        return (
-            "当前达人的补充采集出现异常，程序已暂停等待人工处理。"
-            "请根据下方详细信息检查页面和接口情况，处理完成后再点击“重试”或“继续”。"
-        )
+        return "当前达人的补充采集出现异常已暂停，请进行检查并重试或跳过。"
 
     def _send_command(self, payload: dict[str, object]) -> None:
         if self._process.state() != QProcess.ProcessState.Running:
@@ -560,7 +565,7 @@ class _IssueDialog(QDialog):
         summary_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         root.addWidget(summary_label)
 
-        details_label = QLabel("详细排查信息")
+        details_label = QLabel("开发者详细排查信息")
         root.addWidget(details_label)
 
         self._tabs = QTabWidget()

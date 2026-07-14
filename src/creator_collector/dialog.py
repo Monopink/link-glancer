@@ -342,14 +342,17 @@ class CreatorCollectorProgressDialog(QDialog):
         summary_bottom.addStretch(1)
         controls_box.addLayout(summary_bottom)
 
-        self._auto_scroll_button = _create_action_button("暂停自动滚动")
+        self._pause_auto_scroll_button = _create_action_button("暂停")
+        self._resume_auto_scroll_button = _create_action_button("继续")
         self._save_create_button = _create_action_button("保存并创建任务")
-        self._auto_scroll_button.clicked.connect(self._toggle_auto_scroll)
+        self._pause_auto_scroll_button.clicked.connect(self._pause_auto_scroll)
+        self._resume_auto_scroll_button.clicked.connect(self._resume_auto_scroll)
         self._save_create_button.clicked.connect(self._save_and_create_task)
         actions = QHBoxLayout()
         actions.setContentsMargins(0, 0, 0, 0)
         actions.setSpacing(12)
-        actions.addWidget(self._auto_scroll_button)
+        actions.addWidget(self._pause_auto_scroll_button)
+        actions.addWidget(self._resume_auto_scroll_button)
         actions.addStretch(1)
         actions.addWidget(self._save_create_button)
         controls_box.addLayout(actions)
@@ -519,11 +522,14 @@ class CreatorCollectorProgressDialog(QDialog):
         self._status_label.setText(self._display_status_text(status))
         auto_scroll_active = status.running and not status.completed
         controls_ready = not self._startup_pending
-        self._auto_scroll_button.setEnabled(
+        auto_scroll_controls_enabled = (
             controls_ready and auto_scroll_active and not self._is_saving()
         )
-        self._auto_scroll_button.setText(
-            "暂停自动滚动" if status.auto_scroll_enabled else "继续自动滚动"
+        self._pause_auto_scroll_button.setEnabled(
+            auto_scroll_controls_enabled and status.auto_scroll_enabled
+        )
+        self._resume_auto_scroll_button.setEnabled(
+            auto_scroll_controls_enabled and not status.auto_scroll_enabled
         )
         has_rows = status.collected_count > 0
         self._save_create_button.setEnabled(controls_ready and has_rows and not self._is_saving())
@@ -569,19 +575,19 @@ class CreatorCollectorProgressDialog(QDialog):
         self.last_auto_advance_interval_seconds = value
         self._send_command({"cmd": "update_interval", "value": value})
 
-    def _toggle_auto_scroll(self) -> None:
+    def _pause_auto_scroll(self) -> None:
+        self._send_command({"cmd": "pause"})
+
+    def _resume_auto_scroll(self) -> None:
         status = self._status
-        if status.auto_scroll_enabled:
-            self._send_command({"cmd": "pause"})
-        else:
-            if status.collected_count >= max(status.safety_limit, 1):
-                QMessageBox.information(
-                    self,
-                    "已达到单次上限",
-                    "当前已达到单次上限，需要调整上限或先保存并创建任务后继续。",
-                )
-                return
-            self._send_command({"cmd": "resume"})
+        if status.collected_count >= max(status.safety_limit, 1):
+            QMessageBox.information(
+                self,
+                "已达到单次上限",
+                "当前已达到单次上限，需要调整上限或先保存并创建任务后继续。",
+            )
+            return
+        self._send_command({"cmd": "resume"})
 
     def _save_and_create_task(self) -> None:
         if self._is_saving():
@@ -800,7 +806,7 @@ class CreatorCollectorProgressDialog(QDialog):
 
     def _update_window_title(self) -> None:
         suffix = f" {self._instance_id}" if self._instance_id > 1 else ""
-        title = f"Link Glancer{suffix} - Profile: {self._browser_config.name}"
+        title = f"LinkGlancer{suffix} - Profile: {self._browser_config.name}"
         self.setWindowTitle(title)
 
 
