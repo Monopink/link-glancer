@@ -38,7 +38,7 @@ from link_glancer.runtime.locks import (
 from link_glancer.tasks.models import BrowserConfig
 
 DEFAULT_CREATOR_PAGE_URL = ""
-DEFAULT_COLLECTION_EXPORT_NAME = "creator_{timestamp}.xlsx"
+DEFAULT_COLLECTION_EXPORT_NAME = "collection_{timestamp}.xlsx"
 COLLECTION_POLL_INTERVAL_MS = 1000
 TIME_LABEL_REFRESH_INTERVAL_SECONDS = 5
 FORM_FIELD_FULL_WIDTH = 420
@@ -316,7 +316,7 @@ class CreatorCollectorDialog(QDialog):
         )
 
     def _default_export_path(self) -> Path:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M")
         filename = DEFAULT_COLLECTION_EXPORT_NAME.format(timestamp=timestamp)
         saved_dir = self._load_saved_export_dir()
         return (saved_dir or Path.cwd()) / filename
@@ -798,7 +798,7 @@ class CreatorCollectorProgressDialog(QDialog):
         return "暂停滚动中"
 
     def _default_export_path(self) -> Path:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M")
         filename = DEFAULT_COLLECTION_EXPORT_NAME.format(timestamp=timestamp)
         saved_dir = self._load_saved_export_dir()
         return (saved_dir or Path.cwd()) / filename
