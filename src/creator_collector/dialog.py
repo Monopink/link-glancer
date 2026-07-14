@@ -658,8 +658,15 @@ class CreatorCollectorProgressDialog(QDialog):
         self._send_command({"cmd": "pause"})
 
     def _resume_auto_scroll(self) -> None:
+        self._commit_safety_limit_edit()
         status = self._status
-        if status.collected_count >= max(status.safety_limit, 1):
+        effective_limit = max(
+            self._pending_safety_limit
+            if self._pending_safety_limit is not None
+            else int(self._safety_limit_spin.value()),
+            1,
+        )
+        if status.collected_count >= effective_limit:
             QMessageBox.information(
                 self,
                 "已达到单次上限",
@@ -667,6 +674,10 @@ class CreatorCollectorProgressDialog(QDialog):
             )
             return
         self._send_command({"cmd": "resume"})
+
+    def _commit_safety_limit_edit(self) -> None:
+        self._safety_limit_spin.interpretText()
+        self._apply_safety_limit()
 
     def _save_and_create_task(self) -> None:
         if self._is_saving():
