@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from pathlib import Path
 
 
 @dataclass(slots=True)
@@ -24,9 +23,7 @@ class CreatorCollectionStatus:
     safety_limit: int
     auto_advance_interval_seconds: float
     last_message: str
-    rows: list[dict[str, object]]
     started_at: datetime | None = None
     ended_at: datetime | None = None
     estimated_total_count: int | None = None
     estimated_end_at: datetime | None = None
-    backup_path: Path | None = None

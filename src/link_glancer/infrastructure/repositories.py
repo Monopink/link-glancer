@@ -7,6 +7,8 @@ from link_glancer.tasks.exporter import export_task_results, export_task_results
 from link_glancer.tasks.models import (
     BrowserConfig,
     BrowserProfile,
+    CreatorCollectionRecovery,
+    CreatorCollectionSessionSummary,
     ReviewRecord,
     TaskDetail,
     TaskItem,
@@ -190,6 +192,83 @@ class TaskRepository:
 
     def save_app_setting(self, key: str, value: object) -> None:
         database.save_app_setting(self.database_path, key, value)
+
+    def create_creator_collection_session(
+        self,
+        *,
+        browser_config_id: str,
+        page_url: str,
+        safety_limit: int,
+        auto_advance_interval_seconds: float,
+        last_message: str,
+    ) -> int:
+        return database.create_creator_collection_session(
+            self.database_path,
+            browser_config_id=browser_config_id,
+            page_url=page_url,
+            safety_limit=safety_limit,
+            auto_advance_interval_seconds=auto_advance_interval_seconds,
+            last_message=last_message,
+        )
+
+    def append_creator_collection_session_rows(
+        self,
+        *,
+        session_id: int,
+        rows: list[tuple[str, dict[str, object]]],
+    ) -> int:
+        return database.append_creator_collection_session_rows(
+            self.database_path,
+            session_id=session_id,
+            rows=rows,
+        )
+
+    def update_creator_collection_session(
+        self,
+        *,
+        session_id: int,
+        status: str,
+        collected_count: int,
+        pages_fetched: int,
+        safety_limit: int,
+        auto_advance_interval_seconds: float,
+        last_message: str,
+    ) -> None:
+        database.update_creator_collection_session(
+            self.database_path,
+            session_id=session_id,
+            status=status,
+            collected_count=collected_count,
+            pages_fetched=pages_fetched,
+            safety_limit=safety_limit,
+            auto_advance_interval_seconds=auto_advance_interval_seconds,
+            last_message=last_message,
+        )
+
+    def load_pending_creator_collection_recovery(self) -> CreatorCollectionRecovery | None:
+        return database.load_pending_creator_collection_recovery(self.database_path)
+
+    def load_creator_collection_session_rows(self, *, session_id: int) -> list[dict[str, object]]:
+        return database.load_creator_collection_session_rows(
+            self.database_path,
+            session_id=session_id,
+        )
+
+    def load_creator_collection_session_summary(
+        self,
+        *,
+        session_id: int,
+    ) -> CreatorCollectionSessionSummary:
+        return database.load_creator_collection_session_summary(
+            self.database_path,
+            session_id=session_id,
+        )
+
+    def finalize_creator_collection_session(self, *, session_id: int) -> None:
+        database.finalize_creator_collection_session(self.database_path, session_id=session_id)
+
+    def discard_creator_collection_session(self, *, session_id: int) -> None:
+        database.discard_creator_collection_session(self.database_path, session_id=session_id)
 
 
 class BrowserConfigRepository:

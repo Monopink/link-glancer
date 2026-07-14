@@ -13,7 +13,6 @@ from creator_collector.exporter import (
     dedupe_creator_rows,
     export_collection_to_path,
     export_collection_to_xlsx,
-    save_backup_json,
 )
 from creator_collector.models import CreatorCollectionConfig, CreatorCollectionStatus
 from link_glancer.browser.detector import detect_browser
@@ -23,7 +22,6 @@ from link_glancer.tasks.models import BrowserConfig
 REQUEST_API_PATH = "/api/v1/oec/affiliate/creator/marketplace/find"
 DEFAULT_SAFETY_LIMIT = 1000
 MAX_REPEAT_PAGES = 2
-BACKUP_INTERVAL_SECONDS = 5
 RESPONSE_WAIT_SECONDS = 8
 AUTO_ADVANCE_INTERVAL_SECONDS = 1.5
 MIN_AUTO_ADVANCE_INTERVAL_SECONDS = 0.3
@@ -33,6 +31,23 @@ PLAYWRIGHT_ALLOWED_DEFAULT_ARGS = [
     "--disable-extensions",
     "--disable-component-extensions-with-background-pages",
 ]
+BLOCKED_RESOURCE_TYPES = {"image", "media"}
+BLOCKED_RESOURCE_HOSTS = {
+    "p16-common-sign.tiktokcdn.com",
+    "p19-common-sign.tiktokcdn.com",
+    "p16-oec-sg.ibyteimg.com",
+    "p16-oec-va.ibyteimg.com",
+    "p19-oec-va.ibyteimg.com",
+}
+BLOCKED_RESOURCE_PATH_MARKERS = (
+    "/tos-alisg-p-0037/",
+    "/tos-alisg-avt-0068/",
+    "/tplv-noop.image",
+    ".webp",
+    ".jpeg",
+    ".jpg",
+    ".png",
+)
 
 
 @dataclass(slots=True)
@@ -54,13 +69,11 @@ class CreatorCollectorSession:
         self._interrupted = False
         self._completed = False
         self._last_message = "未启动"
-        self._backup_path: Path | None = None
         self._started_at: datetime | None = None
         self._ended_at: datetime | None = None
         self._estimated_total_count: int | None = None
-        self._last_backup_saved_at: datetime | None = None
-        self._rows_dirty = False
         self._row_keys: set[str] = set()
+        self._pending_persist_rows: list[tuple[str, dict[str, object]]] = []
         self._captured_responses: list[_CapturedResponse] = []
         self._next_capture_id = 0
         self._last_processed_capture_id = 0
@@ -71,6 +84,9 @@ class CreatorCollectorSession:
         self._repeat_page_hits = 0
         self._safety_limit = DEFAULT_SAFETY_LIMIT
         self._auto_advance_interval_seconds = AUTO_ADVANCE_INTERVAL_SECONDS
+        self._collection_started = False
+        self._route_installed = False
+        self._collection_mode_installed = False
 
     def start(
         self,
@@ -116,12 +132,13 @@ class CreatorCollectorSession:
             self._started_at = datetime.now(UTC)
             self._ended_at = None
             self._estimated_total_count = None
-            self._last_backup_saved_at = None
-            self._rows_dirty = False
             self._safety_limit = max(config.safety_limit, 1)
             self._auto_advance_interval_seconds = _normalize_auto_advance_interval(
                 config.auto_advance_interval_seconds
             )
+            self._collection_started = False
+            self._route_installed = False
+            self._collection_mode_installed = False
             self._last_message = (
                 "浏览器已启动，请确认登录、筛选与页面状态。" if paused else "等待第一页列表请求。"
             )
@@ -136,7 +153,6 @@ class CreatorCollectorSession:
         if not self._ensure_runtime_alive():
             return self.status()
 
-        self._flush_backup(force=False)
         if len(self._rows) >= self._safety_limit and not self._interrupted:
             self._interrupt_with_message(
                 f"已达到上限 {self._safety_limit} 条，可调整上限后继续采集。"
@@ -144,7 +160,6 @@ class CreatorCollectorSession:
             return self.status()
 
         if self._consume_pending_responses():
-            self._flush_backup(force=False)
             return self.status()
 
         if self._completed or self._interrupted or not self._auto_scroll_enabled:
@@ -179,6 +194,9 @@ class CreatorCollectorSession:
                 "请先调高上限后再继续。"
             )
             return self.status()
+        self._ensure_resource_blocking()
+        self._collection_started = True
+        self._ensure_collection_mode()
         self._auto_scroll_enabled = True
         self._interrupted = False
         self._waiting_for_response = False
@@ -208,7 +226,6 @@ class CreatorCollectorSession:
         return self.status()
 
     def stop(self) -> CreatorCollectionStatus:
-        self._flush_backup(force=True)
         if self._started_at is not None and self._ended_at is None:
             self._ended_at = datetime.now(UTC)
         self._close_runtime(clear_collection_state=False)
@@ -220,7 +237,6 @@ class CreatorCollectorSession:
             raise ValueError("当前没有可导出的采集数据。")
         self._rows = dedupe_creator_rows(self._rows)
         self._row_keys = {_row_identity(row) for row in self._rows}
-        self._flush_backup(force=True)
         output_dir = destination_dir or (ensure_creator_collector_dir() / "exports")
         export_path = export_collection_to_xlsx(self._rows, output_dir)
         self._last_message = f"已导出到 {export_path}"
@@ -231,13 +247,14 @@ class CreatorCollectorSession:
             raise ValueError("当前没有可导出的采集数据。")
         self._rows = dedupe_creator_rows(self._rows)
         self._row_keys = {_row_identity(row) for row in self._rows}
-        self._flush_backup(force=True)
         saved_path = export_collection_to_path(self._rows, export_path)
         self._last_message = f"已导出到 {saved_path}"
         return saved_path
 
     def clear_collected_batch(self) -> CreatorCollectionStatus:
         self._rows.clear()
+        self._row_keys.clear()
+        self._pending_persist_rows.clear()
         self._completed = False
         self._interrupted = False
         self._waiting_for_response = False
@@ -246,9 +263,6 @@ class CreatorCollectorSession:
         self._pages_fetched = 0
         self._repeat_page_hits = 0
         self._estimated_total_count = None
-        self._backup_path = None
-        self._last_backup_saved_at = None
-        self._rows_dirty = False
         self._started_at = datetime.now(UTC) if self._context is not None else None
         self._ended_at = None
         self._auto_scroll_enabled = False
@@ -302,13 +316,23 @@ class CreatorCollectorSession:
             safety_limit=self._safety_limit,
             auto_advance_interval_seconds=self._auto_advance_interval_seconds,
             last_message=self._last_message,
-            rows=list(self._rows),
             started_at=self._started_at,
             ended_at=self._ended_at,
             estimated_total_count=estimated_total_count,
             estimated_end_at=estimated_end_at,
-            backup_path=self._backup_path,
         )
+
+    def collection_state(self) -> str:
+        if self._completed:
+            return "finalizing"
+        if self._interrupted:
+            return "interrupted"
+        return "active"
+
+    def drain_pending_persist_rows(self) -> list[tuple[str, dict[str, object]]]:
+        pending = list(self._pending_persist_rows)
+        self._pending_persist_rows.clear()
+        return pending
 
     def shutdown(self) -> None:
         self._close_runtime(clear_collection_state=True)
@@ -330,6 +354,9 @@ class CreatorCollectorSession:
         self._page = None
         self._config = None
         self._auto_scroll_enabled = False
+        self._collection_started = False
+        self._route_installed = False
+        self._collection_mode_installed = False
         self._interrupted = False
         self._waiting_for_response = False
         self._waiting_started_at = None
@@ -339,10 +366,9 @@ class CreatorCollectorSession:
             self._started_at = None
             self._ended_at = None
             self._estimated_total_count = None
-            self._last_backup_saved_at = None
-            self._rows_dirty = False
             self._row_keys.clear()
             self._rows.clear()
+            self._pending_persist_rows.clear()
             self._captured_responses.clear()
             self._next_capture_id = 0
             self._last_processed_capture_id = 0
@@ -402,6 +428,34 @@ class CreatorCollectorSession:
                 break
         return True
 
+    def _handle_route(self, route) -> None:
+        try:
+            request = route.request
+            if self._collection_started and (
+                request.resource_type in BLOCKED_RESOURCE_TYPES
+                or _should_block_resource_url(request.url)
+            ):
+                route.abort()
+                return
+        except PlaywrightError:
+            pass
+        route.continue_()
+
+    def _ensure_resource_blocking(self) -> None:
+        if self._context is None or self._route_installed:
+            return
+        self._context.route("**/*", self._handle_route)
+        self._route_installed = True
+
+    def _ensure_collection_mode(self) -> None:
+        if self._page is None or self._collection_mode_installed:
+            return
+        try:
+            self._page.evaluate(_collection_mode_script())
+        except PlaywrightError:
+            return
+        self._collection_mode_installed = True
+
     def _trigger_page_progress(self) -> None:
         if self._page is None:
             self._interrupt_with_message("浏览器页面不可用，请重新打开采集。")
@@ -410,37 +464,21 @@ class CreatorCollectorSession:
             self._page.evaluate(
                 """
                 () => {
-                    const candidates = Array.from(document.querySelectorAll("*"));
-                    let target = null;
-                    let bestScore = -1;
-                    for (const element of candidates) {
-                        if (!(element instanceof HTMLElement)) continue;
-                        const style = window.getComputedStyle(element);
-                        const overflowY = style.overflowY;
-                        const scrollable =
-                            (overflowY === "auto" || overflowY === "scroll") &&
-                            element.scrollHeight > element.clientHeight + 40;
-                        if (!scrollable) continue;
-                        const rect = element.getBoundingClientRect();
-                        const score = rect.width * rect.height;
-                        if (score > bestScore) {
-                            bestScore = score;
-                            target = element;
-                        }
-                    }
-                    if (target) {
+                    const target =
+                        document.querySelector("#scroll-container") ||
+                        document.scrollingElement ||
+                        document.documentElement ||
+                        document.body;
+                    if (target instanceof HTMLElement) {
                         target.scrollTop = target.scrollHeight;
                         target.dispatchEvent(new Event("scroll", { bubbles: true }));
-                        return "container";
+                        return target.id || "scroll-container";
                     }
                     window.scrollTo(0, document.body.scrollHeight);
                     return "window";
                 }
                 """
             )
-            self._page.keyboard.press("End")
-            self._page.keyboard.press("PageDown")
-            self._page.mouse.wheel(0, 2400)
         except PlaywrightError:
             self._interrupt_with_message("无法触发页面加载，请处理页面后重试。")
             return
@@ -467,6 +505,7 @@ class CreatorCollectorSession:
                 continue
             self._row_keys.add(row_key)
             self._rows.append(item)
+            self._pending_persist_rows.append((row_key, item))
             added_count += 1
 
         self._pages_fetched += 1
@@ -481,9 +520,6 @@ class CreatorCollectorSession:
             self._repeat_page_hits += 1
         else:
             self._repeat_page_hits = 0
-
-        if added_count > 0:
-            self._rows_dirty = True
 
         if not rows:
             self._interrupt_with_message("分页返回空数据，请处理后点继续。")
@@ -549,24 +585,6 @@ class CreatorCollectorSession:
             self._ended_at = datetime.now(UTC)
         self._last_message = message
 
-    def _flush_backup(self, *, force: bool) -> None:
-        if not self._rows or not self._rows_dirty:
-            return
-        now = datetime.now(UTC)
-        if (
-            not force
-            and self._last_backup_saved_at is not None
-            and (now - self._last_backup_saved_at).total_seconds() < BACKUP_INTERVAL_SECONDS
-        ):
-            return
-        backup_root = ensure_creator_collector_dir() / "backups"
-        if self._backup_path is None:
-            timestamp = now.strftime("%Y%m%d_%H%M%S")
-            self._backup_path = backup_root / f"creator_collection_{timestamp}.json"
-        save_backup_json(self._rows, self._backup_path)
-        self._last_backup_saved_at = now
-        self._rows_dirty = False
-
 
 def _matches_request_api(url: str) -> bool:
     return urlsplit(url).path.endswith(REQUEST_API_PATH)
@@ -605,3 +623,108 @@ def _normalize_auto_advance_interval(value: float) -> float:
         max(float(value), MIN_AUTO_ADVANCE_INTERVAL_SECONDS),
         MAX_AUTO_ADVANCE_INTERVAL_SECONDS,
     )
+
+
+def _should_block_resource_url(url: str) -> bool:
+    parts = urlsplit(url)
+    host = parts.netloc.casefold()
+    path = parts.path.casefold()
+    if host in BLOCKED_RESOURCE_HOSTS:
+        return True
+    return any(marker in path for marker in BLOCKED_RESOURCE_PATH_MARKERS)
+
+
+def _collection_mode_script() -> str:
+    return """
+    () => {
+        const installedKey = "__linkGlancerCollectionModeInstalled";
+        if (window[installedKey]) {
+            return;
+        }
+        window[installedKey] = true;
+
+        const style = document.createElement("style");
+        style.id = "link-glancer-collection-mode";
+        style.textContent = `
+            #im-entry,
+            aside,
+            .entryWrapper-Zd4AJg,
+            .core-modal-wrapper,
+            .core-modal-mask,
+            [data-modal-root="true"],
+            [id^="video_preview_"],
+            .video-info-modal__StyleModal-VoRgY,
+            .pulse-avatar-image,
+            .pulse-avatar-image-mask {
+                display: none !important;
+            }
+            #content-container,
+            main,
+            #affiliate_sub_app_container,
+            #modern_sub_app_container_connection,
+            #garfish_app_for_connection_avzm2k5p {
+                max-width: none !important;
+                width: 100% !important;
+            }
+            #scroll-container,
+            main,
+            #affiliate_sub_app_container {
+                overflow-anchor: none !important;
+            }
+            *,
+            *::before,
+            *::after {
+                animation: none !important;
+                transition: none !important;
+                scroll-behavior: auto !important;
+            }
+            img,
+            video,
+            canvas {
+                visibility: hidden !important;
+            }
+        `;
+        document.head.appendChild(style);
+
+        const pruneNode = (node) => {
+            if (!(node instanceof HTMLElement)) {
+                return;
+            }
+            if (
+                node.matches(
+                    ".core-modal-wrapper, .core-modal-mask, "
+                    + "[data-modal-root='true'], [id^='video_preview_']"
+                )
+            ) {
+                node.remove();
+                return;
+            }
+            for (const img of node.querySelectorAll("img")) {
+                img.removeAttribute("src");
+                img.removeAttribute("srcset");
+                img.loading = "lazy";
+            }
+            for (const media of node.querySelectorAll("video, source")) {
+                media.remove();
+            }
+            for (const preview of node.querySelectorAll("[id^='video_preview_']")) {
+                preview.remove();
+            }
+        };
+
+        const listRoot =
+            document.querySelector("#scroll-container") ||
+            document.querySelector("main") ||
+            document.body;
+        pruneNode(document.body);
+        const observer = new MutationObserver((mutations) => {
+            for (const mutation of mutations) {
+                for (const addedNode of mutation.addedNodes) {
+                    pruneNode(addedNode);
+                }
+            }
+        });
+        observer.observe(listRoot, { childList: true, subtree: true });
+        window.__linkGlancerCollectionModeObserver = observer;
+    }
+    """

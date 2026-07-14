@@ -4,12 +4,14 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+from creator_collector.exporter import export_collection_to_path
 from link_glancer.infrastructure.repositories import BrowserConfigRepository, TaskRepository
 from link_glancer.infrastructure.workbooks import WorkbookImporter
 from link_glancer.tasks.export_fields import resolve_export_fields
 from link_glancer.tasks.models import (
     BrowserConfig,
     BrowserProfile,
+    CreatorCollectionRecovery,
     ReviewField,
     ReviewOption,
     ReviewRecord,
@@ -156,6 +158,76 @@ class TaskApplicationService:
             source_path=source_path,
             task_snapshot=task_snapshot,
         )
+        return task_id
+
+    def create_creator_collection_session(
+        self,
+        *,
+        browser_config_id: str,
+        page_url: str,
+        safety_limit: int,
+        auto_advance_interval_seconds: float,
+        last_message: str,
+    ) -> int:
+        return self._tasks.create_creator_collection_session(
+            browser_config_id=browser_config_id,
+            page_url=page_url,
+            safety_limit=safety_limit,
+            auto_advance_interval_seconds=auto_advance_interval_seconds,
+            last_message=last_message,
+        )
+
+    def append_creator_collection_session_rows(
+        self,
+        *,
+        session_id: int,
+        rows: list[tuple[str, dict[str, object]]],
+    ) -> int:
+        return self._tasks.append_creator_collection_session_rows(session_id=session_id, rows=rows)
+
+    def update_creator_collection_session(
+        self,
+        *,
+        session_id: int,
+        status: str,
+        collected_count: int,
+        pages_fetched: int,
+        safety_limit: int,
+        auto_advance_interval_seconds: float,
+        last_message: str,
+    ) -> None:
+        self._tasks.update_creator_collection_session(
+            session_id=session_id,
+            status=status,
+            collected_count=collected_count,
+            pages_fetched=pages_fetched,
+            safety_limit=safety_limit,
+            auto_advance_interval_seconds=auto_advance_interval_seconds,
+            last_message=last_message,
+        )
+
+    def load_pending_creator_collection_recovery(self) -> CreatorCollectionRecovery | None:
+        return self._tasks.load_pending_creator_collection_recovery()
+
+    def discard_creator_collection_session(self, *, session_id: int) -> None:
+        self._tasks.discard_creator_collection_session(session_id=session_id)
+
+    def create_task_from_creator_collection_session(
+        self,
+        *,
+        session_id: int,
+        export_path: Path,
+    ) -> int:
+        summary = self._tasks.load_creator_collection_session_summary(session_id=session_id)
+        rows = self._tasks.load_creator_collection_session_rows(session_id=session_id)
+        if not rows:
+            raise ValueError("当前没有可保存的采集数据。")
+        saved_path = export_collection_to_path(rows, export_path)
+        task_id = self.create_task_from_creator_collection(
+            source_path=saved_path,
+            browser_config_id=summary.browser_config_id,
+        )
+        self._tasks.finalize_creator_collection_session(session_id=session_id)
         return task_id
 
     def load_task(self, task_id: int) -> TaskDetail:

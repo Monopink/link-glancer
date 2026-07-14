@@ -20,7 +20,9 @@ class _CollectorWorkerRuntime:
     def __init__(self) -> None:
         self._app_service = TaskApplicationService.create_default()
         self._session: CreatorCollectorSession | None = None
+        self._collector_session_id: int | None = None
         self._browser_config_id: str | None = None
+        self._page_url = ""
         self._command_queue: queue.Queue[dict[str, object]] = queue.Queue()
         self._stop_event = threading.Event()
         self._stdin_thread = threading.Thread(target=self._read_commands, daemon=True)
@@ -35,10 +37,12 @@ class _CollectorWorkerRuntime:
                 self._process_pending_commands()
                 if self._session is not None:
                     self._session.poll()
+                    self._persist_session_progress()
                 self._push_status_if_needed(force=False)
                 time.sleep(POLL_INTERVAL_SECONDS)
         finally:
             if self._session is not None:
+                self._persist_session_progress(force=True)
                 self._session.shutdown()
             self._push_message({"type": "worker_stopped"})
 
@@ -123,9 +127,18 @@ class _CollectorWorkerRuntime:
             ),
         )
         paused = bool(command.get("paused", False))
+        self._page_url = config.page_url
+        self._collector_session_id = self._app_service.create_creator_collection_session(
+            browser_config_id=browser_config_id,
+            page_url=config.page_url,
+            safety_limit=config.safety_limit,
+            auto_advance_interval_seconds=config.auto_advance_interval_seconds,
+            last_message="采集会话已创建。",
+        )
         self._session = CreatorCollectorSession(browser_config)
         self._browser_config_id = browser_config_id
         status = self._session.start(config, paused=paused)
+        self._persist_session_progress(force=True)
         self._push_status_if_needed(force=True)
         if not status.running:
             self._push_message({"type": "error", "message": status.last_message})
@@ -141,6 +154,10 @@ class _CollectorWorkerRuntime:
         if not self._browser_config_id:
             self._push_message({"type": "error", "message": "缺少浏览器配置。"})
             return
+        if self._collector_session_id is None:
+            self._push_message({"type": "error", "message": "缺少采集会话。"})
+            return
+        self._persist_session_progress(force=True)
         status = self._session.status()
         if status.collected_count <= 0:
             self._push_message({"type": "error", "message": "当前没有可保存的采集数据。"})
@@ -150,12 +167,21 @@ class _CollectorWorkerRuntime:
         self._saving = True
         self._push_status_if_needed(force=True)
         try:
-            saved_path = self._session.finish_to_path(export_path)
-            task_id = self._app_service.create_task_from_creator_collection(
-                source_path=saved_path,
-                browser_config_id=self._browser_config_id,
+            task_id = self._app_service.create_task_from_creator_collection_session(
+                session_id=self._collector_session_id,
+                export_path=export_path,
             )
+            saved_path = export_path
+            session_status = self._session.status()
             self._session.clear_collected_batch()
+            self._collector_session_id = self._app_service.create_creator_collection_session(
+                browser_config_id=self._browser_config_id,
+                page_url=self._page_url,
+                safety_limit=session_status.safety_limit,
+                auto_advance_interval_seconds=session_status.auto_advance_interval_seconds,
+                last_message="已保存并创建任务，可继续采集。",
+            )
+            self._persist_session_progress(force=True)
         except Exception as exc:  # noqa: BLE001
             self._saving = False
             self._push_message({"type": "error", "message": str(exc)})
@@ -182,6 +208,10 @@ class _CollectorWorkerRuntime:
         if not self._browser_config_id:
             self._push_message({"type": "error", "message": "缺少浏览器配置。"})
             return
+        if self._collector_session_id is None:
+            self._push_message({"type": "error", "message": "缺少采集会话。"})
+            return
+        self._persist_session_progress(force=True)
         status = self._session.status()
         if status.collected_count <= 0:
             self._push_message({"type": "error", "message": "当前没有可保存的采集数据。"})
@@ -191,13 +221,14 @@ class _CollectorWorkerRuntime:
         self._saving = True
         self._push_status_if_needed(force=True)
         try:
-            saved_path = self._session.finish_to_path(export_path)
-            task_id = self._app_service.create_task_from_creator_collection(
-                source_path=saved_path,
-                browser_config_id=self._browser_config_id,
+            task_id = self._app_service.create_task_from_creator_collection_session(
+                session_id=self._collector_session_id,
+                export_path=export_path,
             )
+            saved_path = export_path
             self._session.shutdown()
             self._session = None
+            self._collector_session_id = None
             self._browser_config_id = None
         except Exception as exc:  # noqa: BLE001
             self._saving = False
@@ -220,14 +251,39 @@ class _CollectorWorkerRuntime:
             self._push_message({"type": "error", "message": "采集会话未启动。"})
             return
         callback(self._session)
+        self._persist_session_progress(force=True)
         self._push_status_if_needed(force=True)
 
     def _shutdown_session(self) -> None:
+        self._persist_session_progress(force=True)
         if self._session is not None:
             self._session.shutdown()
         self._session = None
+        self._collector_session_id = None
         self._browser_config_id = None
+        self._page_url = ""
         self._saving = False
+
+    def _persist_session_progress(self, *, force: bool = False) -> None:
+        if self._session is None or self._collector_session_id is None:
+            return
+        pending_rows = self._session.drain_pending_persist_rows()
+        if pending_rows:
+            self._app_service.append_creator_collection_session_rows(
+                session_id=self._collector_session_id,
+                rows=pending_rows,
+            )
+        if pending_rows or force:
+            status = self._session.status()
+            self._app_service.update_creator_collection_session(
+                session_id=self._collector_session_id,
+                status=self._session.collection_state(),
+                collected_count=status.collected_count,
+                pages_fetched=status.pages_fetched,
+                safety_limit=status.safety_limit,
+                auto_advance_interval_seconds=status.auto_advance_interval_seconds,
+                last_message=status.last_message,
+            )
 
     def _push_status_if_needed(self, *, force: bool) -> None:
         payload = self._build_status_payload()

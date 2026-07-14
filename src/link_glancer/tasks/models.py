@@ -6,6 +6,7 @@ from typing import Literal
 
 FieldType = Literal["single_select", "multi_select", "text", "boolean"]
 TaskStatus = Literal["ready", "in_progress", "completed"]
+CollectorSessionStatus = Literal["active", "interrupted", "finalizing", "finalized", "discarded"]
 
 
 @dataclass(slots=True)
@@ -111,5 +112,36 @@ class TaskDetail:
     completed_items: int
     current_item: TaskItem | None
     current_review: ReviewRecord | None
+    created_at: str
+    updated_at: str
+
+
+@dataclass(slots=True)
+class CreatorCollectionSessionSummary:
+    session_id: int
+    browser_config_id: str
+    page_url: str
+    status: CollectorSessionStatus
+    collected_count: int
+    pages_fetched: int
+    safety_limit: int
+    auto_advance_interval_seconds: float
+    last_message: str
+    created_at: str
+    updated_at: str
+
+
+@dataclass(slots=True)
+class CreatorCollectionRecovery:
+    session_id: int
+    browser_config_id: str
+    browser_config_name: str
+    page_url: str
+    status: CollectorSessionStatus
+    collected_count: int
+    pages_fetched: int
+    safety_limit: int
+    auto_advance_interval_seconds: float
+    last_message: str
     created_at: str
     updated_at: str

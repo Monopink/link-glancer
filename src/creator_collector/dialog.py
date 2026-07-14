@@ -169,8 +169,11 @@ class CreatorCollectorDialog(QDialog):
         root.addWidget(buttons)
 
         self._restore_defaults()
+        QTimer.singleShot(0, self._handle_pending_recovery)
 
     def _start_collection(self) -> None:
+        if not self._handle_pending_recovery():
+            return
         browser_config = self._selected_browser_config()
         if browser_config is None:
             QMessageBox.warning(self, "缺少浏览器配置", "请先选择浏览器配置。")
@@ -187,6 +190,67 @@ class CreatorCollectorDialog(QDialog):
         self.last_created_task_id = progress_dialog.last_created_task_id
         if self.last_created_task_id is not None:
             self.accept()
+
+    def _handle_pending_recovery(self) -> bool:
+        recovery = self._app_service.load_pending_creator_collection_recovery()
+        if recovery is None:
+            return True
+        result = QMessageBox.question(
+            self,
+            "发现未保存采集数据",
+            "\n".join(
+                [
+                    "检测到上次采集存在未保存数据。",
+                    f"浏览器配置：{recovery.browser_config_name}",
+                    f"页面 URL：{recovery.page_url or '-'}",
+                    f"已采集：{recovery.collected_count} 条 / {recovery.pages_fetched} 页",
+                    "",
+                    "是否现在保存并创建任务？",
+                ]
+            ),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if result == QMessageBox.StandardButton.Yes:
+            return self._recover_session_as_task(recovery.session_id)
+        discard = QMessageBox.question(
+            self,
+            "确认放弃未保存数据",
+            "放弃后将删除这批未保存的采集数据，且无法恢复。是否继续？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if discard == QMessageBox.StandardButton.Yes:
+            self._app_service.discard_creator_collection_session(session_id=recovery.session_id)
+            return True
+        return False
+
+    def _recover_session_as_task(self, session_id: int) -> bool:
+        default_path = self._default_export_path()
+        selected, _ = QFileDialog.getSaveFileName(
+            self,
+            "保存采集结果",
+            str(default_path),
+            "Excel Workbook (*.xlsx)",
+        )
+        if not selected:
+            return False
+        export_path = Path(selected)
+        if export_path.suffix.lower() != ".xlsx":
+            export_path = export_path.with_suffix(".xlsx")
+        self._save_export_dir(export_path.parent)
+        try:
+            self.last_created_task_id = (
+                self._app_service.create_task_from_creator_collection_session(
+                    session_id=session_id,
+                    export_path=export_path,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "恢复失败", str(exc))
+            return False
+        QMessageBox.information(self, "已创建任务", f"已创建检查任务 #{self.last_created_task_id}")
+        return True
 
     def _bounded_form_field(self, widget: QWidget, width: int) -> QWidget:
         widget.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
@@ -250,6 +314,21 @@ class CreatorCollectorDialog(QDialog):
                 "auto_advance_interval_seconds": float(self._auto_scroll_interval_spin.value()),
             },
         )
+
+    def _default_export_path(self) -> Path:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = DEFAULT_COLLECTION_EXPORT_NAME.format(timestamp=timestamp)
+        saved_dir = self._load_saved_export_dir()
+        return (saved_dir or Path.cwd()) / filename
+
+    def _load_saved_export_dir(self) -> Path | None:
+        raw = self._app_service.load_app_setting("creator_collection_export_dir")
+        if isinstance(raw, str) and raw.strip():
+            return Path(raw)
+        return None
+
+    def _save_export_dir(self, directory: Path) -> None:
+        self._app_service.save_app_setting("creator_collection_export_dir", str(directory))
 
 
 class CreatorCollectorProgressDialog(QDialog):

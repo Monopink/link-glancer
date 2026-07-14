@@ -9,6 +9,8 @@ from link_glancer.runtime.paths import app_database_path
 from link_glancer.tasks.models import (
     BrowserConfig,
     BrowserProfile,
+    CreatorCollectionRecovery,
+    CreatorCollectionSessionSummary,
     ReviewRecord,
     TaskDetail,
     TaskItem,
@@ -23,7 +25,7 @@ from link_glancer.tasks.serialization import (
     task_snapshot_to_dict,
 )
 
-CURRENT_SCHEMA_VERSION = 5
+CURRENT_SCHEMA_VERSION = 6
 _LAST_DATABASE_RESET_REASON: str | None = None
 
 _REQUIRED_SCHEMA_COLUMNS = {
@@ -65,6 +67,27 @@ _REQUIRED_SCHEMA_COLUMNS = {
     "reviews": {"task_item_id", "review_data_json", "review_status", "reviewed_at", "updated_at"},
     "review_history": {"id", "task_item_id", "action", "payload_json", "created_at"},
     "app_settings": {"key", "value_json", "updated_at"},
+    "creator_collection_sessions": {
+        "id",
+        "browser_config_id",
+        "page_url",
+        "status",
+        "collected_count",
+        "pages_fetched",
+        "safety_limit",
+        "auto_advance_interval_seconds",
+        "last_message",
+        "created_at",
+        "updated_at",
+    },
+    "creator_collection_session_rows": {
+        "id",
+        "session_id",
+        "item_index",
+        "row_key",
+        "task_data_json",
+        "created_at",
+    },
 }
 
 
@@ -84,81 +107,9 @@ def ensure_app_database() -> Path:
         _LAST_DATABASE_RESET_REASON = reset_reason
 
     with sqlite3.connect(database_path) as connection:
-        connection.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS browser_profiles (
-                id TEXT PRIMARY KEY,
-                name TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS browser_configs (
-                id TEXT PRIMARY KEY,
-                name TEXT NOT NULL,
-                profile_id TEXT NOT NULL,
-                executable_path TEXT NOT NULL,
-                launch_args_json TEXT NOT NULL,
-                test_url TEXT NOT NULL,
-                last_tested_at TEXT,
-                last_test_status TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                FOREIGN KEY(profile_id) REFERENCES browser_profiles(id)
-            );
-
-            CREATE TABLE IF NOT EXISTS tasks (
-                id INTEGER PRIMARY KEY,
-                name TEXT NOT NULL,
-                source_file_path TEXT NOT NULL,
-                source_file_name TEXT NOT NULL,
-                source_file_size INTEGER,
-                source_file_mtime TEXT,
-                source_file_hash TEXT,
-                browser_config_id TEXT NOT NULL,
-                task_snapshot_json TEXT NOT NULL,
-                browser_config_snapshot_json TEXT NOT NULL,
-                status TEXT NOT NULL,
-                current_task_index INTEGER NOT NULL,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS task_items (
-                id INTEGER PRIMARY KEY,
-                task_id INTEGER NOT NULL,
-                task_index INTEGER NOT NULL,
-                source_row INTEGER NOT NULL,
-                task_data_json TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                UNIQUE(task_id, task_index),
-                FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE
-            );
-
-            CREATE TABLE IF NOT EXISTS reviews (
-                task_item_id INTEGER PRIMARY KEY,
-                review_data_json TEXT NOT NULL,
-                review_status TEXT NOT NULL,
-                reviewed_at TEXT,
-                updated_at TEXT NOT NULL,
-                FOREIGN KEY(task_item_id) REFERENCES task_items(id) ON DELETE CASCADE
-            );
-
-            CREATE TABLE IF NOT EXISTS review_history (
-                id INTEGER PRIMARY KEY,
-                task_item_id INTEGER NOT NULL,
-                action TEXT NOT NULL,
-                payload_json TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS app_settings (
-                key TEXT PRIMARY KEY,
-                value_json TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            );
-            """
-        )
+        connection.execute("PRAGMA foreign_keys = ON")
+        _ensure_schema_objects(connection)
+        _migrate_schema(connection)
         _set_app_setting(connection, "schema_version", CURRENT_SCHEMA_VERSION)
     return database_path
 
@@ -443,6 +394,274 @@ def load_app_setting(database_path: Path, key: str) -> object | None:
 def save_app_setting(database_path: Path, key: str, value: object) -> None:
     with sqlite3.connect(database_path) as connection:
         _set_app_setting(connection, key, value)
+
+
+def create_creator_collection_session(
+    database_path: Path,
+    *,
+    browser_config_id: str,
+    page_url: str,
+    safety_limit: int,
+    auto_advance_interval_seconds: float,
+    last_message: str,
+) -> int:
+    now = _now_iso()
+    with sqlite3.connect(database_path) as connection:
+        cursor = connection.execute(
+            """
+            INSERT INTO creator_collection_sessions (
+                browser_config_id, page_url, status, collected_count, pages_fetched,
+                safety_limit, auto_advance_interval_seconds, last_message, created_at, updated_at
+            )
+            VALUES (?, ?, 'active', 0, 0, ?, ?, ?, ?, ?)
+            """,
+            (
+                browser_config_id,
+                page_url,
+                safety_limit,
+                auto_advance_interval_seconds,
+                last_message,
+                now,
+                now,
+            ),
+        )
+        return int(cursor.lastrowid)
+
+
+def append_creator_collection_session_rows(
+    database_path: Path,
+    *,
+    session_id: int,
+    rows: list[tuple[str, dict[str, object]]],
+) -> int:
+    if not rows:
+        return 0
+    now = _now_iso()
+    with sqlite3.connect(database_path) as connection:
+        existing = connection.execute(
+            """
+            SELECT row_key
+            FROM creator_collection_session_rows
+            WHERE session_id = ?
+            """,
+            (session_id,),
+        ).fetchall()
+        existing_keys = {str(row[0]) for row in existing}
+        pending = [
+            (row_key, row_data) for row_key, row_data in rows if row_key not in existing_keys
+        ]
+        if not pending:
+            return 0
+        current_index = int(
+            connection.execute(
+                """
+                SELECT COALESCE(MAX(item_index), 0)
+                FROM creator_collection_session_rows
+                WHERE session_id = ?
+                """,
+                (session_id,),
+            ).fetchone()[0]
+        )
+        connection.executemany(
+            """
+            INSERT INTO creator_collection_session_rows (
+                session_id, item_index, row_key, task_data_json, created_at
+            )
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            [
+                (session_id, current_index + offset, row_key, _json(row_data), now)
+                for offset, (row_key, row_data) in enumerate(pending, start=1)
+            ],
+        )
+        connection.execute(
+            """
+            UPDATE creator_collection_sessions
+            SET collected_count = collected_count + ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (len(pending), now, session_id),
+        )
+        return len(pending)
+
+
+def update_creator_collection_session(
+    database_path: Path,
+    *,
+    session_id: int,
+    status: str,
+    collected_count: int,
+    pages_fetched: int,
+    safety_limit: int,
+    auto_advance_interval_seconds: float,
+    last_message: str,
+) -> None:
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """
+            UPDATE creator_collection_sessions
+            SET status = ?,
+                collected_count = ?,
+                pages_fetched = ?,
+                safety_limit = ?,
+                auto_advance_interval_seconds = ?,
+                last_message = ?,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                status,
+                collected_count,
+                pages_fetched,
+                safety_limit,
+                auto_advance_interval_seconds,
+                last_message,
+                _now_iso(),
+                session_id,
+            ),
+        )
+
+
+def load_pending_creator_collection_recovery(
+    database_path: Path,
+) -> CreatorCollectionRecovery | None:
+    with sqlite3.connect(database_path) as connection:
+        connection.row_factory = sqlite3.Row
+        row = connection.execute(
+            """
+            SELECT
+                s.id,
+                s.browser_config_id,
+                s.page_url,
+                s.status,
+                s.collected_count,
+                s.pages_fetched,
+                s.safety_limit,
+                s.auto_advance_interval_seconds,
+                s.last_message,
+                s.created_at,
+                s.updated_at,
+                c.name AS browser_config_name
+            FROM creator_collection_sessions s
+            JOIN browser_configs c ON c.id = s.browser_config_id
+            WHERE s.status IN ('active', 'interrupted', 'finalizing')
+              AND s.collected_count > 0
+            ORDER BY s.updated_at DESC, s.id DESC
+            LIMIT 1
+            """
+        ).fetchone()
+        if row is None:
+            return None
+        return CreatorCollectionRecovery(
+            session_id=int(row["id"]),
+            browser_config_id=str(row["browser_config_id"]),
+            browser_config_name=str(row["browser_config_name"]),
+            page_url=str(row["page_url"]),
+            status=str(row["status"]),  # type: ignore[arg-type]
+            collected_count=int(row["collected_count"]),
+            pages_fetched=int(row["pages_fetched"]),
+            safety_limit=int(row["safety_limit"]),
+            auto_advance_interval_seconds=float(row["auto_advance_interval_seconds"]),
+            last_message=str(row["last_message"]),
+            created_at=str(row["created_at"]),
+            updated_at=str(row["updated_at"]),
+        )
+
+
+def load_creator_collection_session_rows(
+    database_path: Path,
+    *,
+    session_id: int,
+) -> list[dict[str, object]]:
+    with sqlite3.connect(database_path) as connection:
+        connection.row_factory = sqlite3.Row
+        rows = connection.execute(
+            """
+            SELECT task_data_json
+            FROM creator_collection_session_rows
+            WHERE session_id = ?
+            ORDER BY item_index
+            """,
+            (session_id,),
+        ).fetchall()
+        return [json.loads(str(row["task_data_json"])) for row in rows]
+
+
+def load_creator_collection_session_summary(
+    database_path: Path,
+    *,
+    session_id: int,
+) -> CreatorCollectionSessionSummary:
+    with sqlite3.connect(database_path) as connection:
+        connection.row_factory = sqlite3.Row
+        row = connection.execute(
+            """
+            SELECT
+                id,
+                browser_config_id,
+                page_url,
+                status,
+                collected_count,
+                pages_fetched,
+                safety_limit,
+                auto_advance_interval_seconds,
+                last_message,
+                created_at,
+                updated_at
+            FROM creator_collection_sessions
+            WHERE id = ?
+            """,
+            (session_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"Creator collection session not found: {session_id}")
+        return CreatorCollectionSessionSummary(
+            session_id=int(row["id"]),
+            browser_config_id=str(row["browser_config_id"]),
+            page_url=str(row["page_url"]),
+            status=str(row["status"]),  # type: ignore[arg-type]
+            collected_count=int(row["collected_count"]),
+            pages_fetched=int(row["pages_fetched"]),
+            safety_limit=int(row["safety_limit"]),
+            auto_advance_interval_seconds=float(row["auto_advance_interval_seconds"]),
+            last_message=str(row["last_message"]),
+            created_at=str(row["created_at"]),
+            updated_at=str(row["updated_at"]),
+        )
+
+
+def finalize_creator_collection_session(database_path: Path, *, session_id: int) -> None:
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute(
+            """
+            UPDATE creator_collection_sessions
+            SET status = 'finalized', updated_at = ?
+            WHERE id = ?
+            """,
+            (_now_iso(), session_id),
+        )
+        connection.execute(
+            "DELETE FROM creator_collection_session_rows WHERE session_id = ?",
+            (session_id,),
+        )
+
+
+def discard_creator_collection_session(database_path: Path, *, session_id: int) -> None:
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute(
+            """
+            UPDATE creator_collection_sessions
+            SET status = 'discarded', updated_at = ?
+            WHERE id = ?
+            """,
+            (_now_iso(), session_id),
+        )
+        connection.execute(
+            "DELETE FROM creator_collection_session_rows WHERE session_id = ?",
+            (session_id,),
+        )
 
 
 def list_items_in_range(
@@ -740,7 +959,7 @@ def _database_reset_reason(database_path: Path) -> str | None:
             return "数据库缺少 schema 版本信息"
 
         schema_version = _schema_version(connection)
-        if schema_version != CURRENT_SCHEMA_VERSION:
+        if schema_version is not None and schema_version > CURRENT_SCHEMA_VERSION:
             return (
                 f"数据库 schema 版本不匹配：当前需要 {CURRENT_SCHEMA_VERSION}，"
                 f"实际为 {schema_version or '未设置'}"
@@ -748,6 +967,11 @@ def _database_reset_reason(database_path: Path) -> str | None:
 
         for table_name, required_columns in _REQUIRED_SCHEMA_COLUMNS.items():
             if table_name not in table_names:
+                if table_name in {
+                    "creator_collection_sessions",
+                    "creator_collection_session_rows",
+                } and schema_version in {None, 5}:
+                    continue
                 return f"数据库缺少表：{table_name}"
             existing_columns = _table_columns(connection, table_name)
             missing_columns = sorted(required_columns - existing_columns)
@@ -791,6 +1015,130 @@ def _schema_version(connection: sqlite3.Connection) -> int | None:
         return int(json.loads(str(row[0])))
     except (TypeError, ValueError, json.JSONDecodeError):
         return None
+
+
+def _ensure_schema_objects(connection: sqlite3.Connection) -> None:
+    connection.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS browser_profiles (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS browser_configs (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            profile_id TEXT NOT NULL,
+            executable_path TEXT NOT NULL,
+            launch_args_json TEXT NOT NULL,
+            test_url TEXT NOT NULL,
+            last_tested_at TEXT,
+            last_test_status TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(profile_id) REFERENCES browser_profiles(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS tasks (
+            id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            source_file_path TEXT NOT NULL,
+            source_file_name TEXT NOT NULL,
+            source_file_size INTEGER,
+            source_file_mtime TEXT,
+            source_file_hash TEXT,
+            browser_config_id TEXT NOT NULL,
+            task_snapshot_json TEXT NOT NULL,
+            browser_config_snapshot_json TEXT NOT NULL,
+            status TEXT NOT NULL,
+            current_task_index INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS task_items (
+            id INTEGER PRIMARY KEY,
+            task_id INTEGER NOT NULL,
+            task_index INTEGER NOT NULL,
+            source_row INTEGER NOT NULL,
+            task_data_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE(task_id, task_index),
+            FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS reviews (
+            task_item_id INTEGER PRIMARY KEY,
+            review_data_json TEXT NOT NULL,
+            review_status TEXT NOT NULL,
+            reviewed_at TEXT,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(task_item_id) REFERENCES task_items(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS review_history (
+            id INTEGER PRIMARY KEY,
+            task_item_id INTEGER NOT NULL,
+            action TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS app_settings (
+            key TEXT PRIMARY KEY,
+            value_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS creator_collection_sessions (
+            id INTEGER PRIMARY KEY,
+            browser_config_id TEXT NOT NULL,
+            page_url TEXT NOT NULL,
+            status TEXT NOT NULL,
+            collected_count INTEGER NOT NULL,
+            pages_fetched INTEGER NOT NULL,
+            safety_limit INTEGER NOT NULL,
+            auto_advance_interval_seconds REAL NOT NULL,
+            last_message TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(browser_config_id) REFERENCES browser_configs(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS creator_collection_session_rows (
+            id INTEGER PRIMARY KEY,
+            session_id INTEGER NOT NULL,
+            item_index INTEGER NOT NULL,
+            row_key TEXT NOT NULL,
+            task_data_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE(session_id, item_index),
+            UNIQUE(session_id, row_key),
+            FOREIGN KEY(session_id) REFERENCES creator_collection_sessions(id) ON DELETE CASCADE
+        );
+        """
+    )
+
+
+def _migrate_schema(connection: sqlite3.Connection) -> None:
+    schema_version = _schema_version(connection)
+    if schema_version is None:
+        return
+    if schema_version >= CURRENT_SCHEMA_VERSION:
+        return
+    if schema_version == 5:
+        _migrate_schema_v5_to_v6(connection)
+        return
+    raise RuntimeError(
+        f"不支持从 schema 版本 {schema_version} 自动迁移到 {CURRENT_SCHEMA_VERSION}。"
+    )
+
+
+def _migrate_schema_v5_to_v6(connection: sqlite3.Connection) -> None:
+    # v6 only adds creator collector temporary-session tables; existing task data stays intact.
+    _ensure_schema_objects(connection)
 
 
 def load_task_item_by_index(
