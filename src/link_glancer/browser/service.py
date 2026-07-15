@@ -86,14 +86,19 @@ class PlaywrightBrowserController(BrowserController):
     def ensure_running(self) -> None:
         if self._context is None:
             return
-        if len(self._context.pages) == 0:
-            self._context.new_page()
+        try:
+            if len(self._context.pages) == 0:
+                self._context.new_page()
+        except PlaywrightError as exc:
+            self._set_runtime_failure(f"浏览器已不可用：{exc}")
 
     def open_confirmation_page(self, url: str) -> None:
         if self._context is None:
             return
         self.close_confirmation_page()
-        page = self._context.new_page()
+        page = self._create_page()
+        if page is None:
+            return
         self._confirmation_page = page
         self._navigate_page(page, url)
         self._bring_page_to_front(page)
@@ -106,6 +111,8 @@ class PlaywrightBrowserController(BrowserController):
 
     def sync_buffer(self, tasks: list[TaskItem], url_field: str) -> None:
         if self._context is None:
+            return
+        if not self._status.running:
             return
         if not tasks:
             self._clear_runtime_pages()
@@ -172,7 +179,9 @@ class PlaywrightBrowserController(BrowserController):
                 self._current_task_index = pending.task.task_index
                 self._bring_page_to_front(self._current_page)
                 return
-            self._current_page = self._context.new_page()
+            self._current_page = self._create_page()
+            if self._current_page is None:
+                return
             self._current_task_index = pending.task.task_index
             self._navigate_page(self._current_page, pending.url)
             self._bring_page_to_front(self._current_page)
@@ -197,7 +206,9 @@ class PlaywrightBrowserController(BrowserController):
         self._bring_page_to_front(self._current_page)
 
     def _open_prefetch_page(self, pending: _PendingPage) -> None:
-        page = self._context.new_page()
+        page = self._create_page()
+        if page is None:
+            return
         self._bring_page_to_front(self._current_page)
         self._navigate_page(page, pending.url)
         self._ready_pages_by_task_index[pending.task.task_index] = page
@@ -212,8 +223,8 @@ class PlaywrightBrowserController(BrowserController):
     def _navigate_page(self, page, url: str) -> None:
         try:
             page.evaluate("(targetUrl) => { window.location.replace(targetUrl); }", url)
-        except PlaywrightError:
-            pass
+        except PlaywrightError as exc:
+            self._set_runtime_failure(f"标签跳转失败：{exc}")
 
     def _prune_ready_pages(self, desired_indexes: set[int]) -> None:
         for task_index, page in list(self._ready_pages_by_task_index.items()):
@@ -227,8 +238,8 @@ class PlaywrightBrowserController(BrowserController):
             return
         try:
             page.bring_to_front()
-        except PlaywrightError:
-            pass
+        except PlaywrightError as exc:
+            self._set_runtime_failure(f"标签切换失败：{exc}")
 
     def _open_page_count(self) -> int:
         return len(self._ready_pages_by_task_index) + (1 if self._current_page is not None else 0)
@@ -252,6 +263,23 @@ class PlaywrightBrowserController(BrowserController):
             page.close()
         except PlaywrightError:
             pass
+
+    def _create_page(self):
+        if self._context is None:
+            return None
+        try:
+            return self._context.new_page()
+        except PlaywrightError as exc:
+            self._set_runtime_failure(f"打开标签失败：{exc}")
+            return None
+
+    def _set_runtime_failure(self, message: str) -> None:
+        self._status = BrowserStatus(
+            active_browser=self._candidate.name if self._candidate else None,
+            executable_path=self._candidate.executable_path if self._candidate else None,
+            running=False,
+            message=message,
+        )
 
 
 def create_browser_controller() -> BrowserController:

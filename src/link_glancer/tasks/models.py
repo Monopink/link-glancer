@@ -27,8 +27,9 @@ class ReviewField:
 @dataclass(slots=True)
 class ReviewShortcutConfig:
     submit: str = "Enter"
-    previous: str = "Backspace"
-    exit: str = "Esc"
+    previous: str = "Left"
+    next: str = "Right"
+    skip: str = "+"
 
 
 @dataclass(slots=True)

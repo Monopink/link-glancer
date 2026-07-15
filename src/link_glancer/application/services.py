@@ -384,8 +384,9 @@ class TaskApplicationService:
             return ReviewShortcutConfig()
         return ReviewShortcutConfig(
             submit=str(raw.get("submit", "Enter")),
-            previous=str(raw.get("previous", "Backspace")),
-            exit=str(raw.get("exit", "Esc")),
+            previous=str(raw.get("previous", "Left")),
+            next=str(raw.get("next", "Right")),
+            skip=str(raw.get("skip", "+")),
         )
 
     def save_task_shortcut_defaults(self, shortcuts: ReviewShortcutConfig) -> None:
@@ -395,7 +396,8 @@ class TaskApplicationService:
             {
                 "submit": shortcuts.submit,
                 "previous": shortcuts.previous,
-                "exit": shortcuts.exit,
+                "next": shortcuts.next,
+                "skip": shortcuts.skip,
             },
         )
 
@@ -637,6 +639,10 @@ class TaskApplicationService:
         )
         return self.load_task(task_id)
 
+    def skip_review(self, *, task_id: int, task_index: int) -> TaskDetail:
+        self._tasks.skip_review(task_id=task_id, task_index=task_index)
+        return self.load_task(task_id)
+
     def update_task_item_data(
         self,
         *,
@@ -736,7 +742,8 @@ class TaskApplicationService:
 
         register(shortcuts.submit, "提交快捷键")
         register(shortcuts.previous, "上一条快捷键")
-        register(shortcuts.exit, "退出快捷键")
+        register(shortcuts.next, "下一条快捷键")
+        register(shortcuts.skip, "跳过快捷键")
 
         for field in review_fields:
             for option in field.options:

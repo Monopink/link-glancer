@@ -24,7 +24,8 @@ def task_snapshot_to_dict(snapshot: TaskSnapshot) -> dict[str, object]:
         "shortcuts": {
             "submit": snapshot.shortcuts.submit,
             "previous": snapshot.shortcuts.previous,
-            "exit": snapshot.shortcuts.exit,
+            "next": snapshot.shortcuts.next,
+            "skip": snapshot.shortcuts.skip,
         },
         "export_fields": snapshot.export_fields,
     }
@@ -50,8 +51,9 @@ def task_snapshot_from_dict(data: dict[str, object]) -> TaskSnapshot:
         or [field.field_id for field in review_fields],
         shortcuts=ReviewShortcutConfig(
             submit=str(shortcuts.get("submit", "Enter")),
-            previous=str(shortcuts.get("previous", "Backspace")),
-            exit=str(shortcuts.get("exit", "Esc")),
+            previous=str(shortcuts.get("previous", "Left")),
+            next=str(shortcuts.get("next", "Right")),
+            skip=str(shortcuts.get("skip", "+")),
         ),
         export_fields=[str(item) for item in data.get("export_fields", [])],
     )

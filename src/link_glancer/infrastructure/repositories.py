@@ -130,6 +130,13 @@ class TaskRepository:
             draft_data=draft_data,
         )
 
+    def skip_review(self, *, task_id: int, task_index: int) -> None:
+        database.skip_review(
+            self.database_path,
+            task_id=task_id,
+            task_index=task_index,
+        )
+
     def update_task_item_data(
         self,
         *,

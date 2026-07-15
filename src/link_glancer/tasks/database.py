@@ -755,7 +755,11 @@ def save_review(
         if advance_pointer:
             total_items = _count_task_items(connection, task_id)
             next_index = min(task_index + 1, total_items + 1)
-            status = "completed" if task_index >= total_items else "in_progress"
+            status: TaskStatus = (
+                "completed"
+                if _first_unreviewed_task_index(connection, task_id) is None
+                else "in_progress"
+            )
             _update_task_pointer(
                 connection,
                 task_id,
@@ -765,6 +769,28 @@ def save_review(
             )
         else:
             connection.execute("UPDATE tasks SET updated_at = ? WHERE id = ?", (now, task_id))
+
+
+def skip_review(database_path: Path, *, task_id: int, task_index: int) -> None:
+    with sqlite3.connect(database_path) as connection:
+        item = load_task_item_by_index(connection, task_id, task_index)
+        if item is None:
+            raise ValueError(f"Task item not found: task_id={task_id}, task_index={task_index}")
+        connection.execute("DELETE FROM review_drafts WHERE task_item_id = ?", (item.task_item_id,))
+        total_items = _count_task_items(connection, task_id)
+        next_index = min(task_index + 1, total_items + 1)
+        status: TaskStatus = (
+            "completed"
+            if _first_unreviewed_task_index(connection, task_id) is None
+            else "in_progress"
+        )
+        _update_task_pointer(
+            connection,
+            task_id,
+            current_task_index=next_index,
+            viewing_task_index=next_index,
+            status=status,
+        )
 
 
 def save_review_draft(
@@ -871,21 +897,16 @@ def set_viewing_task_index(database_path: Path, task_id: int, task_index: int) -
 def mark_task_in_progress(database_path: Path, task_id: int) -> None:
     with sqlite3.connect(database_path) as connection:
         total_items = _count_task_items(connection, task_id)
-        current_completed = _count_completed_items(connection, task_id)
+        first_unreviewed = _first_unreviewed_task_index(connection, task_id)
         status: TaskStatus = (
-            "completed" if current_completed >= total_items and total_items > 0 else "in_progress"
+            "completed" if first_unreviewed is None and total_items > 0 else "in_progress"
         )
-        row = connection.execute(
-            "SELECT current_task_index, viewing_task_index FROM tasks WHERE id = ?",
-            (task_id,),
-        ).fetchone()
-        if row is None:
-            raise ValueError(f"Task not found: {task_id}")
+        current_index = first_unreviewed if first_unreviewed is not None else total_items + 1
         _update_task_pointer(
             connection,
             task_id,
-            current_task_index=int(row[0]),
-            viewing_task_index=int(row[1]),
+            current_task_index=current_index,
+            viewing_task_index=current_index,
             status=status,
         )
 
@@ -1322,6 +1343,21 @@ def _count_completed_items(connection: sqlite3.Connection, task_id: int) -> int:
             (task_id,),
         ).fetchone()[0]
     )
+
+
+def _first_unreviewed_task_index(connection: sqlite3.Connection, task_id: int) -> int | None:
+    row = connection.execute(
+        """
+        SELECT MIN(i.task_index)
+        FROM task_items i
+        LEFT JOIN reviews r ON r.task_item_id = i.id AND r.review_status = 'completed'
+        WHERE i.task_id = ? AND r.task_item_id IS NULL
+        """,
+        (task_id,),
+    ).fetchone()
+    if row is None or row[0] is None:
+        return None
+    return int(row[0])
 
 
 def _delete_task_review_state(connection: sqlite3.Connection, task_id: int) -> None:

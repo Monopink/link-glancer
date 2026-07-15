@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QFormLayout,
     QGridLayout,
+    QGroupBox,
     QHBoxLayout,
     QHeaderView,
     QKeySequenceEdit,
@@ -219,20 +220,25 @@ class TaskCreationDialog(QDialog):
         form.addRow("导出字段", self._expanding_form_field(self._export_fields_edit))
         root.addLayout(form)
 
-        shortcut_group = QGridLayout()
+        shortcut_box = QGroupBox("快捷键")
+        shortcut_group = QGridLayout(shortcut_box)
         self._submit_shortcut_edit = QKeySequenceEdit()
         self._submit_shortcut_edit.setKeySequence(QKeySequence("Enter"))
         self._previous_shortcut_edit = QKeySequenceEdit()
-        self._previous_shortcut_edit.setKeySequence(QKeySequence("Backspace"))
-        self._exit_shortcut_edit = QKeySequenceEdit()
-        self._exit_shortcut_edit.setKeySequence(QKeySequence("Esc"))
-        shortcut_group.addWidget(QLabel("提交快捷键"), 0, 0)
+        self._previous_shortcut_edit.setKeySequence(QKeySequence("Left"))
+        self._next_shortcut_edit = QKeySequenceEdit()
+        self._next_shortcut_edit.setKeySequence(QKeySequence("Right"))
+        self._skip_shortcut_edit = QKeySequenceEdit()
+        self._skip_shortcut_edit.setKeySequence(QKeySequence("+"))
+        shortcut_group.addWidget(QLabel("提交/保存"), 0, 0)
         shortcut_group.addWidget(self._submit_shortcut_edit, 0, 1)
-        shortcut_group.addWidget(QLabel("上一条快捷键"), 0, 2)
-        shortcut_group.addWidget(self._previous_shortcut_edit, 0, 3)
-        shortcut_group.addWidget(QLabel("退出快捷键"), 0, 4)
-        shortcut_group.addWidget(self._exit_shortcut_edit, 0, 5)
-        root.addLayout(shortcut_group)
+        shortcut_group.addWidget(QLabel("跳过"), 0, 2)
+        shortcut_group.addWidget(self._skip_shortcut_edit, 0, 3)
+        shortcut_group.addWidget(QLabel("上一条"), 1, 0)
+        shortcut_group.addWidget(self._previous_shortcut_edit, 1, 1)
+        shortcut_group.addWidget(QLabel("下一条"), 1, 2)
+        shortcut_group.addWidget(self._next_shortcut_edit, 1, 3)
+        root.addWidget(shortcut_box)
 
         root.addWidget(QLabel("检查项"))
         self._review_fields_table = QTableWidget()
@@ -350,7 +356,8 @@ class TaskCreationDialog(QDialog):
         self._export_fields_edit.setPlainText(", ".join(snapshot.export_fields))
         self._submit_shortcut_edit.setKeySequence(QKeySequence(snapshot.shortcuts.submit))
         self._previous_shortcut_edit.setKeySequence(QKeySequence(snapshot.shortcuts.previous))
-        self._exit_shortcut_edit.setKeySequence(QKeySequence(snapshot.shortcuts.exit))
+        self._next_shortcut_edit.setKeySequence(QKeySequence(snapshot.shortcuts.next))
+        self._skip_shortcut_edit.setKeySequence(QKeySequence(snapshot.shortcuts.skip))
         if self._source_editable:
             self._render_review_field_rows(self._build_new_task_review_field_rows(snapshot))
         else:
@@ -473,7 +480,8 @@ class TaskCreationDialog(QDialog):
             shortcuts=ReviewShortcutConfig(
                 submit=_key_sequence_text(self._submit_shortcut_edit),
                 previous=_key_sequence_text(self._previous_shortcut_edit),
-                exit=_key_sequence_text(self._exit_shortcut_edit),
+                next=_key_sequence_text(self._next_shortcut_edit),
+                skip=_key_sequence_text(self._skip_shortcut_edit),
             ),
             export_fields=_split_csv(self._export_fields_edit.toPlainText()),
         )

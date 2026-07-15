@@ -8,8 +8,10 @@ from PySide6.QtCore import QEventLoop, Qt, QTimer
 from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QDialog,
     QDialogButtonBox,
+    QFormLayout,
     QHBoxLayout,
     QKeySequenceEdit,
     QLabel,
@@ -41,16 +43,24 @@ class ShortcutConfigDialog(QDialog):
 
         self._submit_shortcut_edit = QKeySequenceEdit()
         self._previous_shortcut_edit = QKeySequenceEdit()
-        self._exit_shortcut_edit = QKeySequenceEdit()
+        self._next_shortcut_edit = QKeySequenceEdit()
+        self._skip_shortcut_edit = QKeySequenceEdit()
 
         shortcuts = task.task_snapshot.shortcuts
         self._submit_shortcut_edit.setKeySequence(QKeySequence(shortcuts.submit))
         self._previous_shortcut_edit.setKeySequence(QKeySequence(shortcuts.previous))
-        self._exit_shortcut_edit.setKeySequence(QKeySequence(shortcuts.exit))
+        self._next_shortcut_edit.setKeySequence(QKeySequence(shortcuts.next))
+        self._skip_shortcut_edit.setKeySequence(QKeySequence(shortcuts.skip))
 
-        root.addWidget(self._row("提交/保存", self._submit_shortcut_edit))
-        root.addWidget(self._row("上一条", self._previous_shortcut_edit))
-        root.addWidget(self._row("退出", self._exit_shortcut_edit))
+        form = QFormLayout()
+        form.setContentsMargins(0, 0, 0, 0)
+        form.setSpacing(10)
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        form.addRow("提交/保存", self._submit_shortcut_edit)
+        form.addRow("上一条", self._previous_shortcut_edit)
+        form.addRow("下一条", self._next_shortcut_edit)
+        form.addRow("跳过", self._skip_shortcut_edit)
+        root.addLayout(form)
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
@@ -59,20 +69,13 @@ class ShortcutConfigDialog(QDialog):
         buttons.rejected.connect(self.reject)
         root.addWidget(buttons)
 
-    def values(self) -> tuple[str, str, str]:
+    def values(self) -> tuple[str, str, str, str]:
         return (
             self._key_sequence_text(self._submit_shortcut_edit),
             self._key_sequence_text(self._previous_shortcut_edit),
-            self._key_sequence_text(self._exit_shortcut_edit),
+            self._key_sequence_text(self._next_shortcut_edit),
+            self._key_sequence_text(self._skip_shortcut_edit),
         )
-
-    def _row(self, title: str, editor: QKeySequenceEdit) -> QWidget:
-        widget = QWidget()
-        layout = QHBoxLayout(widget)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.addWidget(QLabel(title))
-        layout.addWidget(editor, stretch=1)
-        return widget
 
     def _key_sequence_text(self, editor: QKeySequenceEdit) -> str:
         text = editor.keySequence().toString(QKeySequence.SequenceFormat.NativeText).strip()
@@ -102,6 +105,7 @@ class ReviewWindow(QMainWindow):
         self._review_started_completed = self._display_completed_items_for(self.task)
         self._submit_locked = False
         self._switching_current_item = False
+        self._browser_unavailable_notified = False
 
         self.setWindowTitle("检查")
         self.resize(660, 660)
@@ -128,13 +132,12 @@ class ReviewWindow(QMainWindow):
         self._progress_label = QLabel("0 / 0")
         self._completion_label = QLabel("-")
         self._remaining_label = QLabel("-")
-        self._mode_label = QLabel("-")
         self._progress_bar = QProgressBar()
         self._progress_bar.setTextVisible(True)
-        top_row.addWidget(self._summary("进度", self._progress_label))
-        top_row.addWidget(self._summary("完成", self._completion_label))
-        top_row.addWidget(self._summary("剩余", self._remaining_label))
-        top_row.addWidget(self._summary("模式", self._mode_label))
+        top_row.setSpacing(12)
+        top_row.addWidget(self._summary("进度", self._progress_label), stretch=1)
+        top_row.addWidget(self._summary("完成", self._completion_label), stretch=1)
+        top_row.addWidget(self._summary("剩余", self._remaining_label), stretch=1)
         layout.addLayout(top_row)
         layout.addWidget(self._progress_bar)
 
@@ -152,14 +155,18 @@ class ReviewWindow(QMainWindow):
         scroll.setWidget(self._fields_container)
         layout.addWidget(scroll, stretch=1)
 
+        top_controls = QHBoxLayout()
+        self._always_on_top_checkbox = QCheckBox("窗口置顶")
+        self._always_on_top_checkbox.clicked.connect(self._toggle_always_on_top)
+        top_controls.addStretch(1)
+        top_controls.addWidget(self._always_on_top_checkbox)
+        layout.addLayout(top_controls)
+
         actions = QHBoxLayout()
         self._shortcut_button = QPushButton("快捷键")
         self._shortcut_button.clicked.connect(self._edit_public_shortcuts)
-        self._always_on_top_button = QPushButton("窗口置顶")
-        self._always_on_top_button.setCheckable(True)
-        self._always_on_top_button.clicked.connect(self._toggle_always_on_top)
-        self._exit_button = QPushButton("退出检查")
-        self._exit_button.clicked.connect(self.close)
+        self._skip_button = QPushButton("跳过")
+        self._skip_button.clicked.connect(self._skip_review)
         self._previous_button = QPushButton("上一条")
         self._previous_button.clicked.connect(self._go_to_previous)
         self._next_button = QPushButton("下一条")
@@ -167,9 +174,8 @@ class ReviewWindow(QMainWindow):
         self._submit_button = QPushButton("提交")
         self._submit_button.clicked.connect(self._submit_review)
         actions.addWidget(self._shortcut_button)
-        actions.addWidget(self._always_on_top_button)
-        actions.addWidget(self._exit_button)
         actions.addStretch(1)
+        actions.addWidget(self._skip_button)
         actions.addWidget(self._previous_button)
         actions.addWidget(self._next_button)
         actions.addWidget(self._submit_button)
@@ -181,8 +187,12 @@ class ReviewWindow(QMainWindow):
         widget = QWidget()
         layout = QHBoxLayout(widget)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.addWidget(QLabel(f"{title}:"))
+        layout.setSpacing(6)
+        title_label = QLabel(f"{title}:")
+        value.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        layout.addWidget(title_label)
         layout.addWidget(value)
+        layout.addStretch(1)
         return widget
 
     def _render_review_fields(self, values: dict[str, object] | None = None) -> None:
@@ -220,9 +230,15 @@ class ReviewWindow(QMainWindow):
         previous_shortcut.setProperty("action_id", "previous")
         self._dynamic_shortcuts.append(previous_shortcut)
 
-        exit_shortcut = QShortcut(QKeySequence(shortcuts.exit), self)
-        exit_shortcut.activated.connect(self.close)
-        self._dynamic_shortcuts.append(exit_shortcut)
+        next_shortcut = QShortcut(QKeySequence(shortcuts.next), self)
+        next_shortcut.activated.connect(self._go_to_next)
+        next_shortcut.setProperty("action_id", "next")
+        self._dynamic_shortcuts.append(next_shortcut)
+
+        skip_shortcut = QShortcut(QKeySequence(shortcuts.skip), self)
+        skip_shortcut.activated.connect(self._skip_review)
+        skip_shortcut.setProperty("action_id", "skip")
+        self._dynamic_shortcuts.append(skip_shortcut)
 
         for field in self._app_service.enabled_review_fields(self.task.task_snapshot):
             for option in field.options:
@@ -255,6 +271,7 @@ class ReviewWindow(QMainWindow):
 
     def _refresh_view(self) -> None:
         self.task = self._app_service.load_task(self.task.task_id)
+        self._refresh_browser_availability(notify=False)
         viewing_index = self.task.viewing_task_index
         completed = self._display_completed_items()
         percentage = int((completed / self.task.total_items) * 100) if self.task.total_items else 0
@@ -270,17 +287,33 @@ class ReviewWindow(QMainWindow):
     def _apply_interaction_state(self) -> None:
         viewing_current_item = self._is_viewing_current_item()
         if self._switching_current_item and viewing_current_item:
-            mode_text = "切换中"
             submit_text = "切换中"
         else:
-            mode_text = "当前检查" if viewing_current_item else "历史回看"
-            submit_text = "提交" if viewing_current_item else "保存修改"
-        self._mode_label.setText(mode_text)
+            submit_text = self._button_text(
+                "提交" if viewing_current_item else "保存修改",
+                self.task.task_snapshot.shortcuts.submit,
+            )
         self._submit_button.setText(submit_text)
         self._submit_button.setEnabled(
-            self.task.viewing_item is not None and not self._submit_locked
+            self.task.viewing_item is not None
+            and not self._submit_locked
+            and self._can_submit_current_view()
         )
         navigation_enabled = not self._switching_current_item
+        self._skip_button.setText(self._button_text("跳过", self.task.task_snapshot.shortcuts.skip))
+        self._previous_button.setText(
+            self._button_text("上一条", self.task.task_snapshot.shortcuts.previous)
+        )
+        self._next_button.setText(
+            self._button_text("下一条", self.task.task_snapshot.shortcuts.next)
+        )
+        self._shortcut_button.setText("快捷键")
+        self._skip_button.setEnabled(
+            navigation_enabled
+            and self._is_viewing_current_item()
+            and self.task.viewing_item is not None
+            and self._browser.status().running
+        )
         self._previous_button.setEnabled(navigation_enabled and self._can_view_previous())
         self._next_button.setEnabled(navigation_enabled and self._can_view_next())
         self._fields_container.setEnabled(not self._switching_current_item)
@@ -290,6 +323,14 @@ class ReviewWindow(QMainWindow):
                 shortcut.setEnabled(not self._submit_locked)
             elif action_id == "previous":
                 shortcut.setEnabled(navigation_enabled)
+            elif action_id == "next":
+                shortcut.setEnabled(navigation_enabled)
+            elif action_id == "skip":
+                shortcut.setEnabled(
+                    navigation_enabled
+                    and self._is_viewing_current_item()
+                    and self.task.viewing_item is not None
+                )
 
     def _refresh_time_labels(self) -> None:
         eta_seconds = self._review_time_metrics()
@@ -359,6 +400,9 @@ class ReviewWindow(QMainWindow):
     def _submit_review(self) -> None:
         if self._submit_locked:
             return
+        if not self._can_submit_current_view():
+            self._refresh_browser_availability(notify=True)
+            return
         target_index = self.task.viewing_task_index
         submitting_current_item = self._is_viewing_current_item()
         values, errors = self._collect_review_values()
@@ -390,6 +434,29 @@ class ReviewWindow(QMainWindow):
             self._switching_current_item = False
             self._submit_locked = False
             self._refresh_view()
+
+    def _skip_review(self) -> None:
+        if (
+            self._submit_locked
+            or self._switching_current_item
+            or not self._is_viewing_current_item()
+        ):
+            return
+        if self.task.viewing_item is None:
+            return
+        if not self._browser.status().running:
+            self._refresh_browser_availability(notify=True)
+            return
+        self._submit_locked = True
+        self._switching_current_item = True
+        self._apply_interaction_state()
+        self.task = self._app_service.skip_review(
+            task_id=self.task.task_id,
+            task_index=self.task.current_task_index,
+        )
+        self._refresh_view()
+        QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+        QTimer.singleShot(0, self._sync_browser_buffer_after_submit)
 
     def _go_to_previous(self) -> None:
         if self._switching_current_item:
@@ -445,20 +512,22 @@ class ReviewWindow(QMainWindow):
             tasks=items,
             url_field=self.task.task_snapshot.url_field,
         )
+        self._refresh_browser_availability(notify=True)
 
     def _edit_public_shortcuts(self) -> None:
         dialog = ShortcutConfigDialog(self.task, self)
         if dialog.exec() != int(QDialog.DialogCode.Accepted):
             return
         try:
-            submit_shortcut, previous_shortcut, exit_shortcut = dialog.values()
+            submit_shortcut, previous_shortcut, next_shortcut, skip_shortcut = dialog.values()
         except ValueError as exc:
             QMessageBox.warning(self, "快捷键无效", str(exc))
             return
         snapshot = deepcopy(self.task.task_snapshot)
         snapshot.shortcuts.submit = submit_shortcut
         snapshot.shortcuts.previous = previous_shortcut
-        snapshot.shortcuts.exit = exit_shortcut
+        snapshot.shortcuts.next = next_shortcut
+        snapshot.shortcuts.skip = skip_shortcut
         self._update_snapshot(snapshot)
 
     def _edit_option_shortcut(self, field_id: str, option_value: str) -> None:
@@ -525,9 +594,9 @@ class ReviewWindow(QMainWindow):
         self._set_always_on_top(checked, persist=True)
 
     def _set_always_on_top(self, enabled: bool, *, persist: bool) -> None:
-        self._always_on_top_button.blockSignals(True)
-        self._always_on_top_button.setChecked(enabled)
-        self._always_on_top_button.blockSignals(False)
+        self._always_on_top_checkbox.blockSignals(True)
+        self._always_on_top_checkbox.setChecked(enabled)
+        self._always_on_top_checkbox.blockSignals(False)
         was_visible = self.isVisible()
         self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, enabled)
         if was_visible:
@@ -550,7 +619,38 @@ class ReviewWindow(QMainWindow):
             raise ValueError("快捷键不能为空。")
         return text
 
+    def _button_text(self, label: str, shortcut: str) -> str:
+        return f"{label} ({shortcut})" if shortcut else label
+
+    def _can_submit_current_view(self) -> bool:
+        if not self._is_viewing_current_item():
+            return True
+        return self._browser.status().running
+
+    def _refresh_browser_availability(self, *, notify: bool) -> None:
+        status = self._browser.status()
+        if status.running:
+            self._browser_unavailable_notified = False
+            return
+        if notify and not self._browser_unavailable_notified:
+            QMessageBox.warning(
+                self,
+                "检查已停止",
+                status.message or "浏览器已不可用，无法继续提交或跳过当前检查。",
+            )
+            self._browser_unavailable_notified = True
+
     def closeEvent(self, event) -> None:
+        result = QMessageBox.question(
+            self,
+            "确认退出检查",
+            "确认退出检查？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if result != QMessageBox.StandardButton.Yes:
+            event.ignore()
+            return
         self._timer.stop()
         self._save_current_draft()
         self._browser.shutdown()
