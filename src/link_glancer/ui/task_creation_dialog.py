@@ -49,9 +49,12 @@ REVIEW_FIELD_TYPE_OPTIONS = [
 ROW_ORIGIN_ROLE = Qt.ItemDataRole.UserRole + 1
 ROW_TASK_OWNED_ROLE = Qt.ItemDataRole.UserRole + 2
 ROW_IS_UNIQUE_ROLE = Qt.ItemDataRole.UserRole + 3
+ROW_OPTIONS_STASH_ROLE = Qt.ItemDataRole.UserRole + 4
 FORM_FIELD_FULL_WIDTH = 420
 FORM_FIELD_COMPACT_WIDTH = 140
 MAX_AUTO_EXPORT_FIELDS = 50
+OPTIONLESS_FIELD_TYPES = {"text", "boolean"}
+SELECTABLE_FIELD_TYPES = {"single_select", "multi_select"}
 
 
 @dataclass(slots=True)
@@ -74,6 +77,10 @@ class ReviewOptionsDialog(QDialog):
         self._table.setColumnCount(2)
         self._table.setHorizontalHeaderLabels(["选项", "快捷键"])
         _setup_table(self._table)
+        header = self._table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self._table.setColumnWidth(1, 140)
         _fill_options_table(self._table, self.options)
         root.addWidget(self._table, stretch=1)
 
@@ -700,10 +707,12 @@ class TaskCreationDialog(QDialog):
         required_checkbox = self._review_fields_table.cellWidget(row, 4)
         if isinstance(type_combo, QComboBox):
             try:
-                type_combo.currentIndexChanged.disconnect(self._sync_global_review_field_library)
+                type_combo.currentIndexChanged.disconnect(self._handle_review_field_type_changed)
             except (RuntimeError, TypeError):
                 pass
-            type_combo.currentIndexChanged.connect(self._sync_global_review_field_library)
+            type_combo.currentIndexChanged.connect(
+                lambda _index, row=row: self._handle_review_field_type_changed(row)
+            )
         if isinstance(required_checkbox, QCheckBox):
             try:
                 required_checkbox.checkStateChanged.disconnect(
@@ -712,6 +721,11 @@ class TaskCreationDialog(QDialog):
             except (RuntimeError, TypeError):
                 pass
             required_checkbox.checkStateChanged.connect(self._sync_global_review_field_library)
+
+    def _handle_review_field_type_changed(self, row: int) -> None:
+        _normalize_review_field_row_options(self._review_fields_table, row)
+        self._configure_review_fields_table()
+        self._sync_global_review_field_library()
 
     def _sync_global_review_field_library(self) -> None:
         if self._suspend_global_sync:
@@ -793,24 +807,46 @@ def _set_options_item(table: QTableWidget, row: int, options: list[ReviewOption]
     if summary_item is None:
         summary_item = QTableWidgetItem()
         table.setItem(row, 5, summary_item)
-    summary_item.setText(_options_preview(options))
-    summary_item.setToolTip(_options_tooltip(options))
+    field_type = _combo_data(table, row, 3) or "single_select"
+    summary_item.setText(_options_preview(options, field_type))
+    summary_item.setToolTip(_options_tooltip(options, field_type))
     summary_item.setData(Qt.ItemDataRole.UserRole, list(options))
     table.setRowHeight(row, max(table.rowHeight(row), 34))
 
 
+def _set_options_stash(table: QTableWidget, row: int, options: list[ReviewOption]) -> None:
+    summary_item = table.item(row, 5)
+    if summary_item is None:
+        summary_item = QTableWidgetItem()
+        table.setItem(row, 5, summary_item)
+    summary_item.setData(ROW_OPTIONS_STASH_ROLE, list(options))
+
+
+def _options_stash_value(table: QTableWidget, row: int, column: int) -> list[ReviewOption]:
+    item = table.item(row, column)
+    if item is None:
+        return []
+    raw_options = item.data(ROW_OPTIONS_STASH_ROLE)
+    if not isinstance(raw_options, list):
+        return []
+    return [deepcopy(option) for option in raw_options if isinstance(option, ReviewOption)]
+
+
 def _edit_options_for_row(table: QTableWidget, row: int) -> None:
     field_type = _combo_data(table, row, 3) or "single_select"
-    if field_type not in {"single_select", "multi_select"}:
+    if field_type not in SELECTABLE_FIELD_TYPES:
         return
     existing_options = _options_value(table, row, 5)
     dialog = ReviewOptionsDialog(existing_options, table)
     if dialog.exec() != int(QDialog.DialogCode.Accepted):
         return
     _set_options_item(table, row, dialog.options)
+    _set_options_stash(table, row, dialog.options)
 
 
-def _options_preview(options: list[ReviewOption]) -> str:
+def _options_preview(options: list[ReviewOption], field_type: str) -> str:
+    if field_type in OPTIONLESS_FIELD_TYPES:
+        return "不适用"
     if not options:
         return "未配置选项"
     parts: list[str] = []
@@ -819,7 +855,9 @@ def _options_preview(options: list[ReviewOption]) -> str:
     return " / ".join(parts)
 
 
-def _options_tooltip(options: list[ReviewOption]) -> str:
+def _options_tooltip(options: list[ReviewOption], field_type: str) -> str:
+    if field_type in OPTIONLESS_FIELD_TYPES:
+        return ""
     if not options:
         return "未配置选项"
     return "\n".join(
@@ -851,14 +889,15 @@ def _collect_review_field_at_row(table: QTableWidget, row: int) -> ReviewField |
     field_type = _combo_data(table, row, 3) or "single_select"
     required = _checkbox_value(table, row, 4)
     options = _options_value(table, row, 5)
+    stashed_options = _options_stash_value(table, row, 5)
     if not field_id and not label:
         return None
     if not field_id or not label:
         raise ValueError(f"检查项第 {row + 1} 行需要结果列名和问题标题。")
-    if field_type in {"single_select", "multi_select"} and not options:
+    if field_type in SELECTABLE_FIELD_TYPES and not options:
         raise ValueError(f"检查项 {label} 需要至少一个选项。")
-    if field_type in {"text", "boolean"}:
-        options = []
+    if field_type in OPTIONLESS_FIELD_TYPES:
+        options = stashed_options or options
     return ReviewField(
         field_id=field_id,
         label=label,
@@ -923,9 +962,8 @@ def _fill_review_fields_table(
         if summary_item is None:
             summary_item = QTableWidgetItem()
             table.setItem(row, 5, summary_item)
-        summary_item.setText(_options_preview(field.options))
-        summary_item.setToolTip(_options_tooltip(field.options))
         _set_options_item(table, row, field.options)
+        _set_options_stash(table, row, field.options)
     _configure_review_fields_table(table, field_id_editable=field_id_editable)
 
 
@@ -1064,6 +1102,11 @@ def _set_cell_value(table: QTableWidget, row: int, column: int, value: object) -
             row,
             [item for item in options if isinstance(item, ReviewOption)],
         )
+        _set_options_stash(
+            table,
+            row,
+            [item for item in options if isinstance(item, ReviewOption)],
+        )
         return
     if isinstance(widget, QKeySequenceEdit):
         widget.setKeySequence(QKeySequence(str(value or "")))
@@ -1115,3 +1158,30 @@ def _configure_review_fields_table(table: QTableWidget, *, field_id_editable: bo
             type_combo.setEnabled(not is_unique)
         if isinstance(required_checkbox, QCheckBox):
             required_checkbox.setEnabled(not is_unique)
+        _normalize_review_field_row_options(table, row)
+        if option_item is not None:
+            selectable_options = _field_type_supports_options(_combo_data(table, row, 3))
+            option_flags = option_item.flags()
+            if selectable_options and not is_unique:
+                option_item.setFlags(option_flags | Qt.ItemFlag.ItemIsEnabled)
+            else:
+                option_item.setFlags(option_flags & ~Qt.ItemFlag.ItemIsEditable)
+
+
+def _field_type_supports_options(field_type: str | None) -> bool:
+    return (field_type or "single_select") in SELECTABLE_FIELD_TYPES
+
+
+def _normalize_review_field_row_options(table: QTableWidget, row: int) -> None:
+    field_type = _combo_data(table, row, 3) or "single_select"
+    visible_options = _options_value(table, row, 5)
+    stashed_options = _options_stash_value(table, row, 5)
+    if field_type in OPTIONLESS_FIELD_TYPES:
+        options_to_stash = visible_options or stashed_options
+        if options_to_stash:
+            _set_options_stash(table, row, options_to_stash)
+        _set_options_item(table, row, [])
+        return
+    options_to_restore = visible_options or stashed_options
+    _set_options_item(table, row, options_to_restore)
+    _set_options_stash(table, row, options_to_restore)
