@@ -4,9 +4,10 @@ from collections.abc import Callable
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import QEventLoop, Qt, QTimer
 from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (
+    QApplication,
     QDialog,
     QDialogButtonBox,
     QHBoxLayout,
@@ -47,7 +48,7 @@ class ShortcutConfigDialog(QDialog):
         self._previous_shortcut_edit.setKeySequence(QKeySequence(shortcuts.previous))
         self._exit_shortcut_edit.setKeySequence(QKeySequence(shortcuts.exit))
 
-        root.addWidget(self._row("提交", self._submit_shortcut_edit))
+        root.addWidget(self._row("提交/保存", self._submit_shortcut_edit))
         root.addWidget(self._row("上一条", self._previous_shortcut_edit))
         root.addWidget(self._row("退出", self._exit_shortcut_edit))
 
@@ -100,6 +101,8 @@ class ReviewWindow(QMainWindow):
         self._review_started_at = datetime.now(UTC)
         self._review_started_completed = self._display_completed_items_for(self.task)
         self._handling_browser_block = False
+        self._submit_locked = False
+        self._switching_current_item = False
 
         self.setWindowTitle("检查")
         self.resize(660, 660)
@@ -126,11 +129,13 @@ class ReviewWindow(QMainWindow):
         self._progress_label = QLabel("0 / 0")
         self._completion_label = QLabel("-")
         self._remaining_label = QLabel("-")
+        self._mode_label = QLabel("-")
         self._progress_bar = QProgressBar()
         self._progress_bar.setTextVisible(True)
         top_row.addWidget(self._summary("进度", self._progress_label))
         top_row.addWidget(self._summary("完成", self._completion_label))
         top_row.addWidget(self._summary("剩余", self._remaining_label))
+        top_row.addWidget(self._summary("模式", self._mode_label))
         layout.addLayout(top_row)
         layout.addWidget(self._progress_bar)
 
@@ -158,6 +163,8 @@ class ReviewWindow(QMainWindow):
         self._exit_button.clicked.connect(self.close)
         self._previous_button = QPushButton("上一条")
         self._previous_button.clicked.connect(self._go_to_previous)
+        self._next_button = QPushButton("下一条")
+        self._next_button.clicked.connect(self._go_to_next)
         self._submit_button = QPushButton("提交")
         self._submit_button.clicked.connect(self._submit_review)
         actions.addWidget(self._shortcut_button)
@@ -165,6 +172,7 @@ class ReviewWindow(QMainWindow):
         actions.addWidget(self._exit_button)
         actions.addStretch(1)
         actions.addWidget(self._previous_button)
+        actions.addWidget(self._next_button)
         actions.addWidget(self._submit_button)
         layout.addLayout(actions)
 
@@ -205,10 +213,12 @@ class ReviewWindow(QMainWindow):
         shortcuts = self.task.task_snapshot.shortcuts
         submit_shortcut = QShortcut(QKeySequence(shortcuts.submit), self)
         submit_shortcut.activated.connect(self._submit_review)
+        submit_shortcut.setProperty("action_id", "submit")
         self._dynamic_shortcuts.append(submit_shortcut)
 
         previous_shortcut = QShortcut(QKeySequence(shortcuts.previous), self)
         previous_shortcut.activated.connect(self._go_to_previous)
+        previous_shortcut.setProperty("action_id", "previous")
         self._dynamic_shortcuts.append(previous_shortcut)
 
         exit_shortcut = QShortcut(QKeySequence(shortcuts.exit), self)
@@ -226,6 +236,7 @@ class ReviewWindow(QMainWindow):
                     )
                 )
                 self._dynamic_shortcuts.append(option_shortcut)
+        self._apply_interaction_state()
 
     def _update_snapshot(self, task_snapshot: TaskSnapshot) -> None:
         current_values = {
@@ -245,7 +256,7 @@ class ReviewWindow(QMainWindow):
 
     def _refresh_view(self) -> None:
         self.task = self._app_service.load_task(self.task.task_id)
-        current_index = self.task.current_task_index
+        viewing_index = self.task.viewing_task_index
         completed = self._display_completed_items()
         percentage = int((completed / self.task.total_items) * 100) if self.task.total_items else 0
         self._progress_label.setText(f"{completed}/{self.task.total_items}")
@@ -253,10 +264,33 @@ class ReviewWindow(QMainWindow):
         self._progress_bar.setValue(completed)
         self._progress_bar.setFormat(f"{percentage}%")
         self._refresh_time_labels()
-        self._item_details_label.setText(self._build_item_details(current_index))
-        self._submit_button.setEnabled(self.task.current_item is not None)
-        self._previous_button.setEnabled(self._has_previous_review())
-        self._sync_form_with_current_item()
+        self._item_details_label.setText(self._build_item_details(viewing_index))
+        self._sync_form_with_viewing_item()
+        self._apply_interaction_state()
+
+    def _apply_interaction_state(self) -> None:
+        viewing_current_item = self._is_viewing_current_item()
+        if self._switching_current_item and viewing_current_item:
+            mode_text = "切换中"
+            submit_text = "切换中"
+        else:
+            mode_text = "当前检查" if viewing_current_item else "历史回看"
+            submit_text = "提交" if viewing_current_item else "保存修改"
+        self._mode_label.setText(mode_text)
+        self._submit_button.setText(submit_text)
+        self._submit_button.setEnabled(
+            self.task.viewing_item is not None and not self._submit_locked
+        )
+        navigation_enabled = not self._switching_current_item
+        self._previous_button.setEnabled(navigation_enabled and self._can_view_previous())
+        self._next_button.setEnabled(navigation_enabled and self._can_view_next())
+        self._fields_container.setEnabled(not self._switching_current_item)
+        for shortcut in self._dynamic_shortcuts:
+            action_id = shortcut.property("action_id")
+            if action_id == "submit":
+                shortcut.setEnabled(not self._submit_locked)
+            elif action_id == "previous":
+                shortcut.setEnabled(navigation_enabled)
 
     def _refresh_time_labels(self) -> None:
         eta_seconds = self._review_time_metrics()
@@ -269,11 +303,11 @@ class ReviewWindow(QMainWindow):
         item = self._app_service.load_item_at(task_id=self.task.task_id, task_index=task_index)
         if item is None:
             return "没有更多条目。"
-        details: list[str] = []
+        details: list[str] = [f"序号：{task_index}"]
         for field_name in self._app_service.task_display_field_names(self.task, [item]):
             if field_name in item.task_data:
                 details.append(f"{field_name}：{item.task_data[field_name]}")
-        return "\n".join(details) if details else "当前条目没有可展示字段。"
+        return "\n".join(details)
 
     def _review_time_metrics(self) -> int | None:
         elapsed = max(int((datetime.now(UTC) - self._review_started_at).total_seconds()), 0)
@@ -281,8 +315,7 @@ class ReviewWindow(QMainWindow):
         remaining = max(self.task.total_items - self._display_completed_items(), 0)
         if completed_in_session <= 0:
             return None
-        eta = int(elapsed / completed_in_session * remaining)
-        return eta
+        return int(elapsed / completed_in_session * remaining)
 
     def _format_completion_time(self, remaining_seconds: int | None) -> str:
         if remaining_seconds is None:
@@ -320,50 +353,110 @@ class ReviewWindow(QMainWindow):
                 errors.append(field.label)
         return values, errors
 
+    def _collect_form_values(self) -> dict[str, object]:
+        values = {field_id: widget.value() for field_id, widget in self._field_widgets.items()}
+        return {key: value for key, value in values.items() if not _is_empty_value(value)}
+
     def _submit_review(self) -> None:
-        target_index = self.task.current_task_index
+        if self._submit_locked:
+            return
+        target_index = self.task.viewing_task_index
+        submitting_current_item = self._is_viewing_current_item()
         values, errors = self._collect_review_values()
         if errors:
             QMessageBox.warning(self, "缺少必填项", "请先完成：\n" + "\n".join(errors))
             return
+        if submitting_current_item:
+            if (
+                self._should_confirm_current_page_alignment()
+                and not self._confirm_current_page_alignment()
+            ):
+                return
+            self._submit_locked = True
+            self._switching_current_item = True
+            self._apply_interaction_state()
         self.task = self._app_service.save_review(
             task_id=self.task.task_id,
             task_index=target_index,
             review_data=values,
-            advance_pointer=True,
+            advance_pointer=submitting_current_item,
         )
-        self._clear_review_form()
-        if not self._sync_browser_buffer():
-            return
         self._refresh_view()
+        if submitting_current_item:
+            QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+            QTimer.singleShot(0, self._sync_browser_buffer_after_submit)
+            return
+        self._submit_locked = False
+        self._apply_interaction_state()
+
+    def _sync_browser_buffer_after_submit(self) -> None:
+        try:
+            self._sync_browser_buffer()
+        finally:
+            self._switching_current_item = False
+            self._submit_locked = False
+            self._refresh_view()
 
     def _go_to_previous(self) -> None:
-        target_index = self._app_service.find_previous_reviewed_index(
+        if self._switching_current_item:
+            return
+        if not self._can_view_previous():
+            return
+        self._navigate_to(self.task.viewing_task_index - 1)
+
+    def _go_to_next(self) -> None:
+        if self._switching_current_item:
+            return
+        if not self._can_view_next():
+            return
+        self._navigate_to(self.task.viewing_task_index + 1)
+
+    def _navigate_to(self, task_index: int) -> None:
+        if self._switching_current_item:
+            return
+        if self._is_viewing_current_item():
+            self._save_current_draft()
+        self.task = self._app_service.set_viewing_task_index(
             task_id=self.task.task_id,
-            before_task_index=self.task.current_task_index,
+            task_index=task_index,
         )
-        if target_index is None:
-            return
-        review = self._app_service.load_review(task_id=self.task.task_id, task_index=target_index)
-        if review is None:
-            return
-        self.task = self._app_service.jump_to_task_index(
-            task_id=self.task.task_id,
-            task_index=target_index,
-        )
-        self._populate_review_form(review.review_data)
-        if not self._sync_browser_buffer():
-            return
         self._refresh_view()
 
-    def _has_previous_review(self) -> bool:
-        return (
-            self._app_service.find_previous_reviewed_index(
-                task_id=self.task.task_id,
-                before_task_index=self.task.current_task_index,
-            )
-            is not None
+    def _can_view_previous(self) -> bool:
+        return self.task.viewing_task_index > 1
+
+    def _can_view_next(self) -> bool:
+        return self.task.viewing_task_index < self._max_viewing_index()
+
+    def _max_viewing_index(self) -> int:
+        if self.task.total_items <= 0:
+            return 1
+        return min(self.task.current_task_index, self.task.total_items)
+
+    def _is_viewing_current_item(self) -> bool:
+        return self.task.viewing_task_index == self.task.current_task_index
+
+    def _save_current_draft(self) -> None:
+        if not self._is_viewing_current_item():
+            return
+        self.task = self._app_service.save_review_draft(
+            task_id=self.task.task_id,
+            task_index=self.task.current_task_index,
+            draft_data=self._collect_form_values(),
         )
+
+    def _should_confirm_current_page_alignment(self) -> bool:
+        return not self._browser.current_review_page_matches_active_tab()
+
+    def _confirm_current_page_alignment(self) -> bool:
+        result = QMessageBox.question(
+            self,
+            "确认提交",
+            "当前浏览器前台标签不是当前检查页。\n\n是否仍然提交当前检查内容？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        return result == QMessageBox.StandardButton.Yes
 
     def _sync_browser_buffer(self) -> bool:
         items = self._app_service.list_buffer_items(self.task)
@@ -380,15 +473,11 @@ class ReviewWindow(QMainWindow):
         self._handling_browser_block = True
         try:
             while block is not None:
-                result = QMessageBox.question(
+                QMessageBox.information(
                     self,
                     "页面处理",
                     self._format_browser_block_message(block),
-                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
-                    QMessageBox.StandardButton.Yes,
                 )
-                if result != QMessageBox.StandardButton.Yes:
-                    return False
                 self._browser.resume_buffer()
                 items = self._app_service.list_buffer_items(self.task)
                 self._browser.sync_buffer(
@@ -407,7 +496,7 @@ class ReviewWindow(QMainWindow):
         if block.url:
             lines.append(f"URL：{block.url}")
         lines.append("")
-        lines.append("请在浏览器中处理后点击“继续”。")
+        lines.append("请先在浏览器中处理，然后点击“确定”继续。")
         return "\n".join(lines)
 
     def _edit_public_shortcuts(self) -> None:
@@ -428,14 +517,12 @@ class ReviewWindow(QMainWindow):
     def _edit_option_shortcut(self, field_id: str, option_value: str) -> None:
         snapshot = deepcopy(self.task.task_snapshot)
         target_option = None
-        target_label = option_value
         for field in snapshot.review_fields:
             if field.field_id != field_id:
                 continue
             for option in field.options:
                 if option.value == option_value:
                     target_option = option
-                    target_label = option.label
                     break
         if target_option is None:
             return
@@ -445,12 +532,12 @@ class ReviewWindow(QMainWindow):
             editor.setKeySequence(QKeySequence(target_option.shortcut))
 
         dialog = QDialog(self)
-        dialog.setWindowTitle(f"设置快捷键 - {target_label}")
+        dialog.setWindowTitle(f"设置快捷键 - {option_value}")
         dialog.setModal(True)
         dialog_layout = QVBoxLayout(dialog)
         dialog_layout.setContentsMargins(16, 16, 16, 16)
         dialog_layout.setSpacing(10)
-        dialog_layout.addWidget(QLabel(f"{target_label}"))
+        dialog_layout.addWidget(QLabel(option_value))
         dialog_layout.addWidget(editor)
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
@@ -476,14 +563,16 @@ class ReviewWindow(QMainWindow):
         for field_id, widget in self._field_widgets.items():
             widget.set_value(values.get(field_id))
 
-    def _clear_review_form(self) -> None:
-        for widget in self._field_widgets.values():
-            widget.clear_value()
-
-    def _sync_form_with_current_item(self) -> None:
-        if self.task.current_review is None:
-            return
-        self._populate_review_form(self.task.current_review.review_data)
+    def _sync_form_with_viewing_item(self) -> None:
+        values: dict[str, object] = {}
+        if self._is_viewing_current_item():
+            if self.task.current_draft is not None:
+                values = self.task.current_draft.draft_data
+            elif self.task.current_review is not None:
+                values = self.task.current_review.review_data
+        elif self.task.viewing_review is not None:
+            values = self.task.viewing_review.review_data
+        self._populate_review_form(values)
 
     def _toggle_always_on_top(self, checked: bool) -> None:
         self._set_always_on_top(checked, persist=True)
@@ -516,7 +605,18 @@ class ReviewWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         self._timer.stop()
+        self._save_current_draft()
         self._browser.shutdown()
         if self._on_close is not None:
             self._on_close()
         super().closeEvent(event)
+
+
+def _is_empty_value(value: object) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return not value.strip()
+    if isinstance(value, list):
+        return len(value) == 0
+    return False

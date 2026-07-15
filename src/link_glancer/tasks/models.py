@@ -12,7 +12,6 @@ CollectorSessionStatus = Literal["active", "interrupted", "finalizing", "finaliz
 @dataclass(slots=True)
 class ReviewOption:
     value: str
-    label: str
     shortcut: str | None = None
 
 
@@ -96,6 +95,13 @@ class ReviewRecord:
 
 
 @dataclass(slots=True)
+class ReviewDraft:
+    task_item_id: int
+    draft_data: dict[str, object]
+    updated_at: str
+
+
+@dataclass(slots=True)
 class TaskDetail:
     task_id: int
     name: str
@@ -108,10 +114,15 @@ class TaskDetail:
     browser_config: BrowserConfig
     status: TaskStatus
     current_task_index: int
+    viewing_task_index: int
     total_items: int
     completed_items: int
     current_item: TaskItem | None
     current_review: ReviewRecord | None
+    current_draft: ReviewDraft | None
+    viewing_item: TaskItem | None
+    viewing_review: ReviewRecord | None
+    viewing_draft: ReviewDraft | None
     created_at: str
     updated_at: str
 

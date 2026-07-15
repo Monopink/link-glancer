@@ -9,6 +9,7 @@ from link_glancer.tasks.models import (
     BrowserProfile,
     CreatorCollectionRecovery,
     CreatorCollectionSessionSummary,
+    ReviewDraft,
     ReviewRecord,
     TaskDetail,
     TaskItem,
@@ -71,8 +72,29 @@ class TaskRepository:
             before_task_index=before_task_index,
         )
 
+    def find_next_reviewed_index(
+        self,
+        *,
+        task_id: int,
+        after_task_index: int,
+        max_task_index: int,
+    ) -> int | None:
+        return database.find_next_reviewed_index(
+            self.database_path,
+            task_id=task_id,
+            after_task_index=after_task_index,
+            max_task_index=max_task_index,
+        )
+
     def load_review(self, *, task_id: int, task_index: int) -> ReviewRecord | None:
         return database.load_review_by_task_index(
+            self.database_path,
+            task_id=task_id,
+            task_index=task_index,
+        )
+
+    def load_review_draft(self, *, task_id: int, task_index: int) -> ReviewDraft | None:
+        return database.load_review_draft_by_task_index(
             self.database_path,
             task_id=task_id,
             task_index=task_index,
@@ -94,6 +116,20 @@ class TaskRepository:
             advance_pointer=advance_pointer,
         )
 
+    def save_review_draft(
+        self,
+        *,
+        task_id: int,
+        task_index: int,
+        draft_data: dict[str, object],
+    ) -> None:
+        database.save_review_draft(
+            self.database_path,
+            task_id=task_id,
+            task_index=task_index,
+            draft_data=draft_data,
+        )
+
     def update_task_item_data(
         self,
         *,
@@ -110,6 +146,9 @@ class TaskRepository:
 
     def jump_to_task_index(self, *, task_id: int, task_index: int) -> None:
         database.jump_to_task_index(self.database_path, task_id, task_index)
+
+    def set_viewing_task_index(self, *, task_id: int, task_index: int) -> None:
+        database.set_viewing_task_index(self.database_path, task_id, task_index)
 
     def mark_task_in_progress(self, task_id: int) -> None:
         database.mark_task_in_progress(self.database_path, task_id)

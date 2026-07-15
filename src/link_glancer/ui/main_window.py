@@ -144,7 +144,7 @@ class MainWindow(QMainWindow):
         QMessageBox.information(
             self,
             "数据库已重建",
-            "检测到不兼容的旧数据库，已按当前版本重建。\n"
+            "数据库已按当前版本重建。\n"
             "旧任务数据已清空，浏览器配置的独立环境目录未删除。\n\n"
             f"原因：{reason}",
         )
@@ -186,11 +186,6 @@ class MainWindow(QMainWindow):
         header_view.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
         header_view.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
         layout.addWidget(self._task_table, stretch=1)
-
-        self._task_empty_state_label = QLabel("暂无任务，请先新建任务或新建采集任务。")
-        self._task_empty_state_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._task_empty_state_label.setWordWrap(True)
-        layout.addWidget(self._task_empty_state_label)
 
         actions = QHBoxLayout()
         actions.setContentsMargins(0, 0, 0, 0)
@@ -431,7 +426,11 @@ class MainWindow(QMainWindow):
             selected_task_id if selected_task_id is not None else self._selected_task_id()
         )
         summaries = self.app_service.list_tasks()
-        self._task_empty_state_label.setVisible(not summaries)
+        if summaries:
+            if self.statusBar().currentMessage() == "暂无任务，请先新建任务或新建采集任务。":
+                self.statusBar().clearMessage()
+        else:
+            self.statusBar().showMessage("暂无任务，请先新建任务或新建采集任务。")
         self._task_table_ids = [summary.task_id for summary in summaries]
         self._task_table.setRowCount(len(summaries))
         for row, summary in enumerate(summaries):

@@ -9,6 +9,7 @@ from PySide6.QtWidgets import QApplication, QMessageBox, QStyleFactory, QSystemT
 
 from link_glancer.runtime.locks import register_instance
 from link_glancer.runtime.paths import bundled_asset_path
+from link_glancer.tasks.database import DatabaseResetRequiredError, reset_app_database
 from link_glancer.ui.fonts import apply_application_font
 from link_glancer.ui.main_window import MainWindow
 
@@ -78,7 +79,9 @@ def create_application() -> QApplication:
     )
 
     try:
-        window = MainWindow(instance_id=instance_registration.instance_id)
+        window = _create_main_window_with_database_recovery(
+            instance_id=instance_registration.instance_id
+        )
     except Exception as exc:
         instance_registration.release()
         QMessageBox.critical(None, "启动失败", str(exc))
@@ -93,6 +96,25 @@ def create_application() -> QApplication:
     window.activateWindow()
 
     return app
+
+
+def _create_main_window_with_database_recovery(*, instance_id: int) -> MainWindow:
+    try:
+        return MainWindow(instance_id=instance_id)
+    except DatabaseResetRequiredError as exc:
+        result = QMessageBox.warning(
+            None,
+            "数据库需要重建",
+            "当前数据库无法平稳迁移到新版本，继续将清空现有任务数据并重建数据库。\n\n"
+            f"原因：{exc.reason}\n\n"
+            "是否继续重建？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if result != QMessageBox.StandardButton.Yes:
+            raise RuntimeError("用户取消了数据库重建。") from exc
+        reset_app_database()
+        return MainWindow(instance_id=instance_id)
 
 
 def _apply_color_scheme(app: QApplication) -> None:

@@ -104,7 +104,6 @@ def review_field_to_dict(field: ReviewField) -> dict[str, object]:
         "options": [
             {
                 "value": option.value,
-                "label": option.label,
                 "shortcut": option.shortcut,
             }
             for option in field.options
@@ -120,11 +119,11 @@ def review_field_from_dict(data: dict[str, object]) -> ReviewField:
         required=bool(data.get("required", False)),
         options=[
             ReviewOption(
-                value=str(option["value"]),
-                label=str(option["label"]),
+                value=str(option.get("value", "")),
                 shortcut=str(option["shortcut"]) if option.get("shortcut") else None,
             )
             for option in _dict_list(data.get("options", []))
+            if str(option.get("value", "")).strip()
         ],
     )
 

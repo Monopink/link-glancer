@@ -11,6 +11,7 @@ from link_glancer.tasks.models import (
     BrowserProfile,
     CreatorCollectionRecovery,
     CreatorCollectionSessionSummary,
+    ReviewDraft,
     ReviewRecord,
     TaskDetail,
     TaskItem,
@@ -25,91 +26,44 @@ from link_glancer.tasks.serialization import (
     task_snapshot_to_dict,
 )
 
-CURRENT_SCHEMA_VERSION = 6
+CURRENT_SCHEMA_VERSION = 7
 _LAST_DATABASE_RESET_REASON: str | None = None
 
-_REQUIRED_SCHEMA_COLUMNS = {
-    "browser_profiles": {
-        "id",
-        "name",
-        "created_at",
-        "updated_at",
-    },
-    "browser_configs": {
-        "id",
-        "name",
-        "profile_id",
-        "executable_path",
-        "launch_args_json",
-        "test_url",
-        "last_tested_at",
-        "last_test_status",
-        "created_at",
-        "updated_at",
-    },
-    "tasks": {
-        "id",
-        "name",
-        "source_file_path",
-        "source_file_name",
-        "source_file_size",
-        "source_file_mtime",
-        "source_file_hash",
-        "browser_config_id",
-        "task_snapshot_json",
-        "browser_config_snapshot_json",
-        "status",
-        "current_task_index",
-        "created_at",
-        "updated_at",
-    },
-    "task_items": {"id", "task_id", "task_index", "source_row", "task_data_json", "created_at"},
-    "reviews": {"task_item_id", "review_data_json", "review_status", "reviewed_at", "updated_at"},
-    "review_history": {"id", "task_item_id", "action", "payload_json", "created_at"},
-    "app_settings": {"key", "value_json", "updated_at"},
-    "creator_collection_sessions": {
-        "id",
-        "browser_config_id",
-        "page_url",
-        "status",
-        "collected_count",
-        "pages_fetched",
-        "safety_limit",
-        "auto_advance_interval_seconds",
-        "last_message",
-        "created_at",
-        "updated_at",
-    },
-    "creator_collection_session_rows": {
-        "id",
-        "session_id",
-        "item_index",
-        "row_key",
-        "task_data_json",
-        "created_at",
-    },
-}
+
+class DatabaseResetRequiredError(RuntimeError):
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
 
 
 def ensure_app_database() -> Path:
-    global _LAST_DATABASE_RESET_REASON
-
     database_path = app_database_path()
-    reset_reason = _database_reset_reason(database_path)
-    if reset_reason is not None:
-        try:
-            database_path.unlink(missing_ok=True)
-        except OSError as exc:
-            raise RuntimeError(
-                "检测到不兼容的旧数据库，但无法重建数据库文件。"
-                "请关闭正在运行的 LinkGlancer 或占用 app.db 的程序后重试。"
-            ) from exc
-        _LAST_DATABASE_RESET_REASON = reset_reason
-
     with sqlite3.connect(database_path) as connection:
         connection.execute("PRAGMA foreign_keys = ON")
         _ensure_schema_objects(connection)
         _migrate_schema(connection)
+        reset_reason = _database_reset_reason(connection)
+        if reset_reason is not None:
+            raise DatabaseResetRequiredError(reset_reason)
+        _set_app_setting(connection, "schema_version", CURRENT_SCHEMA_VERSION)
+    return database_path
+
+
+def reset_app_database() -> Path:
+    global _LAST_DATABASE_RESET_REASON
+
+    database_path = app_database_path()
+    try:
+        database_path.unlink(missing_ok=True)
+    except OSError as exc:
+        raise RuntimeError(
+            "无法重建数据库文件。请关闭正在运行的 LinkGlancer 或占用 app.db 的程序后重试。"
+        ) from exc
+
+    _LAST_DATABASE_RESET_REASON = "用户确认重建数据库。"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("PRAGMA foreign_keys = ON")
+        _ensure_schema_objects(connection)
         _set_app_setting(connection, "schema_version", CURRENT_SCHEMA_VERSION)
     return database_path
 
@@ -140,9 +94,10 @@ def create_task(
             INSERT INTO tasks (
                 name, source_file_path, source_file_name, source_file_size,
                 source_file_mtime, source_file_hash, browser_config_id, task_snapshot_json,
-                browser_config_snapshot_json, status, current_task_index, created_at, updated_at
+                browser_config_snapshot_json, status, current_task_index, viewing_task_index,
+                created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 name,
@@ -155,6 +110,7 @@ def create_task(
                 _json(task_snapshot_to_dict(task_snapshot)),
                 _json(browser_config_to_dict(browser_config)),
                 "ready",
+                1,
                 1,
                 now,
                 now,
@@ -229,9 +185,20 @@ def load_task_detail(database_path: Path, task_id: int) -> TaskDetail:
             raise ValueError(f"Task not found: {task_id}")
 
         current_index = int(row["current_task_index"])
+        viewing_index = int(row["viewing_task_index"])
         current_item = load_task_item_by_index(connection, task_id, current_index)
         current_review = (
             load_review_for_item(connection, current_item.task_item_id) if current_item else None
+        )
+        current_draft = (
+            load_draft_for_item(connection, current_item.task_item_id) if current_item else None
+        )
+        viewing_item = load_task_item_by_index(connection, task_id, viewing_index)
+        viewing_review = (
+            load_review_for_item(connection, viewing_item.task_item_id) if viewing_item else None
+        )
+        viewing_draft = (
+            load_draft_for_item(connection, viewing_item.task_item_id) if viewing_item else None
         )
         return TaskDetail(
             task_id=int(row["id"]),
@@ -249,10 +216,15 @@ def load_task_detail(database_path: Path, task_id: int) -> TaskDetail:
             ),
             status=str(row["status"]),  # type: ignore[arg-type]
             current_task_index=current_index,
+            viewing_task_index=viewing_index,
             total_items=int(row["total_items"]),
             completed_items=int(row["completed_items"]),
             current_item=current_item,
             current_review=current_review,
+            current_draft=current_draft,
+            viewing_item=viewing_item,
+            viewing_review=viewing_review,
+            viewing_draft=viewing_draft,
             created_at=str(row["created_at"]),
             updated_at=str(row["updated_at"]),
         )
@@ -284,7 +256,7 @@ def update_task_configuration(
             raise ValueError(f"Task not found: {task_id}")
 
         if rows is not None:
-            _delete_task_history(connection, task_id)
+            _delete_task_review_state(connection, task_id)
             connection.execute("DELETE FROM task_items WHERE task_id = ?", (task_id,))
             connection.executemany(
                 """
@@ -298,28 +270,22 @@ def update_task_configuration(
             )
             status: TaskStatus = "ready"
             current_task_index = 1
+            viewing_task_index = 1
         elif reset_reviews:
-            _delete_task_history(connection, task_id)
-            connection.execute(
-                """
-                DELETE FROM reviews
-                WHERE task_item_id IN (
-                    SELECT id FROM task_items WHERE task_id = ?
-                )
-                """,
-                (task_id,),
-            )
+            _delete_task_review_state(connection, task_id)
             status = "ready"
             current_task_index = 1
+            viewing_task_index = 1
         else:
             current = connection.execute(
-                "SELECT current_task_index, status FROM tasks WHERE id = ?",
+                "SELECT current_task_index, viewing_task_index, status FROM tasks WHERE id = ?",
                 (task_id,),
             ).fetchone()
             if current is None:
                 raise ValueError(f"Task not found: {task_id}")
             current_task_index = int(current[0])
-            status = str(current[1])  # type: ignore[assignment]
+            viewing_task_index = int(current[1])
+            status = str(current[2])  # type: ignore[assignment]
 
         connection.execute(
             """
@@ -328,6 +294,7 @@ def update_task_configuration(
                 task_snapshot_json = ?,
                 browser_config_snapshot_json = ?,
                 current_task_index = ?,
+                viewing_task_index = ?,
                 status = ?,
                 updated_at = ?
             WHERE id = ?
@@ -337,6 +304,7 @@ def update_task_configuration(
                 _json(task_snapshot_to_dict(task_snapshot)),
                 _json(browser_config_to_dict(browser_config)),
                 current_task_index,
+                viewing_task_index,
                 status,
                 now,
                 task_id,
@@ -733,6 +701,29 @@ def find_previous_reviewed_index(
         return int(row[0])
 
 
+def find_next_reviewed_index(
+    database_path: Path, *, task_id: int, after_task_index: int, max_task_index: int
+) -> int | None:
+    with sqlite3.connect(database_path) as connection:
+        row = connection.execute(
+            """
+            SELECT i.task_index
+            FROM reviews r
+            JOIN task_items i ON i.id = r.task_item_id
+            WHERE i.task_id = ?
+              AND i.task_index > ?
+              AND i.task_index <= ?
+              AND r.review_status = 'completed'
+            ORDER BY i.task_index
+            LIMIT 1
+            """,
+            (task_id, after_task_index, max_task_index),
+        ).fetchone()
+        if row is None:
+            return None
+        return int(row[0])
+
+
 def save_review(
     database_path: Path,
     *,
@@ -760,18 +751,61 @@ def save_review(
             """,
             (item.task_item_id, _json(review_data), now, now),
         )
-        connection.execute(
-            """
-            INSERT INTO review_history (task_item_id, action, payload_json, created_at)
-            VALUES (?, 'updated', ?, ?)
-            """,
-            (item.task_item_id, _json(review_data), now),
-        )
+        connection.execute("DELETE FROM review_drafts WHERE task_item_id = ?", (item.task_item_id,))
         if advance_pointer:
             total_items = _count_task_items(connection, task_id)
             next_index = min(task_index + 1, total_items + 1)
             status = "completed" if task_index >= total_items else "in_progress"
-            _update_task_pointer(connection, task_id, next_index, status)
+            _update_task_pointer(
+                connection,
+                task_id,
+                current_task_index=next_index,
+                viewing_task_index=next_index,
+                status=status,
+            )
+        else:
+            connection.execute("UPDATE tasks SET updated_at = ? WHERE id = ?", (now, task_id))
+
+
+def save_review_draft(
+    database_path: Path,
+    *,
+    task_id: int,
+    task_index: int,
+    draft_data: dict[str, object],
+) -> None:
+    now = _now_iso()
+    with sqlite3.connect(database_path) as connection:
+        item = load_task_item_by_index(connection, task_id, task_index)
+        if item is None:
+            raise ValueError(f"Task item not found: task_id={task_id}, task_index={task_index}")
+        if not draft_data:
+            connection.execute(
+                "DELETE FROM review_drafts WHERE task_item_id = ?", (item.task_item_id,)
+            )
+        else:
+            connection.execute(
+                """
+                INSERT INTO review_drafts (task_item_id, draft_data_json, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(task_item_id) DO UPDATE SET
+                    draft_data_json = excluded.draft_data_json,
+                    updated_at = excluded.updated_at
+                """,
+                (item.task_item_id, _json(draft_data), now),
+            )
+        connection.execute("UPDATE tasks SET updated_at = ? WHERE id = ?", (now, task_id))
+
+
+def load_review_draft_by_task_index(
+    database_path: Path, *, task_id: int, task_index: int
+) -> ReviewDraft | None:
+    with sqlite3.connect(database_path) as connection:
+        connection.row_factory = sqlite3.Row
+        item = load_task_item_by_index(connection, task_id, task_index)
+        if item is None:
+            return None
+        return load_draft_for_item(connection, item.task_item_id)
 
 
 def update_task_item_data(
@@ -805,7 +839,33 @@ def jump_to_task_index(database_path: Path, task_id: int, task_index: int) -> No
         total_items = _count_task_items(connection, task_id)
         normalized = 1 if total_items == 0 else max(1, min(task_index, total_items))
         status: TaskStatus = "ready" if total_items == 0 else "in_progress"
-        _update_task_pointer(connection, task_id, normalized, status)
+        _update_task_pointer(
+            connection,
+            task_id,
+            current_task_index=normalized,
+            viewing_task_index=normalized,
+            status=status,
+        )
+
+
+def set_viewing_task_index(database_path: Path, task_id: int, task_index: int) -> None:
+    with sqlite3.connect(database_path) as connection:
+        total_items = _count_task_items(connection, task_id)
+        if total_items <= 0:
+            normalized = 1
+        else:
+            row = connection.execute(
+                "SELECT current_task_index FROM tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"Task not found: {task_id}")
+            max_viewing_index = min(int(row[0]), total_items)
+            normalized = max(1, min(task_index, max_viewing_index))
+        connection.execute(
+            "UPDATE tasks SET viewing_task_index = ?, updated_at = ? WHERE id = ?",
+            (normalized, _now_iso(), task_id),
+        )
 
 
 def mark_task_in_progress(database_path: Path, task_id: int) -> None:
@@ -816,12 +876,18 @@ def mark_task_in_progress(database_path: Path, task_id: int) -> None:
             "completed" if current_completed >= total_items and total_items > 0 else "in_progress"
         )
         row = connection.execute(
-            "SELECT current_task_index FROM tasks WHERE id = ?",
+            "SELECT current_task_index, viewing_task_index FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if row is None:
             raise ValueError(f"Task not found: {task_id}")
-        _update_task_pointer(connection, task_id, int(row[0]), status)
+        _update_task_pointer(
+            connection,
+            task_id,
+            current_task_index=int(row[0]),
+            viewing_task_index=int(row[1]),
+            status=status,
+        )
 
 
 def load_review_by_task_index(
@@ -945,18 +1011,11 @@ def delete_browser_profile(database_path: Path, profile_id: str) -> None:
         connection.execute("DELETE FROM browser_profiles WHERE id = ?", (profile_id,))
 
 
-def _database_reset_reason(database_path: Path) -> str | None:
-    if not database_path.exists():
-        return None
-
-    connection: sqlite3.Connection | None = None
+def _database_reset_reason(connection: sqlite3.Connection) -> str | None:
     try:
-        connection = sqlite3.connect(database_path)
         table_names = _table_names(connection)
         if not table_names:
             return None
-        if "app_settings" not in table_names:
-            return "数据库缺少 schema 版本信息"
 
         schema_version = _schema_version(connection)
         if schema_version is not None and schema_version > CURRENT_SCHEMA_VERSION:
@@ -964,24 +1023,8 @@ def _database_reset_reason(database_path: Path) -> str | None:
                 f"数据库 schema 版本不匹配：当前需要 {CURRENT_SCHEMA_VERSION}，"
                 f"实际为 {schema_version or '未设置'}"
             )
-
-        for table_name, required_columns in _REQUIRED_SCHEMA_COLUMNS.items():
-            if table_name not in table_names:
-                if table_name in {
-                    "creator_collection_sessions",
-                    "creator_collection_session_rows",
-                } and schema_version in {None, 5}:
-                    continue
-                return f"数据库缺少表：{table_name}"
-            existing_columns = _table_columns(connection, table_name)
-            missing_columns = sorted(required_columns - existing_columns)
-            if missing_columns:
-                return f"数据库表 {table_name} 缺少字段：{', '.join(missing_columns)}"
     except sqlite3.DatabaseError as exc:
         return f"数据库文件无法读取：{exc}"
-    finally:
-        if connection is not None:
-            connection.close()
 
     return None
 
@@ -1054,6 +1097,7 @@ def _ensure_schema_objects(connection: sqlite3.Connection) -> None:
             browser_config_snapshot_json TEXT NOT NULL,
             status TEXT NOT NULL,
             current_task_index INTEGER NOT NULL,
+            viewing_task_index INTEGER NOT NULL,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
@@ -1078,12 +1122,11 @@ def _ensure_schema_objects(connection: sqlite3.Connection) -> None:
             FOREIGN KEY(task_item_id) REFERENCES task_items(id) ON DELETE CASCADE
         );
 
-        CREATE TABLE IF NOT EXISTS review_history (
-            id INTEGER PRIMARY KEY,
-            task_item_id INTEGER NOT NULL,
-            action TEXT NOT NULL,
-            payload_json TEXT NOT NULL,
-            created_at TEXT NOT NULL
+        CREATE TABLE IF NOT EXISTS review_drafts (
+            task_item_id INTEGER PRIMARY KEY,
+            draft_data_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(task_item_id) REFERENCES task_items(id) ON DELETE CASCADE
         );
 
         CREATE TABLE IF NOT EXISTS app_settings (
@@ -1131,6 +1174,9 @@ def _migrate_schema(connection: sqlite3.Connection) -> None:
     if schema_version == 5:
         _migrate_schema_v5_to_v6(connection)
         return
+    if schema_version == 6:
+        _migrate_schema_v6_to_v7(connection)
+        return
     raise RuntimeError(
         f"不支持从 schema 版本 {schema_version} 自动迁移到 {CURRENT_SCHEMA_VERSION}。"
     )
@@ -1138,6 +1184,33 @@ def _migrate_schema(connection: sqlite3.Connection) -> None:
 
 def _migrate_schema_v5_to_v6(connection: sqlite3.Connection) -> None:
     # v6 only adds creator collector temporary-session tables; existing task data stays intact.
+    _ensure_schema_objects(connection)
+
+
+def _migrate_schema_v6_to_v7(connection: sqlite3.Connection) -> None:
+    existing_task_columns = _table_columns(connection, "tasks")
+    if "viewing_task_index" not in existing_task_columns:
+        connection.execute(
+            "ALTER TABLE tasks ADD COLUMN viewing_task_index INTEGER NOT NULL DEFAULT 1"
+        )
+        connection.execute(
+            """
+            UPDATE tasks
+            SET viewing_task_index = current_task_index
+            WHERE viewing_task_index IS NULL OR viewing_task_index < 1
+            """
+        )
+    connection.execute("DROP TABLE IF EXISTS review_history")
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS review_drafts (
+            task_item_id INTEGER PRIMARY KEY,
+            draft_data_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(task_item_id) REFERENCES task_items(id) ON DELETE CASCADE
+        )
+        """
+    )
     _ensure_schema_objects(connection)
 
 
@@ -1173,6 +1246,21 @@ def load_review_for_item(connection: sqlite3.Connection, task_item_id: int) -> R
     return _review_from_row(row)
 
 
+def load_draft_for_item(connection: sqlite3.Connection, task_item_id: int) -> ReviewDraft | None:
+    connection.row_factory = sqlite3.Row
+    row = connection.execute(
+        """
+        SELECT task_item_id, draft_data_json, updated_at
+        FROM review_drafts
+        WHERE task_item_id = ?
+        """,
+        (task_item_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return _review_draft_from_row(row)
+
+
 def _task_item_from_row(row: sqlite3.Row) -> TaskItem:
     return TaskItem(
         task_item_id=int(row["id"]),
@@ -1188,6 +1276,14 @@ def _review_from_row(row: sqlite3.Row) -> ReviewRecord:
         review_data=json.loads(row["review_data_json"]),
         review_status=str(row["review_status"]),
         reviewed_at=str(row["reviewed_at"]) if row["reviewed_at"] else None,
+        updated_at=str(row["updated_at"]),
+    )
+
+
+def _review_draft_from_row(row: sqlite3.Row) -> ReviewDraft:
+    return ReviewDraft(
+        task_item_id=int(row["task_item_id"]),
+        draft_data=json.loads(row["draft_data_json"]),
         updated_at=str(row["updated_at"]),
     )
 
@@ -1228,10 +1324,19 @@ def _count_completed_items(connection: sqlite3.Connection, task_id: int) -> int:
     )
 
 
-def _delete_task_history(connection: sqlite3.Connection, task_id: int) -> None:
+def _delete_task_review_state(connection: sqlite3.Connection, task_id: int) -> None:
     connection.execute(
         """
-        DELETE FROM review_history
+        DELETE FROM review_drafts
+        WHERE task_item_id IN (
+            SELECT id FROM task_items WHERE task_id = ?
+        )
+        """,
+        (task_id,),
+    )
+    connection.execute(
+        """
+        DELETE FROM reviews
         WHERE task_item_id IN (
             SELECT id FROM task_items WHERE task_id = ?
         )
@@ -1241,16 +1346,21 @@ def _delete_task_history(connection: sqlite3.Connection, task_id: int) -> None:
 
 
 def _update_task_pointer(
-    connection: sqlite3.Connection, task_id: int, task_index: int, status: TaskStatus
+    connection: sqlite3.Connection,
+    task_id: int,
+    *,
+    current_task_index: int,
+    viewing_task_index: int,
+    status: TaskStatus,
 ) -> None:
     now = _now_iso()
     connection.execute(
         """
         UPDATE tasks
-        SET current_task_index = ?, status = ?, updated_at = ?
+        SET current_task_index = ?, viewing_task_index = ?, status = ?, updated_at = ?
         WHERE id = ?
         """,
-        (task_index, status, now, task_id),
+        (current_task_index, viewing_task_index, status, now, task_id),
     )
     _set_app_setting(connection, "last_task_id", task_id)
 

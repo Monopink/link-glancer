@@ -12,6 +12,7 @@ from link_glancer.tasks.models import (
     BrowserConfig,
     BrowserProfile,
     CreatorCollectionRecovery,
+    ReviewDraft,
     ReviewField,
     ReviewOption,
     ReviewRecord,
@@ -499,8 +500,8 @@ class TaskApplicationService:
                 field_type="single_select",
                 required=True,
                 options=[
-                    ReviewOption(value="是", label="是", shortcut="1"),
-                    ReviewOption(value="否", label="否", shortcut="2"),
+                    ReviewOption(value="是", shortcut="1"),
+                    ReviewOption(value="否", shortcut="2"),
                 ],
             ),
             ReviewField(
@@ -509,9 +510,9 @@ class TaskApplicationService:
                 field_type="single_select",
                 required=False,
                 options=[
-                    ReviewOption(value="好", label="好", shortcut="3"),
-                    ReviewOption(value="中", label="中", shortcut="4"),
-                    ReviewOption(value="差", label="差", shortcut="5"),
+                    ReviewOption(value="好", shortcut="3"),
+                    ReviewOption(value="中", shortcut="4"),
+                    ReviewOption(value="差", shortcut="5"),
                 ],
             ),
             ReviewField(
@@ -587,8 +588,24 @@ class TaskApplicationService:
             before_task_index=before_task_index,
         )
 
+    def find_next_reviewed_index(
+        self,
+        *,
+        task_id: int,
+        after_task_index: int,
+        max_task_index: int,
+    ) -> int | None:
+        return self._tasks.find_next_reviewed_index(
+            task_id=task_id,
+            after_task_index=after_task_index,
+            max_task_index=max_task_index,
+        )
+
     def load_review(self, *, task_id: int, task_index: int) -> ReviewRecord | None:
         return self._tasks.load_review(task_id=task_id, task_index=task_index)
+
+    def load_review_draft(self, *, task_id: int, task_index: int) -> ReviewDraft | None:
+        return self._tasks.load_review_draft(task_id=task_id, task_index=task_index)
 
     def save_review(
         self,
@@ -603,6 +620,20 @@ class TaskApplicationService:
             task_index=task_index,
             review_data=review_data,
             advance_pointer=advance_pointer,
+        )
+        return self.load_task(task_id)
+
+    def save_review_draft(
+        self,
+        *,
+        task_id: int,
+        task_index: int,
+        draft_data: dict[str, object],
+    ) -> TaskDetail:
+        self._tasks.save_review_draft(
+            task_id=task_id,
+            task_index=task_index,
+            draft_data=draft_data,
         )
         return self.load_task(task_id)
 
@@ -622,6 +653,10 @@ class TaskApplicationService:
 
     def jump_to_task_index(self, *, task_id: int, task_index: int) -> TaskDetail:
         self._tasks.jump_to_task_index(task_id=task_id, task_index=task_index)
+        return self.load_task(task_id)
+
+    def set_viewing_task_index(self, *, task_id: int, task_index: int) -> TaskDetail:
+        self._tasks.set_viewing_task_index(task_id=task_id, task_index=task_index)
         return self.load_task(task_id)
 
     def mark_task_in_progress(self, task_id: int) -> TaskDetail:
@@ -706,7 +741,7 @@ class TaskApplicationService:
         for field in review_fields:
             for option in field.options:
                 if option.shortcut:
-                    register(option.shortcut, f"{field.label} / {option.label}")
+                    register(option.shortcut, f"{field.label} / {option.value}")
 
     def enabled_review_fields(self, task_snapshot: TaskSnapshot) -> list[ReviewField]:
         enabled_ids = {

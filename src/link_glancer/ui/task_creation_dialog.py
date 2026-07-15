@@ -71,8 +71,8 @@ class ReviewOptionsDialog(QDialog):
 
         root = QVBoxLayout(self)
         self._table = QTableWidget()
-        self._table.setColumnCount(3)
-        self._table.setHorizontalHeaderLabels(["值", "显示名", "快捷键"])
+        self._table.setColumnCount(2)
+        self._table.setHorizontalHeaderLabels(["选项", "快捷键"])
         _setup_table(self._table)
         _fill_options_table(self._table, self.options)
         root.addWidget(self._table, stretch=1)
@@ -815,8 +815,7 @@ def _options_preview(options: list[ReviewOption]) -> str:
         return "未配置选项"
     parts: list[str] = []
     for option in options:
-        label = option.label or option.value
-        parts.append(f"{label}({option.shortcut})" if option.shortcut else label)
+        parts.append(f"{option.value}({option.shortcut})" if option.shortcut else option.value)
     return " / ".join(parts)
 
 
@@ -824,7 +823,7 @@ def _options_tooltip(options: list[ReviewOption]) -> str:
     if not options:
         return "未配置选项"
     return "\n".join(
-        f"{option.value} | {option.label}" + (f" | {option.shortcut}" if option.shortcut else "")
+        f"{option.value}" + (f" | {option.shortcut}" if option.shortcut else "")
         for option in options
     )
 
@@ -886,8 +885,7 @@ def _fill_options_table(table: QTableWidget, options: list[ReviewOption]) -> Non
     for row, option in enumerate(options):
         _add_empty_option_row(table, row=row)
         table.setItem(row, 0, QTableWidgetItem(option.value))
-        table.setItem(row, 1, QTableWidgetItem(option.label))
-        editor = table.cellWidget(row, 2)
+        editor = table.cellWidget(row, 1)
         if isinstance(editor, QKeySequenceEdit) and option.shortcut:
             editor.setKeySequence(QKeySequence(option.shortcut))
 
@@ -937,11 +935,11 @@ def _add_empty_option_row(table: QTableWidget, row: int | None = None) -> None:
         table.insertRow(actual_row)
     else:
         table.setRowCount(max(table.rowCount(), actual_row + 1))
-    for column in (0, 1):
+    for column in (0,):
         if table.item(actual_row, column) is None:
             table.setItem(actual_row, column, QTableWidgetItem(""))
-    if table.cellWidget(actual_row, 2) is None:
-        table.setCellWidget(actual_row, 2, QKeySequenceEdit())
+    if table.cellWidget(actual_row, 1) is None:
+        table.setCellWidget(actual_row, 1, QKeySequenceEdit())
 
 
 def _collect_options(table: QTableWidget) -> list[ReviewOption]:
@@ -950,12 +948,11 @@ def _collect_options(table: QTableWidget) -> list[ReviewOption]:
     seen_shortcuts: set[str] = set()
     for row in range(table.rowCount()):
         value = _table_text(table, row, 0)
-        label = _table_text(table, row, 1)
-        shortcut = _key_editor_value(table, row, 2)
-        if not value and not label and not shortcut:
+        shortcut = _key_editor_value(table, row, 1)
+        if not value and not shortcut:
             continue
-        if not value or not label:
-            raise ValueError(f"选项第 {row + 1} 行需要值和显示名。")
+        if not value:
+            raise ValueError(f"选项第 {row + 1} 行不能为空。")
         if value in seen_values:
             raise ValueError(f"选项值重复：{value}")
         if shortcut:
@@ -964,7 +961,7 @@ def _collect_options(table: QTableWidget) -> list[ReviewOption]:
                 raise ValueError(f"选项快捷键重复：{shortcut}")
             seen_shortcuts.add(normalized)
         seen_values.add(value)
-        options.append(ReviewOption(value=value, label=label, shortcut=shortcut or None))
+        options.append(ReviewOption(value=value, shortcut=shortcut or None))
     return options
 
 
