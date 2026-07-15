@@ -32,7 +32,7 @@ from creator_collector import CreatorCollectorDialog
 from creator_enrichment import CreatorEnrichmentDialog
 from creator_enrichment.state import is_terminal_status, normalize_state, setting_key
 from link_glancer.application import TaskApplicationService
-from link_glancer.browser.base import BrowserController, BrowserLaunchRequest, BufferBlock
+from link_glancer.browser.base import BrowserController, BrowserLaunchRequest
 from link_glancer.browser.detector import detect_browser
 from link_glancer.browser.service import create_browser_controller
 from link_glancer.runtime.locks import (
@@ -118,7 +118,6 @@ class MainWindow(QMainWindow):
         self._editing_task_index: int | None = None
         self._review_window: ReviewWindow | None = None
         self._confirmation_task_id: int | None = None
-        self._handling_browser_block = False
         self._task_worker_thread: QThread | None = None
         self._task_worker: _TaskMutationWorker | None = None
         self._task_progress_dialog: QProgressDialog | None = None
@@ -1037,46 +1036,7 @@ class MainWindow(QMainWindow):
             tasks=items,
             url_field=self.task.task_snapshot.url_field,
         )
-        return self._handle_browser_buffer_block()
-
-    def _handle_browser_buffer_block(self) -> bool:
-        block = self.browser.buffer_block()
-        if block is None or self._handling_browser_block:
-            return True
-        self._handling_browser_block = True
-        try:
-            while block is not None:
-                result = QMessageBox.question(
-                    self,
-                    "页面处理",
-                    self._format_browser_block_message(block),
-                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
-                    QMessageBox.StandardButton.Yes,
-                )
-                if result != QMessageBox.StandardButton.Yes:
-                    return False
-                self.browser.resume_buffer()
-                if self.task is None:
-                    return False
-                items = self.app_service.list_buffer_items(self.task)
-                self.browser.sync_buffer(
-                    tasks=items,
-                    url_field=self.task.task_snapshot.url_field,
-                )
-                block = self.browser.buffer_block()
-            return True
-        finally:
-            self._handling_browser_block = False
-
-    def _format_browser_block_message(self, block: BufferBlock) -> str:
-        lines = [block.message]
-        if block.task_index is not None:
-            lines.append(f"条目序号：{block.task_index}")
-        if block.url:
-            lines.append(f"URL：{block.url}")
-        lines.append("")
-        lines.append("请在浏览器中处理后点击“继续”。")
-        return "\n".join(lines)
+        return True
 
     def _export_task_with_dialog(self) -> None:
         if not self.task:
