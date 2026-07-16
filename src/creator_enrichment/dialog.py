@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
 )
 
 from link_glancer.application import TaskApplicationService
+from link_glancer.runtime.dev import dev_mode_title_suffix, is_dev_mode
 from link_glancer.runtime.locks import (
     RuntimeLockConflictError,
     RuntimeLockHandle,
@@ -160,7 +161,7 @@ class CreatorEnrichmentDialog(QDialog):
         self._profile_lock: RuntimeLockHandle | None = None
         self._task_lock: RuntimeLockHandle | None = None
 
-        self.setWindowTitle(f"补充采集 · 任务 #{task.task_id}")
+        self.setWindowTitle(f"补充采集 · 任务 #{task.task_id}{dev_mode_title_suffix()}")
         self.resize(860, 320)
 
         root = QVBoxLayout(self)
@@ -280,6 +281,8 @@ class CreatorEnrichmentDialog(QDialog):
         else:
             program = sys.executable
             arguments = ["-m", "link_glancer.main", "--creator-enrichment-worker"]
+        if is_dev_mode():
+            arguments.append("--dev-mode")
         self._process.start(program, arguments)
 
     def _send_start_command(self) -> None:

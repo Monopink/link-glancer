@@ -7,6 +7,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QIcon, QPalette
 from PySide6.QtWidgets import QApplication, QMessageBox, QStyleFactory, QSystemTrayIcon
 
+from link_glancer.runtime.dev import dev_mode_title_suffix
 from link_glancer.runtime.locks import register_instance
 from link_glancer.runtime.paths import bundled_asset_path
 from link_glancer.tasks.database import DatabaseResetRequiredError, reset_app_database
@@ -20,7 +21,7 @@ def create_application() -> QApplication:
         Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
     )
     app = QApplication([])
-    app.setApplicationName("LinkGlancer")
+    app.setApplicationName(f"LinkGlancer{dev_mode_title_suffix()}")
     app.setOrganizationName("LinkGlancer")
     instance_registration = register_instance()
     icon_path = bundled_asset_path("packaging", "icon.svg")

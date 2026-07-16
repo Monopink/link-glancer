@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
 
 from link_glancer.application import TaskApplicationService
 from link_glancer.browser.base import BrowserController
+from link_glancer.runtime.dev import dev_mode_title_suffix
 from link_glancer.tasks.models import TaskDetail, TaskSnapshot
 from link_glancer.ui.review_form import ReviewFieldWidget, create_field_widget
 
@@ -33,7 +34,7 @@ from link_glancer.ui.review_form import ReviewFieldWidget, create_field_widget
 class ShortcutConfigDialog(QDialog):
     def __init__(self, task: TaskDetail, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.setWindowTitle("快捷键")
+        self.setWindowTitle(f"快捷键{dev_mode_title_suffix()}")
         self.setModal(True)
         self.resize(420, 180)
 
@@ -107,7 +108,7 @@ class ReviewWindow(QMainWindow):
         self._switching_current_item = False
         self._browser_unavailable_notified = False
 
-        self.setWindowTitle("检查")
+        self.setWindowTitle(f"检查{dev_mode_title_suffix()}")
         self.resize(660, 660)
         self.setMinimumWidth(560)
 

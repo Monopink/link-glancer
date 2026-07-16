@@ -58,6 +58,7 @@ from creator_enrichment.parsers import (
 from creator_enrichment.state import is_terminal_status, normalize_state, now_iso, update_item_state
 from link_glancer.application import TaskApplicationService
 from link_glancer.browser.detector import detect_browser
+from link_glancer.runtime.dev import JsonlDevLogger, is_dev_mode
 from link_glancer.runtime.paths import ensure_browser_environment_dir
 from link_glancer.tasks.models import BrowserConfig, TaskItem
 
@@ -128,12 +129,20 @@ class CreatorEnrichmentSession:
         self._route_installed = False
         self._collection_mode_installed = False
         self._auto_skip_on_failure = False
+        self._dev_logger: JsonlDevLogger | None = None
 
     def start(self) -> CreatorEnrichmentStatus:
         self.shutdown()
+        if is_dev_mode():
+            self._dev_logger = JsonlDevLogger(
+                module="creator_enrichment",
+                file_stem=f"creator_enrichment_task_{self._task_id}",
+            )
+            self._log_event("session_start")
         candidate = detect_browser("configured", self._browser_config.executable_path or None)
         if candidate is None:
             self._last_message = "未找到可用浏览器。"
+            self._log_event("session_error", reason="browser_not_found")
             return self.status()
 
         environment_dir = ensure_browser_environment_dir(self._browser_config.profile_id)
@@ -166,6 +175,7 @@ class CreatorEnrichmentSession:
             self._advance_to_next_pending(open_page=True)
         except PlaywrightError as exc:
             self._last_message = f"浏览器启动失败：{exc}"
+            self._log_event("session_error", reason="browser_launch_failed", details=str(exc))
             self.shutdown()
         return self.status()
 
@@ -259,12 +269,14 @@ class CreatorEnrichmentSession:
         self._paused = False
         self._pause_reason = None
         self._last_message = self._with_subject("补充采集中。")
+        self._log_event("resume", task_index=self._current_task_index)
         return self.status()
 
     def skip_current(self) -> CreatorEnrichmentStatus:
         if self._current_task_index is None:
             return self.status()
         subject = self._current_subject()
+        self._log_event("skip", task_index=self._current_task_index, reason="manual")
         update_item_state(
             self._state,
             task_index=self._current_task_index,
@@ -286,15 +298,26 @@ class CreatorEnrichmentSession:
         self._pause_reason = None
         self._start_current_attempt(reload_page=True, clear_failure_history=True)
         self._last_message = self._with_subject("正在重试。")
+        self._log_event("retry", task_index=self._current_task_index, reason="manual")
         return self.status()
 
     def stop(self) -> CreatorEnrichmentStatus:
         self._paused = True
         self._pause_reason = PAUSE_REASON_MANUAL_ACTION
         self._last_message = "补充采集已暂停。"
+        self._log_event(
+            "pause",
+            task_index=self._current_task_index,
+            reason=PAUSE_REASON_MANUAL_ACTION,
+        )
         return self.status()
 
     def shutdown(self) -> None:
+        self._log_event(
+            "session_end",
+            task_index=self._current_task_index,
+            completed=self._completed,
+        )
         if self._context is not None:
             try:
                 self._context.close()
@@ -315,6 +338,7 @@ class CreatorEnrichmentSession:
         self._collection_started = False
         self._route_installed = False
         self._collection_mode_installed = False
+        self._dev_logger = None
 
     def status(self) -> CreatorEnrichmentStatus:
         total_count = len(self._eligible_items())
@@ -381,6 +405,12 @@ class CreatorEnrichmentSession:
             self._failure_attempts = []
         self._current_task_index = item.task_index
         self._current_region = normalized_region(item.task_data.get("selection_region"))
+        self._log_event(
+            "advance_next",
+            task_index=self._current_task_index,
+            region=self._current_region,
+            open_page=open_page,
+        )
         if open_page:
             self._load_current_detail_page()
 
@@ -407,6 +437,12 @@ class CreatorEnrichmentSession:
         self._waiting_started_at = datetime.now(UTC)
         if self._collection_started:
             self._collection_mode_installed = False
+        self._log_event(
+            "open_start",
+            task_index=self._current_task_index,
+            creator_oecuid=creator_id,
+            reload_page=reload_page,
+        )
         try:
             if reload_page:
                 self._page.reload(wait_until="commit")
@@ -416,9 +452,11 @@ class CreatorEnrichmentSession:
                     wait_until="commit",
                 )
             self._page.bring_to_front()
+            self._log_event("open_committed", task_index=self._current_task_index)
             if self._collection_started:
                 self._ensure_collection_mode()
         except PlaywrightError:
+            self._log_event("open_failed", task_index=self._current_task_index)
             self._handle_retryable_manual_failure(
                 "无法打开达人详情页，请处理后继续，或跳过当前达人。"
             )
@@ -454,6 +492,11 @@ class CreatorEnrichmentSession:
                 profile_types=profile_types,
             )
             if should_capture:
+                self._log_event(
+                    "profile_seen",
+                    task_index=self._current_task_index,
+                    source="response",
+                )
                 self._store_captured_profile(
                     creator_id=response_creator_id or creator_id,
                     payload=payload,
@@ -466,6 +509,11 @@ class CreatorEnrichmentSession:
             self._last_contact_response_url = response.url
             self._last_contact_payload = payload
             if creator_id:
+                self._log_event(
+                    "contact_seen",
+                    task_index=self._current_task_index,
+                    source="response",
+                )
                 self._contact_positive_signal = True
                 self._captured_contact = _CapturedContact(creator_id=creator_id, payload=payload)
 
@@ -589,6 +637,11 @@ class CreatorEnrichmentSession:
             response_creator_id=creator_id,
             profile_types=profile_types,
         ):
+            self._log_event(
+                "profile_seen",
+                task_index=self._current_task_index,
+                source="page_capture",
+            )
             self._store_captured_profile(
                 creator_id=creator_id,
                 payload=payload,
@@ -611,6 +664,11 @@ class CreatorEnrichmentSession:
         self._last_contact_response_url = url
         self._last_contact_payload = payload
         self._contact_positive_signal = True
+        self._log_event(
+            "contact_seen",
+            task_index=self._current_task_index,
+            source="page_capture",
+        )
         self._captured_contact = _CapturedContact(creator_id=creator_id, payload=payload)
 
     def _handle_page_badge_capture(self, entry: object) -> None:
@@ -622,11 +680,17 @@ class CreatorEnrichmentSession:
         if detected:
             self._last_contact_badge_detected = True
             self._contact_positive_signal = True
+            self._log_event("badge_detected", task_index=self._current_task_index)
         if strategy:
             self._last_contact_badge_strategy = strategy
         if clicked and not self._last_contact_badge_clicked:
             self._last_contact_badge_clicked = True
             self._last_contact_badge_clicked_at = datetime.now(UTC)
+            self._log_event(
+                "badge_clicked",
+                task_index=self._current_task_index,
+                source="page_capture",
+            )
         if not detected:
             return
         if not self._last_contact_badge_clicked:
@@ -728,6 +792,7 @@ class CreatorEnrichmentSession:
         )
 
         if contact_available is False and not has_contact:
+            self._log_event("no_contact", task_index=self._current_task_index)
             self._mark_no_contact_and_advance()
             return
         if not has_contact and contact_available is not True:
@@ -755,6 +820,7 @@ class CreatorEnrichmentSession:
             self._current_step = "waiting_contact"
             self._waiting_started_at = datetime.now(UTC)
             self._last_message = self._with_subject("有联系方式，正在采集。")
+            self._log_event("badge_clicked", task_index=self._current_task_index, source="service")
         return
 
     def _apply_contact(self) -> None:
@@ -1123,6 +1189,21 @@ class CreatorEnrichmentSession:
         if not subject:
             return message
         return f"{subject}：{message}"
+
+    def _log_event(self, event: str, **fields: object) -> None:
+        if self._dev_logger is None:
+            return
+        self._dev_logger.log(
+            event,
+            task_id=self._task_id,
+            current_task_index=self._current_task_index,
+            current_region=self._current_region,
+            current_step=self._current_step,
+            paused=self._paused,
+            completed=self._completed,
+            message=self._last_message,
+            **fields,
+        )
 
     def _mark_no_contact_and_advance(self) -> None:
         if self._current_task_index is None:

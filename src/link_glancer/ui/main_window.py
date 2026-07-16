@@ -35,6 +35,7 @@ from link_glancer.application import TaskApplicationService
 from link_glancer.browser.base import BrowserController, BrowserLaunchRequest
 from link_glancer.browser.detector import detect_browser
 from link_glancer.browser.service import create_browser_controller
+from link_glancer.runtime.dev import dev_mode_title_suffix
 from link_glancer.runtime.locks import (
     RuntimeLockConflictError,
     RuntimeLockHandle,
@@ -1266,7 +1267,7 @@ class MainWindow(QMainWindow):
 
     def _update_window_title(self, *, profile_name: str | None = None) -> None:
         suffix = f" {self._instance_id}" if self._instance_id > 1 else ""
-        title = f"LinkGlancer{suffix}"
+        title = f"LinkGlancer{suffix}{dev_mode_title_suffix()}"
         if profile_name:
             title += f" - Profile: {profile_name}"
         self.setWindowTitle(title)
