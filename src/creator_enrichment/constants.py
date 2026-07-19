@@ -5,7 +5,8 @@ from link_glancer.tasks.export_fields import KNOWN_CONTACT_EXPORT_FIELDS
 PROFILE_API_PATH = "/api/v1/oec/affiliate/creator/marketplace/profile"
 CONTACT_API_PATH = "/api_sens/v1/affiliate/cmp/contact"
 DETAIL_URL_TEMPLATE = (
-    "https://affiliate.tiktokshopglobalselling.com/connection/creator/detail?cid={creator_oecuid}"
+    "https://affiliate.tiktokshopglobalselling.com/connection/creator/detail"
+    "?cid={creator_oecuid}&shop_region={shop_region}"
 )
 
 PROFILE_WAIT_SECONDS = 8

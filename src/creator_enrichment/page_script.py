@@ -92,43 +92,94 @@ def network_capture_init_script() -> str:
         if (root.badgeClickPageUrl === location.href) {{
             return;
         }}
-        const icons = Array.from(
-            container.querySelectorAll("div.cursor-pointer svg[class*='alliance-icon-']"),
-        );
-        for (const icon of icons) {{
-            if (!(icon instanceof SVGElement)) {{
-                continue;
+        const normalizeText = (value) =>
+            typeof value === "string" ? value.trim().toLowerCase() : "";
+        const keywordVariants = contactBadgeKeywords.map((keyword) => normalizeText(keyword));
+        const describeTarget = (target) => {{
+            if (!(target instanceof HTMLElement)) {{
+                return "";
             }}
-            const className = icon.getAttribute("class") || "";
-            const matchedKeyword = contactBadgeKeywords.find(
-                (keyword) => className.includes(keyword),
+            const className =
+                typeof target.className === "string" ? target.className : "";
+            const svgClassName =
+                target.querySelector("svg")?.getAttribute("class") || "";
+            return [
+                target.tagName.toLowerCase(),
+                target.getAttribute("data-e2e") || "",
+                target.getAttribute("data-tid") || "",
+                target.getAttribute("aria-label") || "",
+                target.getAttribute("title") || "",
+                className,
+                svgClassName,
+            ]
+                .map((part) => normalizeText(part))
+                .filter(Boolean)
+                .join("|");
+        }};
+        const triggerClick = (target) => {{
+            target.dispatchEvent(
+                new MouseEvent("mousedown", {{ bubbles: true, cancelable: true }}),
             );
-            if (!matchedKeyword) {{
-                continue;
+            target.dispatchEvent(
+                new MouseEvent("mouseup", {{ bubbles: true, cancelable: true }}),
+            );
+            target.dispatchEvent(
+                new MouseEvent("click", {{ bubbles: true, cancelable: true }}),
+            );
+            target.click();
+        }};
+        const candidates = [];
+        const seen = new Set();
+        const pushCandidate = (node) => {{
+            const target = resolveClickable(
+                node instanceof HTMLElement ? node : node?.parentElement,
+                container,
+            );
+            if (!(target instanceof HTMLElement) || seen.has(target)) {{
+                return;
             }}
-            const target = resolveClickable(icon.parentElement || icon, container);
+            seen.add(target);
+            const description = describeTarget(target);
+            const matchedKeywordIndex = keywordVariants.findIndex(
+                (keyword) => keyword && description.includes(keyword),
+            );
+            if (matchedKeywordIndex < 0) {{
+                return;
+            }}
+            candidates.push({{
+                target,
+                matchedKeyword: contactBadgeKeywords[matchedKeywordIndex],
+            }});
+        }};
+        for (const node of container.querySelectorAll(
+            "svg, button, a, [role='button'], div.cursor-pointer",
+        )) {{
+            pushCandidate(node);
+        }}
+        for (const candidate of candidates) {{
+            const target = candidate.target;
             if (!(target instanceof HTMLElement) || !isVisible(target)) {{
                 reportBadge({{
                     detected: true,
                     clicked: false,
-                    strategy: `observer:${{matchedKeyword}}:not_visible`,
+                    strategy: `observer:${{candidate.matchedKeyword}}:not_visible`,
                 }});
                 return;
             }}
             try {{
                 root.badgeClickPageUrl = location.href;
-                target.click();
+                triggerClick(target);
                 reportBadge({{
                     detected: true,
                     clicked: true,
-                    strategy: `observer:${{matchedKeyword}}:click`,
+                    strategy: `observer:${{candidate.matchedKeyword}}:click`,
                 }});
             }} catch {{
                 root.badgeClickPageUrl = "";
                 reportBadge({{
                     detected: true,
                     clicked: false,
-                    strategy: `observer:${{matchedKeyword}}:visible`,
+                    strategy: `observer:${{candidate.matchedKeyword}}:visible`,
                 }});
             }}
             return;
@@ -237,6 +288,8 @@ def enrichment_collection_mode_script() -> str:
     const style = document.createElement("style");
     style.id = "link-glancer-enrichment-mode";
     style.textContent = `
+        #content-container > aside,
+        #content-container > main > #im-entry,
         #im-entry,
         aside,
         [data-tid="m4b_page_header"],
@@ -259,14 +312,93 @@ def enrichment_collection_mode_script() -> str:
         #content-container,
         main,
         #affiliate_sub_app_container,
-        #modern_sub_app_container_connection {
+        #modern_sub_app_container_connection,
+        #garfish_app_for_connection_6o7h3vss,
+        [__garfishmockbody__] {
             max-width: none !important;
             width: 100% !important;
         }
         #scroll-container,
         main,
-        #affiliate_sub_app_container {
+        #affiliate_sub_app_container,
+        #content-container {
             overflow-anchor: none !important;
+        }
+        #content-container {
+            display: block !important;
+            padding-top: 72px !important;
+            padding-left: 0 !important;
+        }
+        #content-container > main {
+            width: 100% !important;
+            margin: 0 !important;
+            padding: 0 !important;
+            flex: none !important;
+        }
+        #content-container > main > div,
+        #affiliate_sub_app_container > div,
+        #modern_sub_app_container_connection > div,
+        [__garfishmockbody__] > div {
+            margin: 0 !important;
+            padding: 0 !important;
+            width: 100% !important;
+            max-width: none !important;
+        }
+        #scroll-container > .h-60.fixed {
+            min-height: 60px !important;
+            padding: 0 16px !important;
+            background: rgba(23, 25, 29, 0.92) !important;
+            backdrop-filter: blur(4px) !important;
+        }
+        #scroll-container > .h-60.fixed > :first-child,
+        #scroll-container > .h-60.fixed #im-nav,
+        #scroll-container > .h-60.fixed .pulse-badge,
+        #scroll-container > .h-60.fixed [class*="Help"],
+        #scroll-container > .h-60.fixed [class*="Help"] * {
+            display: none !important;
+        }
+        #scroll-container > .h-60.fixed > :last-child {
+            display: flex !important;
+            width: 100% !important;
+            justify-content: space-between !important;
+            align-items: center !important;
+            gap: 12px !important;
+        }
+        #scroll-container > .h-60.fixed > :last-child > div {
+            display: flex !important;
+            align-items: center !important;
+            gap: 8px !important;
+        }
+        #scroll-container > .h-60.fixed #region-selector,
+        #scroll-container > .h-60.fixed #region-selector * {
+            display: initial !important;
+        }
+        #scroll-container > .h-60.fixed #region-selector {
+            display: flex !important;
+            pointer-events: auto !important;
+            margin-left: auto !important;
+        }
+        #scroll-container > .h-60.fixed #region-selector > div,
+        #scroll-container > .h-60.fixed #region-selector > div > div {
+            display: inline-flex !important;
+            align-items: center !important;
+            cursor: pointer !important;
+        }
+        #creator-detail-profile-container {
+            align-items: flex-start !important;
+            gap: 20px !important;
+        }
+        #creator-detail-profile-container > [data-e2e="1d25e140-5f50-b605"] {
+            flex: 1 1 auto !important;
+            min-width: 0 !important;
+        }
+        #creator-detail-profile-container > [data-e2e="f1003596-3f9a-0aeb"] {
+            flex: 0 0 auto !important;
+            align-self: flex-start !important;
+            position: static !important;
+            min-width: max-content !important;
+            padding-left: 12px !important;
+            background: transparent !important;
         }
         [data-e2e="e4af3b5a-a87c-dfbd"],
         [data-e2e="1a71a34c-27e4-2557"],

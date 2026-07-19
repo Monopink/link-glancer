@@ -16,6 +16,7 @@ class CreatorEnrichmentStatus:
     running: bool
     paused: bool
     completed: bool
+    startup_phase: str
     total_count: int
     completed_count: int
     success_count: int

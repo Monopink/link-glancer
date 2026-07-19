@@ -5,7 +5,7 @@ import sys
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
-from PySide6.QtCore import QProcess, Qt, QTimer
+from PySide6.QtCore import QEventLoop, QProcess, Qt, QTimer
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
     QApplication,
@@ -43,6 +43,7 @@ class _EnrichmentWorkerStatus:
     running: bool
     paused: bool
     completed: bool
+    startup_phase: str
     total_count: int
     completed_count: int
     success_count: int
@@ -68,6 +69,7 @@ class _EnrichmentWorkerStatus:
             running=False,
             paused=True,
             completed=False,
+            startup_phase="idle",
             total_count=0,
             completed_count=0,
             success_count=0,
@@ -96,6 +98,7 @@ class _EnrichmentWorkerStatus:
             running=bool(payload.get("running")),
             paused=bool(payload.get("paused")),
             completed=bool(payload.get("completed")),
+            startup_phase=str(payload.get("startup_phase") or "idle"),
             total_count=int(payload.get("total_count") or 0),
             completed_count=int(payload.get("completed_count") or 0),
             success_count=int(payload.get("success_count") or 0),
@@ -150,6 +153,7 @@ class CreatorEnrichmentDialog(QDialog):
         self._task = task
         self._status = _EnrichmentWorkerStatus.idle()
         self._startup_pending = True
+        self._startup_phase = "browser_confirm"
         self._worker_started = False
         self._worker_buffer = ""
         self._expected_process_exit = False
@@ -157,12 +161,14 @@ class CreatorEnrichmentDialog(QDialog):
         self._last_time_label_refresh_at: datetime | None = None
         self._last_notified_message = ""
         self._last_issue_dialog_key: tuple[object, ...] | None = None
+        self._startup_loop: QEventLoop | None = None
+        self._startup_result: bool | None = None
         self._process = QProcess(self)
         self._profile_lock: RuntimeLockHandle | None = None
         self._task_lock: RuntimeLockHandle | None = None
 
         self.setWindowTitle(f"补充采集 · 任务 #{task.task_id}{dev_mode_title_suffix()}")
-        self.resize(860, 320)
+        self.resize(420, 260)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(16, 16, 16, 16)
@@ -185,7 +191,7 @@ class CreatorEnrichmentDialog(QDialog):
         self._no_contact_label = QLabel("0")
         self._skipped_label = QLabel("0")
         _add_summary_row(left_grid, 0, "进度", self._count_label)
-        _add_summary_row(left_grid, 1, "成功", self._success_label)
+        _add_summary_row(left_grid, 1, "有联系方式", self._success_label)
         _add_summary_row(left_grid, 2, "无联系方式", self._no_contact_label)
         _add_summary_row(left_grid, 3, "跳过", self._skipped_label)
         summary_row.addWidget(left_widget, 3)
@@ -220,30 +226,15 @@ class CreatorEnrichmentDialog(QDialog):
         options_row.setSpacing(12)
         options_row.addWidget(self._auto_skip_checkbox)
         options_row.addStretch(1)
-
-        root.addStretch(1)
-
-        actions = QHBoxLayout()
-        actions.setContentsMargins(0, 0, 0, 0)
-        actions.setSpacing(12)
-        self._skip_button = QPushButton("跳过")
-        self._skip_button.clicked.connect(self._skip_current)
-        self._retry_button = QPushButton("重试")
-        self._retry_button.clicked.connect(self._retry_current)
         self._pause_button = QPushButton("暂停")
         self._pause_button.clicked.connect(self._pause)
         self._continue_button = QPushButton("继续")
         self._continue_button.clicked.connect(self._resume)
-        close_button = QPushButton("关闭")
-        close_button.clicked.connect(self.close)
-        actions.addWidget(self._skip_button)
-        actions.addWidget(self._retry_button)
-        actions.addWidget(self._pause_button)
-        actions.addWidget(self._continue_button)
-        actions.addStretch(1)
-        actions.addWidget(close_button)
+        options_row.addWidget(self._pause_button)
+        options_row.addWidget(self._continue_button)
+
+        root.addStretch(1)
         root.addLayout(options_row)
-        root.addLayout(actions)
 
         self._timer = QTimer(self)
         self._timer.setInterval(COLLECTION_POLL_INTERVAL_MS)
@@ -251,7 +242,6 @@ class CreatorEnrichmentDialog(QDialog):
         self._timer.start()
         self._configure_process()
         self._refresh_from_status()
-        QTimer.singleShot(0, self._start_worker_process)
 
     def _configure_process(self) -> None:
         self._process.setProcessChannelMode(QProcess.ProcessChannelMode.SeparateChannels)
@@ -259,6 +249,19 @@ class CreatorEnrichmentDialog(QDialog):
         self._process.readyReadStandardOutput.connect(self._read_worker_output)
         self._process.finished.connect(self._handle_process_finished)
         self._process.errorOccurred.connect(self._handle_process_error)
+
+    def start_with_confirmation(self) -> bool:
+        if self._process.state() != QProcess.ProcessState.NotRunning:
+            return False
+        self._startup_result = None
+        self._start_worker_process()
+        if self._force_close:
+            return False
+        loop = QEventLoop(self)
+        self._startup_loop = loop
+        loop.exec()
+        self._startup_loop = None
+        return bool(self._startup_result)
 
     def _start_worker_process(self) -> None:
         try:
@@ -313,7 +316,7 @@ class CreatorEnrichmentDialog(QDialog):
                 self._status = _EnrichmentWorkerStatus.from_payload(raw_status)
                 if not self._worker_started and self._status.running:
                     self._worker_started = True
-                    self._confirm_start()
+                self._maybe_handle_startup_phase()
                 self._refresh_from_status()
                 if self._should_close_after_browser_shutdown():
                     self._force_close = True
@@ -327,9 +330,29 @@ class CreatorEnrichmentDialog(QDialog):
             details = str(payload.get("details") or "")
             if _is_expected_browser_close_message(message, details):
                 return
+            self._finish_startup(result=False)
             QMessageBox.warning(self, "补充采集失败", message)
 
-    def _confirm_start(self) -> None:
+    def _maybe_handle_startup_phase(self) -> None:
+        if not self._startup_pending:
+            return
+        phase = self._status.startup_phase or "idle"
+        if phase == "browser_confirm" and self._startup_phase == "browser_confirm":
+            self._startup_phase = "browser_confirm_shown"
+            self._confirm_browser_start()
+            return
+        if phase == "collecting" and self._startup_phase == "browser_confirm_done":
+            self._startup_phase = "collecting"
+            self._startup_pending = False
+            self._finish_startup(result=True)
+
+    def _finish_startup(self, *, result: bool) -> None:
+        if self._startup_result is None:
+            self._startup_result = result
+        if self._startup_loop is not None and self._startup_loop.isRunning():
+            self._startup_loop.quit()
+
+    def _confirm_browser_start(self) -> None:
         region_text = self._status.current_region or "未知区域"
         result = QMessageBox.question(
             self,
@@ -340,10 +363,12 @@ class CreatorEnrichmentDialog(QDialog):
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
             QMessageBox.StandardButton.Yes,
         )
-        self._startup_pending = False
         if result == QMessageBox.StandardButton.Yes:
-            self._resume()
+            self._startup_phase = "browser_confirm_done"
+            self._send_command({"cmd": "prepare_pages"})
             return
+        self._startup_phase = "browser_confirm"
+        self._finish_startup(result=False)
         self._expected_process_exit = True
         self._send_command({"cmd": "shutdown"})
         self._force_close = True
@@ -357,26 +382,15 @@ class CreatorEnrichmentDialog(QDialog):
         self._success_label.setText(str(status.success_count))
         self._no_contact_label.setText(str(status.no_contact_count))
         self._skipped_label.setText(str(status.skipped_count + status.auto_skipped_count))
-        self._message_label.setText(status.last_message or "-")
+        self._message_label.setText(self._display_message_text(status))
         progress = 0
         if status.total_count > 0:
             progress = int(status.completed_count * 100 / status.total_count)
         self._progress.setValue(progress)
         self._refresh_time_labels_if_needed(force=True)
         controls_ready = not self._startup_pending
-        is_interrupted = status.attention_required
-        is_manual_pause = (
-            status.running and status.paused and not status.completed and not is_interrupted
-        )
-        can_handle_current = (
-            controls_ready
-            and status.running
-            and not status.completed
-            and status.current_task_index is not None
-        )
-        self._continue_button.setEnabled(controls_ready and is_manual_pause)
-        self._retry_button.setEnabled(can_handle_current and is_interrupted)
-        self._skip_button.setEnabled(can_handle_current and (is_interrupted or is_manual_pause))
+        can_continue = controls_ready and status.running and status.paused and not status.completed
+        self._continue_button.setEnabled(can_continue)
         self._pause_button.setEnabled(
             controls_ready and status.running and not status.completed and not status.paused
         )
@@ -416,10 +430,17 @@ class CreatorEnrichmentDialog(QDialog):
         if self._startup_pending:
             return "启动中"
         if status.completed:
-            return "已完成"
+            return "采集完成"
         if status.paused:
             return "已暂停"
         return "采集中"
+
+    def _display_message_text(self, status: _EnrichmentWorkerStatus) -> str:
+        if self._startup_pending:
+            if self._startup_phase == "browser_confirm_done":
+                return "正在准备补充采集。"
+            return "正在启动浏览器。"
+        return status.last_message or "-"
 
     def _notify_status_change(self) -> None:
         status = self._status
@@ -461,25 +482,13 @@ class CreatorEnrichmentDialog(QDialog):
             }
         )
 
-    def _retry_current(self) -> None:
-        self._send_command({"cmd": "retry"})
-
-    def _skip_current(self) -> None:
-        result = QMessageBox.question(
-            self,
-            "确认跳过",
-            "是否跳过当前达人并继续后续补充采集？",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
-            QMessageBox.StandardButton.Cancel,
-        )
-        if result == QMessageBox.StandardButton.Yes:
-            self._send_command({"cmd": "skip"})
-
     def _pause(self) -> None:
         self._send_command({"cmd": "pause"})
 
     def _show_issue_dialog_if_needed(self) -> None:
         status = self._status
+        if status.last_message == "浏览器已关闭。":
+            return
         if not status.attention_required:
             return
         dialog_key = (
@@ -491,14 +500,6 @@ class CreatorEnrichmentDialog(QDialog):
         if dialog_key == self._last_issue_dialog_key:
             return
         self._last_issue_dialog_key = dialog_key
-        if status.pause_reason in {"captcha", "region_mismatch"}:
-            QMessageBox.information(
-                self,
-                self._issue_dialog_title(status),
-                self._issue_dialog_message(status),
-            )
-            self._send_command({"cmd": "retry"})
-            return
         if not status.diagnostic_text:
             return
         dialog = _IssueDialog(
@@ -509,7 +510,11 @@ class CreatorEnrichmentDialog(QDialog):
             task_name=self._task.name,
             parent=self,
         )
-        dialog.exec()
+        action = dialog.exec_action()
+        if action == "retry":
+            self._send_command({"cmd": "retry"})
+        elif action == "skip":
+            self._send_command({"cmd": "skip"})
 
     def _issue_dialog_title(self, status: _EnrichmentWorkerStatus) -> str:
         if status.pause_reason == "captcha":
@@ -537,6 +542,7 @@ class CreatorEnrichmentDialog(QDialog):
 
     def _handle_process_finished(self) -> None:
         self._release_locks()
+        self._finish_startup(result=False)
         if self._force_close:
             self._force_close = False
             self.close()
@@ -544,6 +550,12 @@ class CreatorEnrichmentDialog(QDialog):
     def _handle_process_error(self, _error: QProcess.ProcessError) -> None:
         if self._force_close or self._expected_process_exit:
             return
+        if self._status.last_message == "浏览器已关闭。":
+            self._finish_startup(result=False)
+            self._force_close = True
+            self.close()
+            return
+        self._finish_startup(result=False)
         QMessageBox.warning(self, "补充采集进程失败", self._process.errorString())
 
     def _shutdown_worker_process(self) -> None:
@@ -618,6 +630,7 @@ class _IssueDialog(QDialog):
         self._diagnostic_text = diagnostic_text
         self._failure_attempts = failure_attempts
         self._task_name = task_name
+        self._selected_action = "close"
         self.setWindowTitle(title)
         self.resize(860, 620)
 
@@ -653,6 +666,10 @@ class _IssueDialog(QDialog):
         actions = QHBoxLayout()
         actions.setContentsMargins(0, 0, 0, 0)
         actions.setSpacing(12)
+        retry_button = QPushButton("重试")
+        retry_button.clicked.connect(self._accept_retry)
+        skip_button = QPushButton("跳过")
+        skip_button.clicked.connect(self._accept_skip)
         copy_button = QPushButton("复制全部")
         copy_button.clicked.connect(self._copy_text)
         select_button = QPushButton("全选")
@@ -661,12 +678,26 @@ class _IssueDialog(QDialog):
         export_button.clicked.connect(self._export_text)
         close_button = QPushButton("关闭")
         close_button.clicked.connect(self.accept)
+        actions.addWidget(retry_button)
+        actions.addWidget(skip_button)
         actions.addWidget(copy_button)
         actions.addWidget(select_button)
         actions.addWidget(export_button)
         actions.addStretch(1)
         actions.addWidget(close_button)
         root.addLayout(actions)
+
+    def exec_action(self) -> str:
+        self.exec()
+        return self._selected_action
+
+    def _accept_retry(self) -> None:
+        self._selected_action = "retry"
+        self.accept()
+
+    def _accept_skip(self) -> None:
+        self._selected_action = "skip"
+        self.accept()
 
     def _copy_text(self) -> None:
         clipboard = QGuiApplication.clipboard()

@@ -82,6 +82,9 @@ class _EnrichmentWorkerRuntime:
                 lambda session: session.resume(auto_skip_on_failure=auto_skip_on_failure)
             )
             return
+        if action == "prepare_pages":
+            self._call_session(lambda session: session.prepare_pages())
+            return
         if action == "pause":
             self._call_session(lambda session: session.stop())
             return
@@ -114,6 +117,8 @@ class _EnrichmentWorkerRuntime:
             app_service=self._app_service,
             task_id=task_id,
             browser_config=task.browser_config,
+            open_tab_count=task.task_snapshot.open_tab_count,
+            confirm_url=task.task_snapshot.confirm_url,
             state_key=setting_key(task_id),
         )
         status = self._session.start()
@@ -160,6 +165,7 @@ class _EnrichmentWorkerRuntime:
                 "running": False,
                 "paused": True,
                 "completed": False,
+                "startup_phase": "idle",
                 "total_count": 0,
                 "completed_count": 0,
                 "success_count": 0,
@@ -184,6 +190,7 @@ class _EnrichmentWorkerRuntime:
             "running": status.running,
             "paused": status.paused,
             "completed": status.completed,
+            "startup_phase": status.startup_phase,
             "total_count": status.total_count,
             "completed_count": status.completed_count,
             "success_count": status.success_count,
