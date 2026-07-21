@@ -161,6 +161,7 @@ class CreatorEnrichmentDialog(QDialog):
         self._last_time_label_refresh_at: datetime | None = None
         self._last_notified_message = ""
         self._last_issue_dialog_key: tuple[object, ...] | None = None
+        self._manual_pause_pending = False
         self._startup_loop: QEventLoop | None = None
         self._startup_result: bool | None = None
         self._process = QProcess(self)
@@ -168,7 +169,7 @@ class CreatorEnrichmentDialog(QDialog):
         self._task_lock: RuntimeLockHandle | None = None
 
         self.setWindowTitle(f"补充采集 · 任务 #{task.task_id}{dev_mode_title_suffix()}")
-        self.resize(420, 260)
+        self.resize(504, 260)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(16, 16, 16, 16)
@@ -237,9 +238,8 @@ class CreatorEnrichmentDialog(QDialog):
         root.addLayout(options_row)
 
         self._timer = QTimer(self)
-        self._timer.setInterval(COLLECTION_POLL_INTERVAL_MS)
+        self._timer.setInterval(TIME_LABEL_REFRESH_INTERVAL_SECONDS * 1000)
         self._timer.timeout.connect(self._refresh_time_labels)
-        self._timer.start()
         self._configure_process()
         self._refresh_from_status()
 
@@ -387,16 +387,38 @@ class CreatorEnrichmentDialog(QDialog):
         if status.total_count > 0:
             progress = int(status.completed_count * 100 / status.total_count)
         self._progress.setValue(progress)
-        self._refresh_time_labels_if_needed(force=True)
+        self._update_time_refresh_timer()
         controls_ready = not self._startup_pending
         can_continue = controls_ready and status.running and status.paused and not status.completed
         self._continue_button.setEnabled(can_continue)
         self._pause_button.setEnabled(
             controls_ready and status.running and not status.completed and not status.paused
         )
+        if status.paused and status.pause_reason == "manual_action":
+            self._manual_pause_pending = False
 
     def _refresh_time_labels(self) -> None:
         self._refresh_time_labels_if_needed(force=False)
+
+    def _update_time_refresh_timer(self) -> None:
+        should_run = (
+            not self._startup_pending
+            and self._status.running
+            and not self._status.paused
+            and not self._status.completed
+            and self._status.estimated_end_at is not None
+        )
+        if should_run:
+            interval_ms = TIME_LABEL_REFRESH_INTERVAL_SECONDS * 1000
+            if self._timer.interval() != interval_ms:
+                self._timer.setInterval(interval_ms)
+            if not self._timer.isActive():
+                self._refresh_time_labels_if_needed(force=True)
+                self._timer.start()
+            return
+        self._refresh_time_labels_if_needed(force=True)
+        if self._timer.isActive():
+            self._timer.stop()
 
     def _refresh_time_labels_if_needed(self, *, force: bool) -> None:
         now = datetime.now(UTC)
@@ -451,6 +473,8 @@ class CreatorEnrichmentDialog(QDialog):
             self._show_system_notification("补充采集完成", status.last_message)
             return
         if status.paused:
+            if status.pause_reason == "manual_action":
+                return
             title = "补充采集已暂停"
             if status.pause_reason == "captcha":
                 title = "需要验证码"
@@ -483,11 +507,14 @@ class CreatorEnrichmentDialog(QDialog):
         )
 
     def _pause(self) -> None:
+        self._manual_pause_pending = True
         self._send_command({"cmd": "pause"})
 
     def _show_issue_dialog_if_needed(self) -> None:
         status = self._status
         if status.last_message == "浏览器已关闭。":
+            return
+        if self._manual_pause_pending or status.pause_reason == "manual_action":
             return
         if not status.attention_required:
             return

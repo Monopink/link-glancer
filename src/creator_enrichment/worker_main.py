@@ -117,7 +117,6 @@ class _EnrichmentWorkerRuntime:
             app_service=self._app_service,
             task_id=task_id,
             browser_config=task.browser_config,
-            open_tab_count=task.task_snapshot.open_tab_count,
             confirm_url=task.task_snapshot.confirm_url,
             state_key=setting_key(task_id),
         )

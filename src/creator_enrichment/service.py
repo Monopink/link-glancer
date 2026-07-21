@@ -1,23 +1,24 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import cast
 from urllib.parse import urlsplit
 
 from playwright.sync_api import Error as PlaywrightError
-from playwright.sync_api import Page, Playwright, Response, sync_playwright
+from playwright.sync_api import Page, Playwright, sync_playwright
 
+from creator_enrichment.browser_guard import BrowserGuardMixin
+from creator_enrichment.capture_pipeline import (
+    CapturePipelineMixin,
+    _CapturedContact,
+    _CapturedProfile,
+)
 from creator_enrichment.constants import (
     BLOCKED_RESOURCE_HOSTS,
     BLOCKED_RESOURCE_PATH_MARKERS,
     BLOCKED_RESOURCE_TYPES,
-    CONTACT_API_PATH,
-    CONTACT_BADGE_CLICK_TIMEOUT_MS,
-    CONTACT_BADGE_SCROLL_TIMEOUT_MS,
     CONTACT_BADGE_WAIT_SECONDS,
-    CONTACT_ICON_CLASS_KEYWORDS,
     CONTACT_WAIT_SECONDS,
     DETAIL_URL_TEMPLATE,
     FAILURE_RETRY_LIMIT,
@@ -32,9 +33,12 @@ from creator_enrichment.constants import (
     STATE_STATUS_NO_CONTACT,
     STATE_STATUS_PAUSED_CAPTCHA,
     STATE_STATUS_PAUSED_MANUAL_ACTION,
-    STATE_STATUS_PAUSED_REGION_MISMATCH,
     STATE_STATUS_SKIPPED,
     STATE_STATUS_SUCCESS,
+)
+from creator_enrichment.contact_badge import (
+    CONTACT_BADGE_LOGIC_VERSION,
+    ContactBadgeMixin,
 )
 from creator_enrichment.diagnostics import build_diagnostic_text
 from creator_enrichment.models import CreatorEnrichmentFailureAttempt, CreatorEnrichmentStatus
@@ -43,16 +47,10 @@ from creator_enrichment.page_script import (
     network_capture_init_script,
 )
 from creator_enrichment.parsers import (
-    contact_info_available,
-    contact_patch,
-    nested_value,
     normalized_creator_id,
     normalized_region,
     parse_datetime,
-    profile_request_metadata,
-    query_param,
     remaining_regions_from_items,
-    should_capture_profile,
     sorted_items_by_region,
 )
 from creator_enrichment.state import is_terminal_status, normalize_state, now_iso, update_item_state
@@ -64,56 +62,34 @@ from link_glancer.tasks.models import BrowserConfig, TaskItem
 
 AUTO_START_PROFILE_WAIT_SECONDS = 8
 PROFILE_WAIT_GRACE_SECONDS = 4
+ATTENTION_PAUSE_REASONS = {
+    PAUSE_REASON_CAPTCHA,
+    PAUSE_REASON_REGION_MISMATCH,
+    PAUSE_REASON_MANUAL_ACTION,
+}
 
 
-@dataclass(slots=True)
-class _CapturedProfile:
-    creator_id: str
-    payload: dict[str, object]
-    shop_region: str
-    profile_types: tuple[int, ...]
-    page_url: str
-
-
-@dataclass(slots=True)
-class _CapturedContact:
-    creator_id: str
-    payload: dict[str, object]
-    page_url: str
-
-
-@dataclass(slots=True)
-class _BufferPage:
-    page: Page
-    task_index: int | None
-    profile_cache: _CapturedProfile | None = None
-    contact_cache: _CapturedContact | None = None
-    collection_mode_installed: bool = False
-
-
-class CreatorEnrichmentSession:
+class CreatorEnrichmentSession(BrowserGuardMixin, CapturePipelineMixin, ContactBadgeMixin):
     def __init__(
         self,
         *,
         app_service: TaskApplicationService,
         task_id: int,
         browser_config: BrowserConfig,
-        open_tab_count: int,
         confirm_url: str | None,
         state_key: str,
     ) -> None:
         self._app_service = app_service
         self._task_id = task_id
         self._browser_config = browser_config
-        self._open_tab_count = max(1, open_tab_count)
         self._confirm_url = (confirm_url or "").strip() or None
         self._state_key = state_key
         self._playwright_manager = None
         self._playwright: Playwright | None = None
         self._context = None
         self._page = None
-        self._current_page_entry: _BufferPage | None = None
-        self._page_entries: dict[int, _BufferPage] = {}
+        self._work_page_task_index: int | None = None
+        self._collection_mode_installed = False
         self._paused = True
         self._completed = False
         self._last_message = "未启动"
@@ -143,6 +119,7 @@ class CreatorEnrichmentSession:
         self._last_contact_badge_clicked = False
         self._last_contact_badge_strategy = ""
         self._last_contact_badge_clicked_at: datetime | None = None
+        self._contact_badge_click_inflight = False
         self._contact_positive_signal = False
         self._profile_patch_applied = False
         self._failure_attempts: list[CreatorEnrichmentFailureAttempt] = []
@@ -157,6 +134,13 @@ class CreatorEnrichmentSession:
         self._finalizing_task_indexes: set[int] = set()
         self._run_started_at: datetime | None = None
         self._run_completed_baseline = 0
+        self._paused_started_at: datetime | None = None
+        self._diagnostic_pages: set[int] = set()
+        self._last_dom_profile_signature = ""
+        self._last_dom_profile_seen_at: datetime | None = None
+        self._last_dom_profile_probe_at: datetime | None = None
+        self._page_guard_breached = False
+        self._page_guard_breach_reason = ""
 
     def start(self) -> CreatorEnrichmentStatus:
         self.shutdown()
@@ -165,7 +149,12 @@ class CreatorEnrichmentSession:
                 module="creator_enrichment",
                 file_stem=f"creator_enrichment_task_{self._task_id}",
             )
-            self._log_event("session_start")
+            self._log_event(
+                "session_start",
+                contact_badge_logic_version=CONTACT_BADGE_LOGIC_VERSION,
+                jsonl_path=str(self._dev_logger.path),
+                artifact_dir=str(self._dev_logger.artifact_dir),
+            )
         candidate = detect_browser("configured", self._browser_config.executable_path or None)
         if candidate is None:
             self._last_message = "未找到可用浏览器。"
@@ -186,15 +175,17 @@ class CreatorEnrichmentSession:
                 ignore_default_args=PLAYWRIGHT_ALLOWED_DEFAULT_ARGS,
             )
             self._context.on("response", self._handle_response)
+            self._context.on("page", self._handle_context_page)
             self._context.add_init_script(network_capture_init_script())
-            self._page = self._context.new_page()
-            self._current_page_entry = self._register_page(self._page, None)
+            if not self._ensure_single_work_page(reason="start"):
+                raise PlaywrightError(self._last_message or "无法创建补充采集工作页面。")
             if self._state.get("started_at") is None:
                 self._state["started_at"] = now_iso()
                 self._persist_state()
             self._started_at = parse_datetime(self._state.get("started_at"))
             self._run_started_at = datetime.now(UTC)
             self._run_completed_baseline = self._status_counts()["completed"]
+            self._paused_started_at = None
             self._completed = False
             self._paused = True
             self._pause_reason = None
@@ -278,6 +269,9 @@ class CreatorEnrichmentSession:
                 self._current_step = "waiting_contact"
                 self._contact_positive_signal = True
                 return self.status()
+            if self._contact_badge_click_inflight:
+                self._last_message = self._with_subject("有联系方式，正在采集。")
+                return self.status()
             if self._last_contact_badge_clicked:
                 self._current_step = "waiting_contact"
                 self._waiting_started_at = datetime.now(UTC)
@@ -290,7 +284,7 @@ class CreatorEnrichmentSession:
                 self._log_event(
                     "badge_clicked",
                     task_index=self._current_task_index,
-                    source="service_retry",
+                    source="service",
                 )
                 return self.status()
             if self._timed_out(CONTACT_BADGE_WAIT_SECONDS):
@@ -315,6 +309,7 @@ class CreatorEnrichmentSession:
         if self._run_started_at is None:
             self._run_started_at = datetime.now(UTC)
             self._run_completed_baseline = self._status_counts()["completed"]
+        self._resume_eta_clock()
         self._ensure_resource_blocking()
         if self._current_task_index is None:
             self._advance_to_next_pending(open_page=True)
@@ -342,6 +337,7 @@ class CreatorEnrichmentSession:
         self._startup_phase = "collecting"
         self._log_event("prepare_pages", task_index=self._current_task_index)
         self._sync_current_page()
+        self._resume_eta_clock()
         self._paused = False
         self._pause_reason = None
         self._last_message = self._with_subject("正在自动开始补充采集。")
@@ -362,6 +358,7 @@ class CreatorEnrichmentSession:
         self._persist_state()
         self._paused = False
         self._pause_reason = None
+        self._paused_started_at = None
         self._pause_step = "idle"
         self._current_step = "idle"
         self._waiting_started_at = None
@@ -380,6 +377,7 @@ class CreatorEnrichmentSession:
             return self.status()
         self._paused = False
         self._pause_reason = None
+        self._resume_eta_clock()
         self._sync_current_page()
         self._start_current_attempt(reload_page=True, clear_failure_history=True)
         self._last_message = self._with_subject("正在重试。")
@@ -387,9 +385,15 @@ class CreatorEnrichmentSession:
         return self.status()
 
     def stop(self) -> CreatorEnrichmentStatus:
+        if not self._paused:
+            self._paused_started_at = datetime.now(UTC)
         self._paused = True
         self._pause_reason = PAUSE_REASON_MANUAL_ACTION
         self._last_message = "补充采集已暂停。"
+        self._pause_step = "idle"
+        self._attempt_in_progress = False
+        self._current_step = "idle"
+        self._waiting_started_at = None
         self._log_event(
             "pause",
             task_index=self._current_task_index,
@@ -413,8 +417,8 @@ class CreatorEnrichmentSession:
         self._playwright = None
         self._context = None
         self._page = None
-        self._current_page_entry = None
-        self._page_entries = {}
+        self._work_page_task_index = None
+        self._collection_mode_installed = False
         self._captured_profile = None
         self._captured_contact = None
         self._attempt_page_url = ""
@@ -423,6 +427,13 @@ class CreatorEnrichmentSession:
         self._finalizing_task_indexes = set()
         self._run_started_at = None
         self._run_completed_baseline = 0
+        self._paused_started_at = None
+        self._diagnostic_pages = set()
+        self._last_dom_profile_signature = ""
+        self._last_dom_profile_seen_at = None
+        self._last_dom_profile_probe_at = None
+        self._page_guard_breached = False
+        self._page_guard_breach_reason = ""
         self._startup_phase = "idle"
         self._current_step = "idle"
         self._collection_started = False
@@ -434,12 +445,13 @@ class CreatorEnrichmentSession:
         counts = self._status_counts()
         estimated_end_at = None
         started_at = self._run_started_at
+        reference_now = self._paused_started_at or datetime.now(UTC)
         completed_delta = max(counts["completed"] - self._run_completed_baseline, 0)
         if started_at is not None and completed_delta > 0 and total_count >= counts["completed"]:
-            elapsed_seconds = max(int((datetime.now(UTC) - started_at).total_seconds()), 1)
+            elapsed_seconds = max(int((reference_now - started_at).total_seconds()), 1)
             remaining_count = max(total_count - counts["completed"], 0)
             projected_remaining = int(elapsed_seconds * remaining_count / completed_delta)
-            estimated_end_at = datetime.now(UTC) + timedelta(seconds=projected_remaining)
+            estimated_end_at = reference_now + timedelta(seconds=projected_remaining)
         return CreatorEnrichmentStatus(
             running=self._context is not None,
             paused=self._paused,
@@ -500,7 +512,7 @@ class CreatorEnrichmentSession:
             open_page=open_page,
         )
         if open_page:
-            self._sync_visible_buffer()
+            self._sync_current_page()
 
     def _open_browser_confirmation_page(self) -> None:
         if self._page is None:
@@ -523,203 +535,6 @@ class CreatorEnrichmentSession:
         if self._current_task_index is None:
             return None
         return self._detail_url_for_task(self._current_task_index)
-
-    def _sync_visible_buffer(self) -> None:
-        self._sync_current_page()
-
-    def _sync_current_page(self) -> None:
-        if self._context is None:
-            return
-        pending = self._pending_items()
-        if not pending:
-            return
-        current_item = pending[0]
-        self._ensure_current_page(current_item)
-
-    def _sync_prefetch_pages(self) -> None:
-        return
-
-    def _prepare_page_for_item(self, page: Page, item: TaskItem) -> bool:
-        return False
-
-    def _ensure_current_page(self, item: TaskItem) -> None:
-        if self._page is None:
-            self._page = self._create_page()
-            if self._page is None:
-                return
-            self._current_page_entry = self._register_page(self._page, None)
-        target_task_index = item.task_index
-        if self._assigned_task_index(self._page) == target_task_index:
-            self._current_task_index = target_task_index
-            self._current_region = normalized_region(item.task_data.get("selection_region"))
-            self._ensure_collection_mode_for_page(self._page)
-            self._bring_page_to_front(self._page)
-            return
-        target_url = self._detail_url_for_item(item)
-        self._current_task_index = target_task_index
-        self._current_region = normalized_region(item.task_data.get("selection_region"))
-        self._navigate_page(self._page, target_url)
-        self._assign_page_task_index(self._page, target_task_index)
-        self._ensure_collection_mode_for_page(self._page)
-        self._log_event(
-            "current_committed",
-            task_index=item.task_index,
-            creator_oecuid=normalized_creator_id(item.task_data.get("creator_oecuid")),
-            page_url=target_url,
-        )
-        self._bring_page_to_front(self._page)
-
-    def _close_prepared_page(self, task_index: int) -> None:
-        return
-
-    def _retire_current_page(self) -> None:
-        self._captured_profile = None
-        self._captured_contact = None
-        self._attempt_creator_id = ""
-        self._attempt_page_url = ""
-        self._attempt_in_progress = False
-
-    def _close_confirmation_page_if_needed(self) -> None:
-        return
-
-    def _open_prefetch_page(self, item: TaskItem) -> None:
-        return
-
-    def _current_page_matches_current_item(self) -> bool:
-        if self._page is None or self._current_task_index is None:
-            return False
-        return self._assigned_task_index(self._page) == self._current_task_index
-
-    def _safe_page_url(self) -> str:
-        return self._page_url(self._page)
-
-    def _page_url(self, page: Page | None) -> str:
-        if page is None:
-            return ""
-        try:
-            return page.url
-        except PlaywrightError:
-            return ""
-
-    def _response_page(self, response: Response) -> Page | None:
-        try:
-            return response.frame.page
-        except PlaywrightError:
-            return None
-
-    def _register_page(self, page: Page, task_index: int | None) -> _BufferPage:
-        page_key = id(page)
-        entry = self._page_entries.get(page_key)
-        if entry is None:
-            entry = _BufferPage(page=page, task_index=task_index)
-            self._page_entries[page_key] = entry
-        return entry
-
-    def _entry_for_page(self, page: Page | None) -> _BufferPage | None:
-        if page is None:
-            return None
-        return self._page_entries.get(id(page))
-
-    def _entry_for_task(self, task_index: int | None) -> _BufferPage | None:
-        if task_index is None:
-            return None
-        if (
-            self._current_page_entry is not None
-            and self._current_page_entry.task_index == task_index
-        ):
-            return self._current_page_entry
-        return None
-
-    def _active_page_entries(self) -> list[_BufferPage]:
-        if self._current_page_entry is None:
-            return []
-        return [self._current_page_entry]
-
-    def _unregister_page(self, page: Page) -> None:
-        page_key = id(page)
-        entry = self._page_entries.pop(page_key, None)
-        if entry is None:
-            return
-        if self._current_page_entry is entry:
-            self._current_page_entry = None
-
-    def _mark_collection_mode_stale(self, page: Page | None) -> None:
-        entry = self._entry_for_page(page)
-        if entry is not None:
-            entry.collection_mode_installed = False
-
-    def _assign_page_task_index(self, page: Page | None, task_index: int | None) -> None:
-        if page is None:
-            return
-        entry = self._register_page(page, None)
-        entry.task_index = task_index
-
-    def _assigned_task_index(self, page: Page | None) -> int | None:
-        if page is None:
-            return None
-        entry = self._entry_for_page(page)
-        return None if entry is None else entry.task_index
-
-    def _detail_url_for_task(self, task_index: int | None) -> str | None:
-        if task_index is None:
-            return None
-        item = self._items_by_index.get(task_index)
-        if item is None:
-            return None
-        return self._detail_url_for_item(item)
-
-    def _detail_url_for_item(self, item: TaskItem) -> str | None:
-        creator_id = normalized_creator_id(item.task_data.get("creator_oecuid"))
-        if not creator_id:
-            return None
-        shop_region = normalized_region(item.task_data.get("selection_region"))
-        return DETAIL_URL_TEMPLATE.format(
-            creator_oecuid=creator_id,
-            shop_region=shop_region or "",
-        )
-
-    def _create_page(self) -> Page | None:
-        if self._context is None:
-            return None
-        try:
-            page = self._context.new_page()
-            self._register_page(page, None)
-            return page
-        except PlaywrightError as exc:
-            self._last_message = f"打开标签失败：{exc}"
-            self._log_event("page_create_failed", details=str(exc))
-            return None
-
-    def _navigate_page(self, page: Page | None, target_url: str) -> None:
-        if page is None:
-            return
-        self._mark_collection_mode_stale(page)
-        current_url = self._page_url(page)
-        try:
-            if not current_url or current_url == "about:blank":
-                page.goto(target_url, wait_until="commit")
-                return
-            page.evaluate("(url) => { window.location.replace(url); }", target_url)
-        except PlaywrightError:
-            page.goto(target_url, wait_until="commit")
-
-    def _bring_page_to_front(self, page: Page | None) -> None:
-        if page is None:
-            return
-        try:
-            page.bring_to_front()
-        except PlaywrightError as exc:
-            self._last_message = f"标签切换失败：{exc}"
-            self._log_event("page_focus_failed", details=str(exc))
-
-    def _close_page(self, page: Page | None) -> None:
-        if page is None:
-            return
-        self._unregister_page(page)
-        try:
-            page.close()
-        except PlaywrightError:
-            pass
 
     def _start_current_attempt(self, *, reload_page: bool, clear_failure_history: bool) -> None:
         if self._page is None or self._current_task_index is None:
@@ -768,14 +583,23 @@ class CreatorEnrichmentSession:
             reload_page=reload_page,
         )
         try:
+            normalize_reason = "attempt_retry_reset" if reload_page else "attempt_start"
+            if not self._ensure_single_work_page(
+                reason=normalize_reason,
+                force_reset=reload_page,
+            ):
+                self._handle_retryable_manual_failure(
+                    "补充采集工作页面不可用，请处理后继续，或跳过当前达人。"
+                )
+                return
             if reload_page:
                 self._clear_cached_capture_for_task(self._current_task_index)
-                self._mark_collection_mode_stale(self._page)
-                self._page.reload(wait_until="commit")
+                self._navigate_page(self._page, target_url)
+                self._assign_page_task_index(self._page, self._current_task_index)
                 self._log_event(
                     "open_committed",
                     task_index=self._current_task_index,
-                    navigation_mode="reload",
+                    navigation_mode="goto_after_retry_reset",
                 )
             elif not self._current_page_matches_current_item():
                 self._page.goto(target_url, wait_until="commit")
@@ -791,6 +615,12 @@ class CreatorEnrichmentSession:
                     task_index=self._current_task_index,
                     page_url=self._safe_page_url(),
                 )
+            if not self._current_page_matches_current_item():
+                self._repair_work_page_if_needed(
+                    reason="attempt_post_open",
+                    task_index=self._current_task_index,
+                    target_url=target_url,
+                )
             self._bring_page_to_front(self._page)
             if self._collection_started:
                 self._ensure_collection_mode()
@@ -801,69 +631,6 @@ class CreatorEnrichmentSession:
             self._handle_retryable_manual_failure(
                 "无法打开达人详情页，请处理后继续，或跳过当前达人。"
             )
-
-    def _handle_response(self, response: Response) -> None:
-        managed_page = self._response_page(response)
-        if managed_page is None:
-            return
-        task_index = self._assigned_task_index(managed_page)
-        if task_index is None:
-            return
-        try:
-            path = urlsplit(response.url).path
-        except ValueError:
-            return
-        try:
-            payload = response.json()
-        except (PlaywrightError, ValueError):
-            return
-        if not isinstance(payload, dict):
-            return
-        if path.endswith(PROFILE_API_PATH):
-            creator_id, profile_types = profile_request_metadata(response)
-            shop_region = query_param(response.url, "shop_region")
-            profile = payload.get("creator_profile")
-            if not isinstance(profile, dict):
-                profile = {}
-            response_creator_id = normalized_creator_id(
-                nested_value(profile.get("creator_oecuid"))
-                or query_param(self._page_url(managed_page), "cid")
-            )
-            should_capture = should_capture_profile(
-                profile=profile,
-                request_creator_id=creator_id,
-                response_creator_id=response_creator_id,
-                profile_types=profile_types,
-            )
-            if should_capture:
-                self._log_event(
-                    "profile_seen",
-                    task_index=task_index,
-                    source="response",
-                )
-                self._store_profile_capture(
-                    task_index=task_index,
-                    creator_id=response_creator_id or creator_id,
-                    payload=payload,
-                    shop_region=shop_region,
-                    profile_types=profile_types,
-                    page_url=self._page_url(managed_page),
-                )
-            return
-        if path.endswith(CONTACT_API_PATH):
-            creator_id = query_param(response.url, "creator_oecuid")
-            if creator_id:
-                self._log_event(
-                    "contact_seen",
-                    task_index=task_index,
-                    source="response",
-                )
-                self._store_contact_capture(
-                    task_index=task_index,
-                    creator_id=creator_id,
-                    payload=payload,
-                    page_url=self._page_url(managed_page),
-                )
 
     def _handle_route(self, route) -> None:
         try:
@@ -896,992 +663,15 @@ class CreatorEnrichmentSession:
         self._ensure_collection_mode_for_page(self._page)
 
     def _ensure_collection_mode_for_page(self, page: Page) -> None:
-        entry = self._entry_for_page(page)
-        if entry is not None and entry.collection_mode_installed:
+        if page is not self._page:
+            return
+        if self._collection_mode_installed:
             return
         try:
             page.evaluate(enrichment_collection_mode_script())
         except PlaywrightError:
             return
-        if entry is not None:
-            entry.collection_mode_installed = True
-
-    def _pull_page_captures(self) -> None:
-        for entry in self._active_page_entries():
-            try:
-                captures = entry.page.evaluate(
-                    """
-                () => {
-                    const root = window.__linkGlancerCapture;
-                    const invalidRoot = !root
-                        || !Array.isArray(root.profileResponses)
-                        || !Array.isArray(root.contactResponses)
-                        || !Array.isArray(root.badgeEvents);
-                    if (invalidRoot) {
-                        return { profileResponses: [], contactResponses: [], badgeEvents: [] };
-                    }
-                    const profileResponses = root.profileResponses.splice(
-                        0,
-                        root.profileResponses.length,
-                    );
-                    const contactResponses = root.contactResponses.splice(
-                        0,
-                        root.contactResponses.length,
-                    );
-                    const badgeEvents = root.badgeEvents.splice(
-                        0,
-                        root.badgeEvents.length,
-                    );
-                    return { profileResponses, contactResponses, badgeEvents };
-                }
-                """
-                )
-            except PlaywrightError:
-                continue
-            if not isinstance(captures, dict):
-                continue
-            profile_responses = captures.get("profileResponses")
-            if isinstance(profile_responses, list):
-                for payload in profile_responses:
-                    self._handle_page_profile_capture(entry.task_index, payload)
-            contact_responses = captures.get("contactResponses")
-            if isinstance(contact_responses, list):
-                for payload in contact_responses:
-                    self._handle_page_contact_capture(entry.task_index, payload)
-            badge_events = captures.get("badgeEvents")
-            if isinstance(badge_events, list):
-                for payload in badge_events:
-                    self._handle_page_badge_capture(entry.task_index, payload)
-        self._process_captured_events(trigger="poll")
-
-    def _handle_page_profile_capture(self, task_index: int | None, entry: object) -> None:
-        if task_index is None or not isinstance(entry, dict):
-            return
-        payload = entry.get("payload")
-        if not isinstance(payload, dict):
-            return
-        profile = payload.get("creator_profile")
-        if not isinstance(profile, dict):
-            profile = {}
-        creator_id = normalized_creator_id(nested_value(profile.get("creator_oecuid")))
-        if not creator_id:
-            creator_id = query_param(str(entry.get("pageUrl") or ""), "cid")
-        if not creator_id:
-            return
-        shop_region = query_param(str(entry.get("url") or ""), "shop_region") or query_param(
-            str(entry.get("pageUrl") or ""),
-            "shop_region",
-        )
-        raw_profile_types = entry.get("profileTypes")
-        profile_types: tuple[int, ...] = ()
-        if isinstance(raw_profile_types, list):
-            parsed_types: list[int] = []
-            for item in raw_profile_types:
-                try:
-                    parsed_types.append(int(item))
-                except (TypeError, ValueError):
-                    continue
-            profile_types = tuple(parsed_types)
-        self._last_profile_response_url = str(entry.get("url") or "")
-        self._last_profile_payload = payload
-        self._last_profile_types = profile_types
-        self._last_profile_seen_at = datetime.now(UTC)
-        if should_capture_profile(
-            profile=profile,
-            request_creator_id=creator_id,
-            response_creator_id=creator_id,
-            profile_types=profile_types,
-        ):
-            self._log_event(
-                "profile_seen",
-                task_index=task_index,
-                source="page_capture",
-            )
-            self._store_profile_capture(
-                task_index=task_index,
-                creator_id=creator_id,
-                payload=payload,
-                shop_region=shop_region,
-                profile_types=profile_types,
-                page_url=str(entry.get("pageUrl") or ""),
-            )
-
-    def _handle_page_contact_capture(self, task_index: int | None, entry: object) -> None:
-        if task_index is None or not isinstance(entry, dict):
-            return
-        payload = entry.get("payload")
-        if not isinstance(payload, dict):
-            return
-        url = str(entry.get("url") or "")
-        creator_id = query_param(url, "creator_oecuid") or normalized_creator_id(
-            entry.get("creatorId")
-        )
-        if not creator_id:
-            return
-        self._last_contact_response_url = url
-        self._last_contact_payload = payload
-        self._contact_positive_signal = True
-        self._log_event(
-            "contact_seen",
-            task_index=task_index,
-            source="page_capture",
-        )
-        self._store_contact_capture(
-            task_index=task_index,
-            creator_id=creator_id,
-            payload=payload,
-            page_url=str(entry.get("pageUrl") or ""),
-        )
-
-    def _handle_page_badge_capture(self, task_index: int | None, entry: object) -> None:
-        if (
-            task_index is None
-            or task_index != self._current_task_index
-            or not isinstance(entry, dict)
-        ):
-            return
-        detected = bool(entry.get("detected"))
-        clicked = bool(entry.get("clicked"))
-        strategy = str(entry.get("strategy") or "")
-        if detected:
-            self._last_contact_badge_detected = True
-            self._contact_positive_signal = True
-            self._log_event("badge_detected", task_index=self._current_task_index)
-        if strategy:
-            self._last_contact_badge_strategy = strategy
-        if clicked and not self._last_contact_badge_clicked:
-            self._last_contact_badge_clicked = True
-            self._last_contact_badge_clicked_at = datetime.now(UTC)
-            self._log_event(
-                "badge_clicked",
-                task_index=self._current_task_index,
-                source="page_capture",
-            )
-        if not detected:
-            return
-        if not self._last_contact_badge_clicked:
-            self._click_contact_badge()
-        if self._last_contact_badge_clicked and self._current_step in {
-            "waiting_profile",
-            "waiting_contact_badge",
-        }:
-            self._current_step = "waiting_contact"
-            self._waiting_started_at = datetime.now(UTC)
-            self._last_message = self._with_subject("有联系方式，正在采集。")
-            self._process_captured_events(trigger="page_capture:badge")
-
-    def _process_captured_events(self, *, trigger: str) -> None:
-        if self._paused or self._completed or self._current_task_index is None:
-            return
-        if not self._attempt_in_progress or self._is_task_finalizing(self._current_task_index):
-            return
-        self._discard_stale_captures()
-        self._log_event(
-            "process_captured_events",
-            trigger=trigger,
-            has_profile=self._captured_profile is not None,
-            has_contact=self._captured_contact is not None,
-            step=self._current_step,
-        )
-        if self._current_step == "waiting_profile" and self._captured_profile is not None:
-            self._apply_profile()
-            return
-        if self._current_step == "waiting_contact_badge":
-            if self._captured_contact is not None:
-                self._current_step = "waiting_contact"
-                self._contact_positive_signal = True
-            elif self._last_contact_badge_clicked:
-                self._current_step = "waiting_contact"
-                self._waiting_started_at = datetime.now(UTC)
-                self._last_message = self._with_subject("有联系方式，正在采集。")
-        if self._current_step == "waiting_contact":
-            if self._captured_profile is not None and not self._profile_patch_applied:
-                self._apply_profile()
-                if self._paused or self._completed:
-                    return
-            if self._captured_contact is not None and self._profile_patch_applied:
-                self._apply_contact()
-
-    def _store_profile_capture(
-        self,
-        *,
-        task_index: int,
-        creator_id: str,
-        payload: dict[str, object],
-        shop_region: str,
-        profile_types: tuple[int, ...],
-        page_url: str,
-    ) -> None:
-        if self._is_task_finalizing(task_index):
-            return
-        captured = _CapturedProfile(
-            creator_id=creator_id,
-            payload=payload,
-            shop_region=shop_region,
-            profile_types=profile_types,
-            page_url=page_url,
-        )
-        if task_index != self._current_task_index:
-            return
-        self._captured_profile = captured
-        self._last_profile_response_url = page_url
-        self._last_profile_payload = payload
-        self._last_profile_types = profile_types
-        self._last_profile_seen_at = datetime.now(UTC)
-        self._process_captured_events(trigger="capture:profile")
-
-    def _store_contact_capture(
-        self,
-        *,
-        task_index: int,
-        creator_id: str,
-        payload: dict[str, object],
-        page_url: str,
-    ) -> None:
-        if self._is_task_finalizing(task_index):
-            return
-        captured = _CapturedContact(
-            creator_id=creator_id,
-            payload=payload,
-            page_url=page_url,
-        )
-        if task_index != self._current_task_index:
-            return
-        self._contact_positive_signal = True
-        self._captured_contact = captured
-        self._last_contact_response_url = page_url
-        self._last_contact_payload = payload
-        self._process_captured_events(trigger="capture:contact")
-
-    def _load_cached_captures_for_current_task(self) -> None:
-        return
-
-    def _clear_cached_capture_for_task(self, task_index: int) -> None:
-        return
-
-    def _is_task_finalizing(self, task_index: int | None) -> bool:
-        return task_index is not None and task_index in self._finalizing_task_indexes
-
-    def _begin_task_finalization(self, task_index: int | None) -> None:
-        if task_index is None:
-            return
-        self._finalizing_task_indexes.add(task_index)
-
-    def _finish_task_finalization(self, task_index: int | None) -> None:
-        if task_index is None:
-            return
-        self._finalizing_task_indexes.discard(task_index)
-
-    def _discard_stale_captures(self) -> None:
-        if self._captured_profile is not None and not self._is_profile_capture_current(
-            self._captured_profile
-        ):
-            self._log_event(
-                "stale_profile_discarded",
-                captured_creator_id=self._captured_profile.creator_id,
-                captured_page_url=self._captured_profile.page_url,
-                attempt_creator_id=self._attempt_creator_id,
-                attempt_page_url=self._attempt_page_url,
-            )
-            self._captured_profile = None
-        if self._captured_contact is not None and not self._is_contact_capture_current(
-            self._captured_contact
-        ):
-            self._log_event(
-                "stale_contact_discarded",
-                captured_creator_id=self._captured_contact.creator_id,
-                captured_page_url=self._captured_contact.page_url,
-                attempt_creator_id=self._attempt_creator_id,
-                attempt_page_url=self._attempt_page_url,
-            )
-            self._captured_contact = None
-
-    def _is_profile_capture_current(self, captured: _CapturedProfile) -> bool:
-        if not self._attempt_creator_id or captured.creator_id != self._attempt_creator_id:
-            return False
-        return self._captured_page_matches_attempt(captured.page_url)
-
-    def _is_contact_capture_current(self, captured: _CapturedContact) -> bool:
-        if not self._attempt_creator_id or captured.creator_id != self._attempt_creator_id:
-            return False
-        return self._captured_page_matches_attempt(captured.page_url)
-
-    def _captured_page_matches_attempt(self, captured_page_url: str) -> bool:
-        captured_page_url = captured_page_url.strip()
-        if not captured_page_url or not self._attempt_page_url:
-            return True
-        return query_param(captured_page_url, "cid") == query_param(self._attempt_page_url, "cid")
-
-    def _apply_profile(self) -> None:
-        if self._captured_profile is None or self._current_task_index is None:
-            return
-        if self._is_task_finalizing(self._current_task_index):
-            return
-        item = self._items_by_index.get(self._current_task_index)
-        if item is None:
-            self._advance_to_next_pending(open_page=True)
-            return
-        creator_id = normalized_creator_id(item.task_data.get("creator_oecuid"))
-        captured = self._captured_profile
-        self._captured_profile = None
-        if captured.creator_id != creator_id:
-            self._log_event(
-                "profile_ignored",
-                task_index=self._current_task_index,
-                expected_creator_id=creator_id,
-                captured_creator_id=captured.creator_id,
-            )
-            return
-        payload = captured.payload
-        response_code = int(payload.get("code") or 0)
-        item_region = normalized_region(item.task_data.get("selection_region"))
-        request_region = normalized_region(
-            captured.shop_region or query_param(self._safe_page_url(), "shop_region")
-        )
-        self._log_event(
-            "profile_apply",
-            task_index=self._current_task_index,
-            response_code=response_code,
-            item_region=item_region,
-            request_region=request_region,
-            captured_creator_id=captured.creator_id,
-        )
-        if response_code != 0:
-            if self._is_captcha_present():
-                self._pause(PAUSE_REASON_CAPTCHA, "检测到人机验证，请先完成验证后继续。")
-                self._mark_current_paused(STATE_STATUS_PAUSED_CAPTCHA)
-                return
-            if item_region and request_region and item_region != request_region:
-                self._log_event(
-                    "profile_region_mismatch",
-                    task_index=self._current_task_index,
-                    response_code=response_code,
-                    item_region=item_region,
-                    request_region=request_region,
-                )
-                self._pause(
-                    PAUSE_REASON_REGION_MISMATCH,
-                    self._with_subject("当前店铺区域与达人区域不匹配，请处理后继续。"),
-                )
-                self._mark_current_paused(STATE_STATUS_PAUSED_REGION_MISMATCH)
-                return
-            self._handle_retryable_manual_failure(
-                "达人资料接口返回异常，请处理页面后继续，或跳过当前达人。"
-            )
-            return
-
-        if item_region and request_region and item_region != request_region:
-            self._log_event(
-                "profile_region_mismatch",
-                task_index=self._current_task_index,
-                response_code=response_code,
-                item_region=item_region,
-                request_region=request_region,
-            )
-            self._pause(
-                PAUSE_REASON_REGION_MISMATCH,
-                self._with_subject("当前店铺区域与达人区域不匹配，请处理后继续。"),
-            )
-            self._mark_current_paused(STATE_STATUS_PAUSED_REGION_MISMATCH)
-            return
-
-        profile = payload.get("creator_profile")
-        if not isinstance(profile, dict):
-            profile = {}
-        patch: dict[str, object] = {}
-        bio = nested_value(profile.get("bio"))
-        patch["bio"] = bio or "-"
-        self._last_contact_available_raw = profile.get("contact_info_available")
-        contact_available = contact_info_available(profile.get("contact_info_available"))
-        self._last_contact_available = contact_available
-        self._profile_patch_applied = True
-        if contact_available is not None:
-            patch["contact_info_available"] = "true" if contact_available else "false"
-        if patch:
-            self._app_service.update_task_item_data(
-                task_id=self._task_id,
-                task_index=self._current_task_index,
-                task_data_patch=patch,
-            )
-            self._refresh_items()
-
-        has_contact = (
-            contact_available is True
-            or self._contact_positive_signal
-            or self._captured_contact is not None
-            or self._last_contact_badge_clicked
-        )
-        self._log_event(
-            "profile_contact_state",
-            task_index=self._current_task_index,
-            contact_available=contact_available,
-            contact_available_raw=self._last_contact_available_raw,
-            has_contact=has_contact,
-            contact_positive_signal=self._contact_positive_signal,
-            captured_contact=self._captured_contact is not None,
-            badge_clicked=self._last_contact_badge_clicked,
-            patch_keys=sorted(patch.keys()),
-        )
-
-        if contact_available is False and not has_contact:
-            self._log_event("no_contact", task_index=self._current_task_index)
-            self._mark_no_contact_and_advance()
-            return
-        if not has_contact and contact_available is not True:
-            self._log_event(
-                "profile_contact_state_invalid",
-                task_index=self._current_task_index,
-                contact_available=contact_available,
-                contact_available_raw=self._last_contact_available_raw,
-            )
-            self._handle_retryable_manual_failure(
-                self._with_subject(
-                    "达人资料已返回，但 contact_info_available 不是明确的 true/false，请人工处理。"
-                )
-            )
-            return
-
-        self._current_step = "waiting_contact_badge"
-        self._waiting_started_at = datetime.now(UTC)
-        self._last_message = self._with_subject("有联系方式，正在采集。")
-        if self._captured_contact is not None:
-            self._current_step = "waiting_contact"
-            self._contact_positive_signal = True
-            return
-        if self._last_contact_badge_clicked:
-            self._current_step = "waiting_contact"
-            self._waiting_started_at = datetime.now(UTC)
-            self._last_message = self._with_subject("有联系方式，正在采集。")
-            return
-        if self._click_contact_badge():
-            self._contact_positive_signal = True
-            self._current_step = "waiting_contact"
-            self._waiting_started_at = datetime.now(UTC)
-            self._last_message = self._with_subject("有联系方式，正在采集。")
-            self._log_event("badge_clicked", task_index=self._current_task_index, source="service")
-        return
-
-    def _apply_contact(self) -> None:
-        if self._captured_contact is None or self._current_task_index is None:
-            return
-        if self._is_task_finalizing(self._current_task_index):
-            return
-        item = self._items_by_index.get(self._current_task_index)
-        if item is None:
-            self._advance_to_next_pending(open_page=True)
-            return
-        creator_id = normalized_creator_id(item.task_data.get("creator_oecuid"))
-        captured = self._captured_contact
-        self._captured_contact = None
-        if captured.creator_id != creator_id:
-            return
-        payload = captured.payload
-        response_code = int(payload.get("code") or 0)
-        if response_code != 0:
-            self._log_event(
-                "contact_apply_error",
-                task_index=self._current_task_index,
-                response_code=response_code,
-            )
-            self._handle_retryable_manual_failure(
-                "联系方式接口返回异常，请处理后继续，或跳过当前达人。"
-            )
-            return
-        parsed = contact_patch(payload, self._current_region or "")
-        self._log_event(
-            "contact_apply",
-            task_index=self._current_task_index,
-            total_entries=parsed.total_entries,
-            valued_entries=parsed.valued_entries,
-            recognized_entries=parsed.recognized_entries,
-            patch_keys=sorted(parsed.patch.keys()),
-        )
-        if parsed.patch:
-            finalized_task_index = self._current_task_index
-            self._begin_task_finalization(finalized_task_index)
-            subject = self._current_subject()
-            region = self._current_region or ""
-            self._app_service.update_task_item_data(
-                task_id=self._task_id,
-                task_index=self._current_task_index,
-                task_data_patch=parsed.patch,
-            )
-            self._refresh_items()
-            new_status = STATE_STATUS_SUCCESS
-            update_item_state(
-                self._state,
-                task_index=finalized_task_index,
-                status=new_status,
-                region=region,
-            )
-            self._persist_state()
-            self._advance_to_next_pending(open_page=True)
-            self._last_message = self._message_for_subject(subject, "已保存补充资料。")
-            self._finish_task_finalization(finalized_task_index)
-            self._continue_after_terminal_transition()
-            return
-        if parsed.total_entries <= 0:
-            self._handle_retryable_manual_failure(
-                self._with_subject(
-                    "资料显示存在联系方式，但联系方式接口未返回任何联系方式数据，请人工处理。"
-                )
-            )
-            return
-        if parsed.valued_entries <= 0:
-            self._handle_retryable_manual_failure(
-                self._with_subject("联系方式接口已返回，但所有联系方式值均为空，请人工处理。")
-            )
-            return
-        if parsed.recognized_entries <= 0:
-            self._handle_retryable_manual_failure(
-                self._with_subject(
-                    "联系方式接口已返回，但未解析到可识别的联系方式字段，请人工处理。"
-                )
-            )
-            return
-
-    def _click_contact_badge(self) -> bool:
-        if self._page is None:
-            return False
-        if self._last_contact_badge_clicked:
-            return True
-        result = self._click_contact_badge_via_dom()
-        if result["clicked"]:
-            self._last_contact_badge_detected = bool(result["detected"])
-            self._last_contact_badge_clicked = True
-            self._last_contact_badge_strategy = str(result["strategy"] or "")
-            self._last_contact_badge_clicked_at = datetime.now(UTC)
-            self._contact_positive_signal = True
-            return True
-        self._last_contact_badge_detected = bool(result["detected"])
-        if result["strategy"]:
-            self._last_contact_badge_strategy = str(result["strategy"])
-        self._log_event(
-            "badge_click_attempt",
-            task_index=self._current_task_index,
-            detected=self._last_contact_badge_detected,
-            clicked=False,
-            strategy=self._last_contact_badge_strategy,
-            candidate_count=int(result.get("candidate_count") or 0),
-            candidate_summary=str(result.get("candidate_summary") or ""),
-        )
-        roots = [
-            "#creator-detail-profile-container",
-            "#content-container > main",
-            "#content-container",
-            "main",
-            "body",
-        ]
-        try:
-            root_locator = None
-            root_name = ""
-            for root_selector in roots:
-                candidate = self._page.locator(root_selector).first
-                if candidate.count() <= 0:
-                    continue
-                root_locator = candidate
-                root_name = root_selector
-                break
-            if root_locator is None:
-                self._last_contact_badge_strategy = "playwright:root_missing"
-                return False
-        except PlaywrightError:
-            self._last_contact_badge_strategy = "playwright:root_error"
-            return False
-        selectors = [
-            f"div.cursor-pointer svg[class*='alliance-icon-{keyword}']"
-            for keyword in CONTACT_ICON_CLASS_KEYWORDS
-        ] + [
-            f"button.core-btn-icon-only svg[class*='alliance-icon-{keyword}']"
-            for keyword in CONTACT_ICON_CLASS_KEYWORDS
-        ]
-        for selector in selectors:
-            try:
-                locator = root_locator.locator(selector).first
-                if locator.count() <= 0:
-                    continue
-                self._last_contact_badge_detected = True
-                try:
-                    locator.scroll_into_view_if_needed(timeout=CONTACT_BADGE_SCROLL_TIMEOUT_MS)
-                except PlaywrightError:
-                    pass
-                target = locator.locator(
-                    "xpath=ancestor::div[contains(@class, 'cursor-pointer')][1]"
-                )
-                clickable = target.first if target.count() > 0 else locator
-                clickable.click(timeout=CONTACT_BADGE_CLICK_TIMEOUT_MS, force=True)
-                self._last_contact_badge_clicked = True
-                self._last_contact_badge_strategy = f"playwright:{root_name}:{selector}"
-                self._last_contact_badge_clicked_at = datetime.now(UTC)
-                self._contact_positive_signal = True
-                return True
-            except PlaywrightError:
-                continue
-        if not self._last_contact_badge_strategy:
-            self._last_contact_badge_strategy = "playwright:not_found"
-        return False
-
-    def _click_contact_badge_via_dom(self, *, click: bool = True) -> dict[str, object]:
-        if self._page is None:
-            return {"detected": False, "clicked": False, "strategy": "dom:no_page"}
-        try:
-            result = self._page.evaluate(
-                """
-                ({ keywords, click }) => {
-                    const roots = [
-                        document.querySelector("#creator-detail-profile-container"),
-                        document.querySelector("#content-container > main"),
-                        document.querySelector("#content-container"),
-                        document.querySelector("main"),
-                        document.body,
-                    ].filter((node) => node instanceof HTMLElement);
-                    if (roots.length <= 0) {
-                        return {
-                            detected: false,
-                            clicked: false,
-                            strategy: "dom:root_missing",
-                        };
-                    }
-                    const isVisible = (element) => {
-                        if (!(element instanceof HTMLElement)) {
-                            return false;
-                        }
-                        const style = window.getComputedStyle(element);
-                        if (style.display === "none" || style.visibility === "hidden") {
-                            return false;
-                        }
-                        const rect = element.getBoundingClientRect();
-                        return rect.width > 0 && rect.height > 0;
-                    };
-                    const resolveClickable = (element, root) => {
-                        let current = element;
-                        while (current instanceof HTMLElement && current !== root) {
-                            const tagName = current.tagName.toLowerCase();
-                            if (
-                                tagName === "button"
-                                || tagName === "a"
-                                || current.classList.contains("cursor-pointer")
-                                || current.getAttribute("role") === "button"
-                                || typeof current.onclick === "function"
-                            ) {
-                                return current;
-                            }
-                            current = current.parentElement;
-                        }
-                        return element instanceof HTMLElement ? element : null;
-                    };
-                    const normalizeText = (value) =>
-                        typeof value === "string" ? value.trim().toLowerCase() : "";
-                    const keywordVariants = keywords.map((keyword) => normalizeText(keyword));
-                    const describeTarget = (target) => {
-                        if (!(target instanceof HTMLElement)) {
-                            return "";
-                        }
-                        const className =
-                            typeof target.className === "string" ? target.className : "";
-                        const svgClassName =
-                            target.querySelector("svg")?.getAttribute("class") || "";
-                        return [
-                            target.tagName.toLowerCase(),
-                            target.getAttribute("data-e2e") || "",
-                            target.getAttribute("data-tid") || "",
-                            target.getAttribute("aria-label") || "",
-                            target.getAttribute("title") || "",
-                            className,
-                            svgClassName,
-                        ]
-                            .map((part) => normalizeText(part))
-                            .filter(Boolean)
-                            .join("|");
-                    };
-                    const triggerClick = (target) => {
-                        target.dispatchEvent(
-                            new MouseEvent("mousedown", { bubbles: true, cancelable: true }),
-                        );
-                        target.dispatchEvent(
-                            new MouseEvent("mouseup", { bubbles: true, cancelable: true }),
-                        );
-                        target.dispatchEvent(
-                            new MouseEvent("click", { bubbles: true, cancelable: true }),
-                        );
-                        target.click();
-                    };
-                    const candidates = [];
-                    const seen = new Set();
-                    const pushCandidate = (node, root, rootName) => {
-                        const target = resolveClickable(
-                            node instanceof HTMLElement ? node : node?.parentElement,
-                            root,
-                        );
-                        if (!(target instanceof HTMLElement)) {
-                            return;
-                        }
-                        if (seen.has(target)) {
-                            return;
-                        }
-                        seen.add(target);
-                        const description = describeTarget(target);
-                        const matchedKeywordIndex = keywordVariants.findIndex(
-                            (keyword) => keyword && description.includes(keyword),
-                        );
-                        if (matchedKeywordIndex < 0) {
-                            return;
-                        }
-                        candidates.push({
-                            target,
-                            matchedKeyword: keywords[matchedKeywordIndex],
-                            description,
-                            rootName,
-                        });
-                    };
-                    for (const root of roots) {
-                        const rootName = root.id ? `#${root.id}` : root.tagName.toLowerCase();
-                        for (const node of root.querySelectorAll(
-                            "svg, button, a, [role='button'], div.cursor-pointer",
-                        )) {
-                            pushCandidate(node, root, rootName);
-                        }
-                    }
-                    const candidateSummary = candidates
-                        .slice(0, 6)
-                        .map(
-                            (candidate) =>
-                                `${candidate.rootName}:${candidate.matchedKeyword}:${candidate.description}`,
-                        )
-                        .join(" || ");
-                    for (const candidate of candidates) {
-                        const target = candidate.target;
-                        if (!(target instanceof HTMLElement) || !isVisible(target)) {
-                            return {
-                                detected: true,
-                                clicked: false,
-                                strategy:
-                                    `dom:${candidate.rootName}:${candidate.matchedKeyword}`
-                                    + ":not_visible",
-                                candidate_count: candidates.length,
-                                candidate_summary: candidateSummary,
-                            };
-                        }
-                        if (!click) {
-                            return {
-                                detected: true,
-                                clicked: false,
-                                strategy:
-                                    `dom:${candidate.rootName}:${candidate.matchedKeyword}`
-                                    + ":visible",
-                                candidate_count: candidates.length,
-                                candidate_summary: candidateSummary,
-                            };
-                        }
-                        triggerClick(target);
-                        return {
-                            detected: true,
-                            clicked: true,
-                            strategy: `dom:${candidate.rootName}:${candidate.matchedKeyword}`,
-                            candidate_count: candidates.length,
-                            candidate_summary: candidateSummary,
-                        };
-                    }
-                    return {
-                        detected: false,
-                        clicked: false,
-                        strategy: "dom:not_found",
-                        candidate_count: 0,
-                        candidate_summary: "",
-                    };
-                }
-                """,
-                {"keywords": list(CONTACT_ICON_CLASS_KEYWORDS), "click": click},
-            )
-        except PlaywrightError:
-            return {"detected": False, "clicked": False, "strategy": "dom:error"}
-        if not isinstance(result, dict):
-            return {"detected": False, "clicked": False, "strategy": "dom:invalid"}
-        return {
-            "detected": bool(result.get("detected")),
-            "clicked": bool(result.get("clicked")),
-            "strategy": str(result.get("strategy") or ""),
-            "candidate_count": int(result.get("candidate_count") or 0),
-            "candidate_summary": str(result.get("candidate_summary") or ""),
-        }
-
-    def _maybe_capture_profile_from_dom(self) -> bool:
-        if self._page is None or self._current_task_index is None:
-            return False
-        if not self._current_page_matches_current_item():
-            return False
-        item = self._items_by_index.get(self._current_task_index)
-        if item is None:
-            return False
-        creator_id = normalized_creator_id(item.task_data.get("creator_oecuid"))
-        if not creator_id:
-            return False
-        dom_profile = self._extract_profile_dom_snapshot()
-        if not dom_profile.get("ready"):
-            return False
-        bio = str(dom_profile.get("bio") or "").strip()
-        if not bio:
-            return False
-        has_badge = bool(dom_profile.get("has_badge"))
-        if not has_badge:
-            return False
-        badge_strategy = str(dom_profile.get("badge_strategy") or "")
-        if badge_strategy:
-            self._last_contact_badge_strategy = badge_strategy
-        self._last_contact_badge_detected = True
-        self._contact_positive_signal = True
-        self._log_event(
-            "profile_dom_ready",
-            task_index=self._current_task_index,
-            bio_length=len(bio),
-            badge_strategy=badge_strategy,
-        )
-        self._store_profile_capture(
-            task_index=self._current_task_index,
-            creator_id=creator_id,
-            payload={
-                "code": 0,
-                "creator_profile": {
-                    "creator_oecuid": creator_id,
-                    "bio": bio,
-                    "contact_info_available": {
-                        "value": True,
-                        "is_authorized": True,
-                        "status": 0,
-                    },
-                },
-            },
-            shop_region=self._current_region or "",
-            profile_types=(1,),
-            page_url=self._safe_page_url(),
-        )
-        return True
-
-    def _extract_profile_dom_snapshot(self) -> dict[str, object]:
-        if self._page is None:
-            return {"ready": False, "bio": "", "has_badge": False, "badge_strategy": ""}
-        try:
-            result = self._page.evaluate(
-                """
-                ({ keywords }) => {
-                    const roots = [
-                        document.querySelector("#creator-detail-profile-container"),
-                        document.querySelector("#content-container > main"),
-                        document.querySelector("#content-container"),
-                        document.querySelector("main"),
-                        document.body,
-                    ].filter((node) => node instanceof HTMLElement);
-                    if (roots.length <= 0) {
-                        return {
-                            ready: false,
-                            bio: "",
-                            hasBadge: false,
-                            badgeStrategy: "profile_dom:no_root",
-                        };
-                    }
-                    const normalizeText = (value) =>
-                        typeof value === "string" ? value.trim().toLowerCase() : "";
-                    const isVisible = (element) => {
-                        if (!(element instanceof HTMLElement)) {
-                            return false;
-                        }
-                        const style = window.getComputedStyle(element);
-                        if (style.display === "none" || style.visibility === "hidden") {
-                            return false;
-                        }
-                        const rect = element.getBoundingClientRect();
-                        return rect.width > 0 && rect.height > 0;
-                    };
-                    const keywordVariants = keywords.map((keyword) => normalizeText(keyword));
-                    const describeTarget = (target) => {
-                        if (!(target instanceof HTMLElement)) {
-                            return "";
-                        }
-                        const className =
-                            typeof target.className === "string" ? target.className : "";
-                        const svgClassName =
-                            target.querySelector("svg")?.getAttribute("class") || "";
-                        return [
-                            target.tagName.toLowerCase(),
-                            target.getAttribute("data-e2e") || "",
-                            target.getAttribute("data-tid") || "",
-                            target.getAttribute("aria-label") || "",
-                            target.getAttribute("title") || "",
-                            className,
-                            svgClassName,
-                        ]
-                            .map((part) => normalizeText(part))
-                            .filter(Boolean)
-                            .join("|");
-                    };
-                    const bioSelectors = [
-                        "#creator-detail-profile-container [data-e2e='2e9732e6-4d06-458d']",
-                        "#creator-detail-profile-container .whitespace-pre-wrap",
-                        "#creator-detail-profile-container [class*='break-words']",
-                    ];
-                    let bio = "";
-                    for (const selector of bioSelectors) {
-                        const node = document.querySelector(selector);
-                        if (!(node instanceof HTMLElement) || !isVisible(node)) {
-                            continue;
-                        }
-                        const text = (node.innerText || node.textContent || "").trim();
-                        if (text.length > bio.length) {
-                            bio = text;
-                        }
-                    }
-                    let hasBadge = false;
-                    let badgeStrategy = "";
-                    const seen = new Set();
-                    for (const root of roots) {
-                        const rootName = root.id ? `#${root.id}` : root.tagName.toLowerCase();
-                        for (const node of root.querySelectorAll(
-                            "svg, button, a, [role='button'], div.cursor-pointer",
-                        )) {
-                            const target =
-                                node instanceof HTMLElement ? node : node?.parentElement;
-                            if (!(target instanceof HTMLElement) || seen.has(target)) {
-                                continue;
-                            }
-                            seen.add(target);
-                            if (!isVisible(target)) {
-                                continue;
-                            }
-                            const description = describeTarget(target);
-                            const matchedKeyword = keywordVariants.find(
-                                (keyword) => keyword && description.includes(keyword),
-                            );
-                            if (!matchedKeyword) {
-                                continue;
-                            }
-                            hasBadge = true;
-                            badgeStrategy = `profile_dom:${rootName}:${matchedKeyword}`;
-                            break;
-                        }
-                        if (hasBadge) {
-                            break;
-                        }
-                    }
-                    return {
-                        ready: Boolean(bio) || hasBadge,
-                        bio,
-                        hasBadge,
-                        badgeStrategy,
-                    };
-                }
-                """,
-                {"keywords": list(CONTACT_ICON_CLASS_KEYWORDS)},
-            )
-        except PlaywrightError:
-            return {"ready": False, "bio": "", "has_badge": False, "badge_strategy": ""}
-        if not isinstance(result, dict):
-            return {"ready": False, "bio": "", "has_badge": False, "badge_strategy": ""}
-        return {
-            "ready": bool(result.get("ready")),
-            "bio": str(result.get("bio") or ""),
-            "has_badge": bool(result.get("hasBadge")),
-            "badge_strategy": str(result.get("badgeStrategy") or ""),
-        }
+        self._collection_mode_installed = True
 
     def _timed_out(self, seconds: int) -> bool:
         if self._waiting_started_at is None:
@@ -1917,6 +707,8 @@ class CreatorEnrichmentSession:
         return True
 
     def _pause(self, reason: str, message: str) -> None:
+        if not self._paused:
+            self._paused_started_at = datetime.now(UTC)
         self._paused = True
         self._pause_reason = reason
         self._last_message = message
@@ -1924,6 +716,14 @@ class CreatorEnrichmentSession:
         self._attempt_in_progress = False
         self._current_step = "idle"
         self._waiting_started_at = None
+        self._write_dev_pause_diagnostic(reason=reason, message=message)
+
+    def _resume_eta_clock(self) -> None:
+        if self._paused_started_at is None:
+            return
+        if self._run_started_at is not None:
+            self._run_started_at += datetime.now(UTC) - self._paused_started_at
+        self._paused_started_at = None
 
     def _pause_manual_for_current(self, message: str) -> None:
         self._pause(PAUSE_REASON_MANUAL_ACTION, message)
@@ -1931,16 +731,27 @@ class CreatorEnrichmentSession:
 
     def _handle_retryable_manual_failure(self, message: str) -> None:
         attempt_index = len(self._failure_attempts) + 1
+        diagnostic_text = self._build_diagnostic_text(
+            message=message,
+            pause_reason=PAUSE_REASON_MANUAL_ACTION,
+            pause_step=self._current_step or "idle",
+        )
         self._failure_attempts.append(
             CreatorEnrichmentFailureAttempt(
                 index=attempt_index,
                 summary=message,
-                diagnostic_text=self._build_diagnostic_text(
-                    message=message,
-                    pause_reason=PAUSE_REASON_MANUAL_ACTION,
-                    pause_step=self._current_step or "idle",
-                ),
+                diagnostic_text=diagnostic_text,
             )
+        )
+        self._write_dev_diagnostic_artifact(
+            name=(
+                f"creator_enrichment_task_{self._task_id}_item_{self._current_task_index or 'na'}"
+                f"_attempt_{attempt_index}"
+            ),
+            diagnostic_text=diagnostic_text,
+            summary=message,
+            kind="failure_attempt",
+            attempt_index=attempt_index,
         )
         if attempt_index < FAILURE_RETRY_LIMIT:
             self._paused = False
@@ -2021,8 +832,12 @@ class CreatorEnrichmentSession:
         self._last_contact_badge_clicked = False
         self._last_contact_badge_strategy = ""
         self._last_contact_badge_clicked_at = None
+        self._contact_badge_click_inflight = False
         self._contact_positive_signal = False
         self._profile_patch_applied = False
+        self._last_dom_profile_signature = ""
+        self._last_dom_profile_seen_at = None
+        self._last_dom_profile_probe_at = None
         if clear_page_capture and self._page is not None:
             try:
                 self._page.evaluate(
@@ -2034,8 +849,6 @@ class CreatorEnrichmentSession:
                         }
                         root.profileResponses = [];
                         root.contactResponses = [];
-                        root.badgeEvents = [];
-                        root.badgeClickPageUrl = "";
                     }
                     """
                 )
@@ -2158,7 +971,11 @@ class CreatorEnrichmentSession:
             self._last_message = "浏览器已关闭。"
             self.shutdown()
             return False
-        return True
+        if self._ensure_single_work_page(reason="runtime_check"):
+            return True
+        if self._context is not None:
+            self._pause_manual_for_current("工作页面不可用，请处理浏览器后重试。")
+        return False
 
     def _is_captcha_present(self) -> bool:
         if self._page is None:
@@ -2252,13 +1069,69 @@ class CreatorEnrichmentSession:
         if not self._paused or self._completed:
             return False
         return (
-            self._pause_reason
-            in {
-                PAUSE_REASON_CAPTCHA,
-                PAUSE_REASON_REGION_MISMATCH,
-                PAUSE_REASON_MANUAL_ACTION,
-            }
+            self._pause_reason in ATTENTION_PAUSE_REASONS
             and self._last_message != "补充采集已暂停。"
+        )
+
+    def _write_dev_pause_diagnostic(self, *, reason: str, message: str) -> None:
+        if reason not in ATTENTION_PAUSE_REASONS or message == "补充采集已暂停。":
+            return
+        diagnostic_text = self._build_diagnostic_text(
+            message=message,
+            pause_reason=reason,
+            pause_step=self._pause_step or "idle",
+        )
+        self._write_dev_diagnostic_artifact(
+            name=(
+                f"creator_enrichment_task_{self._task_id}_item_{self._current_task_index or 'na'}"
+                f"_pause_{reason}"
+            ),
+            diagnostic_text=diagnostic_text,
+            summary=message,
+            kind="pause_snapshot",
+            attempt_index=len(self._failure_attempts) or None,
+        )
+
+    def _write_dev_diagnostic_artifact(
+        self,
+        *,
+        name: str,
+        diagnostic_text: str,
+        summary: str,
+        kind: str,
+        attempt_index: int | None,
+    ) -> None:
+        if self._dev_logger is None:
+            return
+        header = [
+            f"kind: {kind}",
+            f"task_id: {self._task_id}",
+            f"task_index: {self._current_task_index}",
+            f"attempt_index: {attempt_index if attempt_index is not None else '-'}",
+            f"summary: {summary}",
+            "",
+        ]
+        path = self._dev_logger.write_text_artifact(
+            name=name,
+            content="\n".join(header) + diagnostic_text,
+        )
+        if path is None:
+            self._log_event(
+                "diagnostic_artifact_write_failed",
+                task_index=self._current_task_index,
+                artifact_kind=kind,
+                artifact_dir=str(self._dev_logger.artifact_dir),
+                attempt_index=attempt_index,
+                summary=summary,
+            )
+            return
+        self._log_event(
+            "diagnostic_artifact_written",
+            task_index=self._current_task_index,
+            artifact_kind=kind,
+            artifact_path=str(path),
+            attempt_index=attempt_index,
+            summary=summary,
         )
 
 

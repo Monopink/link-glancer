@@ -36,12 +36,19 @@ def dev_mode_title_suffix() -> str:
 class JsonlDevLogger:
     def __init__(self, *, module: str, file_stem: str) -> None:
         timestamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
-        self._path = ensure_logs_dir() / f"{file_stem}_{timestamp}.jsonl"
+        self._base_stem = f"{file_stem}_{timestamp}"
+        self._path = ensure_logs_dir() / f"{self._base_stem}.jsonl"
         self._module = module
+        self._artifact_dir = ensure_logs_dir() / f"{self._base_stem}_artifacts"
 
     @property
     def path(self) -> Path:
         return self._path
+
+    @property
+    def artifact_dir(self) -> Path:
+        self._artifact_dir.mkdir(parents=True, exist_ok=True)
+        return self._artifact_dir
 
     def log(self, event: str, **fields: object) -> None:
         payload = {
@@ -55,3 +62,25 @@ class JsonlDevLogger:
                 handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
         except OSError:
             return
+
+    def write_text_artifact(
+        self,
+        *,
+        name: str,
+        content: str,
+        extension: str = "txt",
+    ) -> Path | None:
+        timestamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S_%f")
+        safe_name = _safe_file_component(name)
+        safe_extension = _safe_file_component(extension).lstrip(".") or "txt"
+        path = self.artifact_dir / f"{timestamp}_{safe_name}.{safe_extension}"
+        try:
+            path.write_text(content, encoding="utf-8")
+        except OSError:
+            return None
+        return path
+
+
+def _safe_file_component(value: str) -> str:
+    safe = "".join(char if char.isalnum() or char in "-_." else "_" for char in value).strip("._")
+    return safe or "artifact"

@@ -1,13 +1,8 @@
 from __future__ import annotations
 
-import json
-
-from creator_enrichment.constants import CONTACT_ICON_CLASS_KEYWORDS
-
 
 def network_capture_init_script() -> str:
-    keywords_json = json.dumps(list(CONTACT_ICON_CLASS_KEYWORDS))
-    return f"""
+    return """
 (() => {{
     if (window.__linkGlancerCaptureInstalled) {{
         return;
@@ -16,8 +11,6 @@ def network_capture_init_script() -> str:
     window.__linkGlancerCapture = {{
         profileResponses: [],
         contactResponses: [],
-        badgeEvents: [],
-        badgeClickPageUrl: "",
     }};
     const pushCapture = (kind, entry) => {{
         const list = window.__linkGlancerCapture[kind];
@@ -45,145 +38,6 @@ def network_capture_init_script() -> str:
             return [];
         }}
         return payload.profile_types;
-    }};
-    const contactBadgeKeywords = {keywords_json};
-    const isVisible = (element) => {{
-        if (!(element instanceof HTMLElement)) {{
-            return false;
-        }}
-        const style = window.getComputedStyle(element);
-        if (style.display === "none" || style.visibility === "hidden") {{
-            return false;
-        }}
-        const rect = element.getBoundingClientRect();
-        return rect.width > 0 && rect.height > 0;
-    }};
-    const resolveClickable = (element, container) => {{
-        let current = element;
-        while (current instanceof HTMLElement && current !== container) {{
-            const tagName = current.tagName.toLowerCase();
-            if (
-                tagName === "button"
-                || tagName === "a"
-                || current.classList.contains("cursor-pointer")
-                || current.getAttribute("role") === "button"
-                || typeof current.onclick === "function"
-            ) {{
-                return current;
-            }}
-            current = current.parentElement;
-        }}
-        return element instanceof HTMLElement ? element : null;
-    }};
-    const reportBadge = (entry) => {{
-        pushCapture("badgeEvents", {{
-            pageUrl: location.href,
-            detected: Boolean(entry && entry.detected),
-            clicked: Boolean(entry && entry.clicked),
-            strategy: typeof entry?.strategy === "string" ? entry.strategy : "",
-        }});
-    }};
-    const monitorContactBadge = () => {{
-        const root = window.__linkGlancerCapture;
-        const container = document.querySelector("#creator-detail-profile-container");
-        if (!(container instanceof HTMLElement)) {{
-            return;
-        }}
-        if (root.badgeClickPageUrl === location.href) {{
-            return;
-        }}
-        const normalizeText = (value) =>
-            typeof value === "string" ? value.trim().toLowerCase() : "";
-        const keywordVariants = contactBadgeKeywords.map((keyword) => normalizeText(keyword));
-        const describeTarget = (target) => {{
-            if (!(target instanceof HTMLElement)) {{
-                return "";
-            }}
-            const className =
-                typeof target.className === "string" ? target.className : "";
-            const svgClassName =
-                target.querySelector("svg")?.getAttribute("class") || "";
-            return [
-                target.tagName.toLowerCase(),
-                target.getAttribute("data-e2e") || "",
-                target.getAttribute("data-tid") || "",
-                target.getAttribute("aria-label") || "",
-                target.getAttribute("title") || "",
-                className,
-                svgClassName,
-            ]
-                .map((part) => normalizeText(part))
-                .filter(Boolean)
-                .join("|");
-        }};
-        const triggerClick = (target) => {{
-            target.dispatchEvent(
-                new MouseEvent("mousedown", {{ bubbles: true, cancelable: true }}),
-            );
-            target.dispatchEvent(
-                new MouseEvent("mouseup", {{ bubbles: true, cancelable: true }}),
-            );
-            target.dispatchEvent(
-                new MouseEvent("click", {{ bubbles: true, cancelable: true }}),
-            );
-            target.click();
-        }};
-        const candidates = [];
-        const seen = new Set();
-        const pushCandidate = (node) => {{
-            const target = resolveClickable(
-                node instanceof HTMLElement ? node : node?.parentElement,
-                container,
-            );
-            if (!(target instanceof HTMLElement) || seen.has(target)) {{
-                return;
-            }}
-            seen.add(target);
-            const description = describeTarget(target);
-            const matchedKeywordIndex = keywordVariants.findIndex(
-                (keyword) => keyword && description.includes(keyword),
-            );
-            if (matchedKeywordIndex < 0) {{
-                return;
-            }}
-            candidates.push({{
-                target,
-                matchedKeyword: contactBadgeKeywords[matchedKeywordIndex],
-            }});
-        }};
-        for (const node of container.querySelectorAll(
-            "svg, button, a, [role='button'], div.cursor-pointer",
-        )) {{
-            pushCandidate(node);
-        }}
-        for (const candidate of candidates) {{
-            const target = candidate.target;
-            if (!(target instanceof HTMLElement) || !isVisible(target)) {{
-                reportBadge({{
-                    detected: true,
-                    clicked: false,
-                    strategy: `observer:${{candidate.matchedKeyword}}:not_visible`,
-                }});
-                return;
-            }}
-            try {{
-                root.badgeClickPageUrl = location.href;
-                triggerClick(target);
-                reportBadge({{
-                    detected: true,
-                    clicked: true,
-                    strategy: `observer:${{candidate.matchedKeyword}}:click`,
-                }});
-            }} catch {{
-                root.badgeClickPageUrl = "";
-                reportBadge({{
-                    detected: true,
-                    clicked: false,
-                    strategy: `observer:${{candidate.matchedKeyword}}:visible`,
-                }});
-            }}
-            return;
-        }}
     }};
     const handlePayload = (url, pageUrl, payload, bodyText) => {{
         if (!payload || typeof payload !== "object") {{
@@ -263,15 +117,6 @@ def network_capture_init_script() -> str:
         }});
         return originalSend.call(this, body);
     }};
-    monitorContactBadge();
-    const badgeObserver = new MutationObserver(() => {{
-        monitorContactBadge();
-    }});
-    badgeObserver.observe(document.documentElement, {{
-        childList: true,
-        subtree: true,
-        attributes: true,
-    }});
 }})();
 """
 
