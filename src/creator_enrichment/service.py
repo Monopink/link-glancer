@@ -18,6 +18,7 @@ from creator_enrichment.constants import (
     BLOCKED_RESOURCE_HOSTS,
     BLOCKED_RESOURCE_PATH_MARKERS,
     BLOCKED_RESOURCE_TYPES,
+    BROWSER_CLOSED_MESSAGE,
     CONTACT_BADGE_WAIT_SECONDS,
     CONTACT_WAIT_SECONDS,
     DETAIL_URL_TEMPLATE,
@@ -442,6 +443,17 @@ class CreatorEnrichmentSession(BrowserGuardMixin, CapturePipelineMixin, ContactB
         self._collection_started = False
         self._route_installed = False
         self._dev_logger = None
+
+    def _handle_browser_closed(self) -> None:
+        self._failure_attempts = []
+        self._pause(PAUSE_REASON_MANUAL_ACTION, BROWSER_CLOSED_MESSAGE)
+        self._context = None
+        self._page = None
+        self._work_page_task_index = None
+        self._collection_mode_installed = False
+        self._route_installed = False
+        self._attempt_in_progress = False
+        self._startup_phase = "idle"
 
     def status(self) -> CreatorEnrichmentStatus:
         total_count = len(self._eligible_items())
@@ -969,12 +981,10 @@ class CreatorEnrichmentSession(BrowserGuardMixin, CapturePipelineMixin, ContactB
             return False
         try:
             if not self._context.pages:
-                self._last_message = "浏览器已关闭。"
-                self.shutdown()
+                self._handle_browser_closed()
                 return False
         except PlaywrightError:
-            self._last_message = "浏览器已关闭。"
-            self.shutdown()
+            self._handle_browser_closed()
             return False
         if self._ensure_single_work_page(reason="runtime_check"):
             return True

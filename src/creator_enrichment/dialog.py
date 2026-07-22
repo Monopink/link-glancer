@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from creator_enrichment.constants import BROWSER_CLOSED_MESSAGE
 from link_glancer.application import TaskApplicationService
 from link_glancer.runtime.dev import dev_mode_title_suffix, is_dev_mode
 from link_glancer.runtime.locks import (
@@ -161,6 +162,7 @@ class CreatorEnrichmentDialog(QDialog):
         self._last_time_label_refresh_at: datetime | None = None
         self._last_notified_message = ""
         self._last_issue_dialog_key: tuple[object, ...] | None = None
+        self._last_browser_closed_notice = ""
         self._manual_pause_pending = False
         self._startup_loop: QEventLoop | None = None
         self._startup_result: bool | None = None
@@ -318,11 +320,8 @@ class CreatorEnrichmentDialog(QDialog):
                     self._worker_started = True
                 self._maybe_handle_startup_phase()
                 self._refresh_from_status()
-                if self._should_close_after_browser_shutdown():
-                    self._force_close = True
-                    self.close()
-                    return
                 self._notify_status_change()
+                self._show_browser_closed_notice_if_needed()
                 self._show_issue_dialog_if_needed()
             return
         if message_type == "error":
@@ -491,13 +490,6 @@ class CreatorEnrichmentDialog(QDialog):
             return
         tray_icon.showMessage(title, message, tray_icon.MessageIcon.Information, 8000)
 
-    def _should_close_after_browser_shutdown(self) -> bool:
-        return (
-            self._worker_started
-            and not self._status.running
-            and self._status.last_message == "浏览器已关闭。"
-        )
-
     def _resume(self) -> None:
         self._send_command(
             {
@@ -512,7 +504,7 @@ class CreatorEnrichmentDialog(QDialog):
 
     def _show_issue_dialog_if_needed(self) -> None:
         status = self._status
-        if status.last_message == "浏览器已关闭。":
+        if status.last_message == BROWSER_CLOSED_MESSAGE:
             return
         if self._manual_pause_pending or status.pause_reason == "manual_action":
             return
@@ -542,6 +534,16 @@ class CreatorEnrichmentDialog(QDialog):
             self._send_command({"cmd": "retry"})
         elif action == "skip":
             self._send_command({"cmd": "skip"})
+
+    def _show_browser_closed_notice_if_needed(self) -> None:
+        status = self._status
+        if status.last_message != BROWSER_CLOSED_MESSAGE:
+            return
+        notice_key = f"{status.current_task_index}:{status.last_message}"
+        if notice_key == self._last_browser_closed_notice:
+            return
+        self._last_browser_closed_notice = notice_key
+        QMessageBox.warning(self, "浏览器已关闭", status.last_message)
 
     def _issue_dialog_title(self, status: _EnrichmentWorkerStatus) -> str:
         if status.pause_reason == "captcha":
@@ -576,11 +578,6 @@ class CreatorEnrichmentDialog(QDialog):
 
     def _handle_process_error(self, _error: QProcess.ProcessError) -> None:
         if self._force_close or self._expected_process_exit:
-            return
-        if self._status.last_message == "浏览器已关闭。":
-            self._finish_startup(result=False)
-            self._force_close = True
-            self.close()
             return
         self._finish_startup(result=False)
         QMessageBox.warning(self, "补充采集进程失败", self._process.errorString())

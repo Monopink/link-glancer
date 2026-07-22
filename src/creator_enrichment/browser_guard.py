@@ -17,8 +17,7 @@ class BrowserGuardMixin:
         try:
             pages = [page for page in self._context.pages if self._page_is_alive(page)]
         except PlaywrightError:
-            self._last_message = "浏览器已关闭。"
-            self.shutdown()
+            self._handle_browser_closed()
             return False
         target_task_index = self._current_task_index
         target_url = self._detail_url_for_task(target_task_index) or self._attempt_page_url or ""
@@ -31,6 +30,7 @@ class BrowserGuardMixin:
             guard_breach_reason=self._page_guard_breach_reason,
             force_reset=force_reset,
         )
+        reset_applied = force_reset or self._page_guard_breached
         if force_reset or self._page_guard_breached:
             pages = self._reset_page_environment(
                 reason=reason,
@@ -78,6 +78,12 @@ class BrowserGuardMixin:
         self._attach_page_diagnostics(work_page, source="work_page")
         if recreated:
             self._restore_work_page_after_recreation(reason=reason)
+        elif reset_applied and target_task_index is not None and target_url:
+            self._reset_work_page_after_normalization(
+                reason=reason,
+                task_index=target_task_index,
+                target_url=target_url,
+            )
         elif target_task_index is not None and target_url:
             self._repair_work_page_if_needed(
                 reason=reason,
@@ -100,8 +106,19 @@ class BrowserGuardMixin:
         pages: list[Page],
         reset_reason: str,
     ) -> list[Page]:
+        survivor = self._select_reset_survivor(pages)
         kept_pages: list[Page] = []
         for page in pages:
+            if page is survivor:
+                kept_pages.append(page)
+                self._log_event(
+                    "page_preserved_for_reset",
+                    reason=reason,
+                    page_url=self._page_url(page),
+                    reset_reason=reset_reason,
+                    was_work_page=page is self._page,
+                )
+                continue
             try:
                 page_url = self._page_url(page)
                 page.close()
@@ -122,10 +139,21 @@ class BrowserGuardMixin:
                 )
                 if self._page_is_alive(page):
                     kept_pages.append(page)
-        self._page = None
+        self._page = survivor if self._page_is_alive(survivor) else None
         self._work_page_task_index = None
         self._collection_mode_installed = False
         return [page for page in kept_pages if self._page_is_alive(page)]
+
+    def _select_reset_survivor(self, pages: list[Page]) -> Page | None:
+        alive_pages = [page for page in pages if self._page_is_alive(page)]
+        if not alive_pages:
+            return None
+        if self._page in alive_pages:
+            return self._page
+        for page in alive_pages:
+            if not self._is_blank_page(page):
+                return page
+        return alive_pages[0]
 
     def _select_work_page_candidate(
         self,
@@ -167,6 +195,26 @@ class BrowserGuardMixin:
             return
         self._log_event(
             "work_page_repair",
+            reason=reason,
+            task_index=task_index,
+            page_url=self._safe_page_url(),
+            target_url=target_url,
+        )
+        self._navigate_page(self._page, target_url)
+        self._assign_page_task_index(self._page, task_index)
+        self._ensure_collection_mode_for_page(self._page)
+
+    def _reset_work_page_after_normalization(
+        self,
+        *,
+        reason: str,
+        task_index: int,
+        target_url: str,
+    ) -> None:
+        if self._page is None:
+            return
+        self._log_event(
+            "work_page_reset_navigation",
             reason=reason,
             task_index=task_index,
             page_url=self._safe_page_url(),

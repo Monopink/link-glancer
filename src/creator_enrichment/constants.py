@@ -40,6 +40,7 @@ BLOCKED_RESOURCE_PATH_MARKERS = (
     ".png",
 )
 PROFILE_TYPES_ALLOWLIST = {1}
+BROWSER_CLOSED_MESSAGE = "浏览器已关闭，请处理后重新开始补充采集。"
 
 PAUSE_REASON_CAPTCHA = "captcha"
 PAUSE_REASON_REGION_MISMATCH = "region_mismatch"
