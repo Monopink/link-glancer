@@ -15,6 +15,10 @@ from link_glancer.ui.fonts import apply_application_font
 from link_glancer.ui.main_window import MainWindow
 
 
+class StartupCancelledError(RuntimeError):
+    """Raised when startup is intentionally cancelled by the user."""
+
+
 def create_application() -> QApplication:
     _set_windows_app_user_model_id()
     QApplication.setHighDpiScaleFactorRoundingPolicy(
@@ -83,8 +87,13 @@ def create_application() -> QApplication:
         window = _create_main_window_with_database_recovery(
             instance_id=instance_registration.instance_id
         )
+    except StartupCancelledError:
+        tray_icon.hide()
+        instance_registration.release()
+        raise SystemExit(0) from None
     except Exception as exc:
         instance_registration.release()
+        tray_icon.hide()
         QMessageBox.critical(None, "启动失败", str(exc))
         raise SystemExit(1) from exc
     tray_icon.messageClicked.connect(lambda: _activate_main_window(window))
@@ -113,7 +122,7 @@ def _create_main_window_with_database_recovery(*, instance_id: int) -> MainWindo
             QMessageBox.StandardButton.Cancel,
         )
         if result != QMessageBox.StandardButton.Yes:
-            raise RuntimeError("用户取消了数据库重建。") from exc
+            raise StartupCancelledError() from exc
         reset_app_database()
         return MainWindow(instance_id=instance_id)
 

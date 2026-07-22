@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import json
+import shutil
 import sqlite3
+from contextlib import closing
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
-from link_glancer.runtime.paths import app_database_path
+from link_glancer.runtime.paths import app_database_path, ensure_database_backups_dir
 from link_glancer.tasks.models import (
     BrowserConfig,
     BrowserProfile,
@@ -27,7 +30,15 @@ from link_glancer.tasks.serialization import (
 )
 
 CURRENT_SCHEMA_VERSION = 7
-_LAST_DATABASE_RESET_REASON: str | None = None
+
+
+@dataclass(frozen=True)
+class DatabaseResetSummary:
+    reason: str
+    backup_path: Path | None = None
+
+
+_LAST_DATABASE_RESET_SUMMARY: DatabaseResetSummary | None = None
 
 
 class DatabaseResetRequiredError(RuntimeError):
@@ -38,7 +49,7 @@ class DatabaseResetRequiredError(RuntimeError):
 
 def ensure_app_database() -> Path:
     database_path = app_database_path()
-    with sqlite3.connect(database_path) as connection:
+    with closing(sqlite3.connect(database_path)) as connection:
         connection.execute("PRAGMA foreign_keys = ON")
         _ensure_schema_objects(connection)
         _migrate_schema(connection)
@@ -50,9 +61,10 @@ def ensure_app_database() -> Path:
 
 
 def reset_app_database() -> Path:
-    global _LAST_DATABASE_RESET_REASON
+    global _LAST_DATABASE_RESET_SUMMARY
 
     database_path = app_database_path()
+    backup_path = _backup_existing_database(database_path)
     try:
         database_path.unlink(missing_ok=True)
     except OSError as exc:
@@ -60,20 +72,38 @@ def reset_app_database() -> Path:
             "无法重建数据库文件。请关闭正在运行的 LinkGlancer 或占用 app.db 的程序后重试。"
         ) from exc
 
-    _LAST_DATABASE_RESET_REASON = "用户确认重建数据库。"
-    with sqlite3.connect(database_path) as connection:
+    _LAST_DATABASE_RESET_SUMMARY = DatabaseResetSummary(
+        reason="用户确认重建数据库。",
+        backup_path=backup_path,
+    )
+    with closing(sqlite3.connect(database_path)) as connection:
         connection.execute("PRAGMA foreign_keys = ON")
         _ensure_schema_objects(connection)
         _set_app_setting(connection, "schema_version", CURRENT_SCHEMA_VERSION)
     return database_path
 
 
-def consume_database_reset_reason() -> str | None:
-    global _LAST_DATABASE_RESET_REASON
+def consume_database_reset_summary() -> DatabaseResetSummary | None:
+    global _LAST_DATABASE_RESET_SUMMARY
 
-    reason = _LAST_DATABASE_RESET_REASON
-    _LAST_DATABASE_RESET_REASON = None
-    return reason
+    summary = _LAST_DATABASE_RESET_SUMMARY
+    _LAST_DATABASE_RESET_SUMMARY = None
+    return summary
+
+
+def _backup_existing_database(database_path: Path) -> Path | None:
+    if not database_path.exists():
+        return None
+
+    timestamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
+    backup_path = ensure_database_backups_dir() / f"app_{timestamp}.db"
+    try:
+        shutil.copy2(database_path, backup_path)
+    except OSError as exc:
+        raise RuntimeError(
+            "无法备份现有数据库文件，已取消重建。请关闭占用 app.db 的程序或检查目录权限后重试。"
+        ) from exc
+    return backup_path
 
 
 def create_task(

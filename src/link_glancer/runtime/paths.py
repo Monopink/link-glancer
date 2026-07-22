@@ -50,6 +50,12 @@ def ensure_logs_dir() -> Path:
     return root
 
 
+def ensure_database_backups_dir() -> Path:
+    root = ensure_app_data_root() / "database-backups"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
 def ensure_runtime_locks_root() -> Path:
     root = ensure_app_data_root() / "runtime-locks"
     root.mkdir(parents=True, exist_ok=True)

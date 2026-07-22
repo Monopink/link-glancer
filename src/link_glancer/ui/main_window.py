@@ -43,7 +43,7 @@ from link_glancer.runtime.locks import (
     acquire_task_lock,
 )
 from link_glancer.runtime.paths import ensure_browser_environment_dir
-from link_glancer.tasks.database import consume_database_reset_reason
+from link_glancer.tasks.database import consume_database_reset_summary
 from link_glancer.tasks.models import (
     BrowserConfig,
     ReviewField,
@@ -142,15 +142,20 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(0, self._show_database_reset_notice)
 
     def _show_database_reset_notice(self) -> None:
-        reason = consume_database_reset_reason()
-        if reason is None:
+        summary = consume_database_reset_summary()
+        if summary is None:
             return
+        message = (
+            "数据库已按当前版本重建。\n"
+            "旧任务数据已清空，浏览器配置的独立环境目录未删除。\n\n"
+            f"原因：{summary.reason}"
+        )
+        if summary.backup_path is not None:
+            message += f"\n\n原数据库备份：{summary.backup_path}"
         QMessageBox.information(
             self,
             "数据库已重建",
-            "数据库已按当前版本重建。\n"
-            "旧任务数据已清空，浏览器配置的独立环境目录未删除。\n\n"
-            f"原因：{reason}",
+            message,
         )
 
     def _build_toolbar(self) -> None:
@@ -1280,7 +1285,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(title)
 
     def _update_version_display(self) -> None:
-        self._version_label.setText(f"版本 {self._window_version_text()}")
+        self._version_label.setText(self._window_version_text())
 
     def _window_version_text(self) -> str:
         if dev_mode_title_suffix():
