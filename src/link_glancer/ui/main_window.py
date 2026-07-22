@@ -54,6 +54,7 @@ from link_glancer.tasks.models import (
 from link_glancer.ui.config_manager_dialog import ConfigManagerDialog
 from link_glancer.ui.review_window import ReviewWindow
 from link_glancer.ui.task_creation_dialog import TaskCreationDialog
+from link_glancer.version import internal_version_text, public_version_text
 
 
 class _TaskMutationWorker(QObject):
@@ -134,6 +135,9 @@ class MainWindow(QMainWindow):
         self._build_toolbar()
         self._build_pages()
         self.setStatusBar(QStatusBar(self))
+        self._version_label = QLabel()
+        self.statusBar().addPermanentWidget(self._version_label)
+        self._update_version_display()
         self._show_start_page()
         QTimer.singleShot(0, self._show_database_reset_notice)
 
@@ -1270,7 +1274,15 @@ class MainWindow(QMainWindow):
 
     def _update_window_title(self, *, profile_name: str | None = None) -> None:
         suffix = f" {self._instance_id}" if self._instance_id > 1 else ""
-        title = f"LinkGlancer{suffix}{dev_mode_title_suffix()}"
+        title = f"LinkGlancer{suffix} {self._window_version_text()}{dev_mode_title_suffix()}"
         if profile_name:
             title += f" - Profile: {profile_name}"
         self.setWindowTitle(title)
+
+    def _update_version_display(self) -> None:
+        self._version_label.setText(f"版本 {self._window_version_text()}")
+
+    def _window_version_text(self) -> str:
+        if dev_mode_title_suffix():
+            return internal_version_text()
+        return public_version_text()
