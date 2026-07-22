@@ -1,9 +1,12 @@
 #define AppName "LinkGlancer"
-#define AppVersion "0.3.3"
 #define AppPublisher "LinkGlancer"
 #define AppExeName "LinkGlancer.exe"
 #define AppDistDir "..\dist\LinkGlancer"
 #define AppIconFile "..\packaging\icon.ico"
+
+#ifndef AppVersion
+  #error AppVersion must be provided by the build script.
+#endif
 
 [Setup]
 AppId={{6D8B9A42-0A0D-4C28-8D80-0DB68643E6D1}

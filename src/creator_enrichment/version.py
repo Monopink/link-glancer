@@ -1,8 +1,10 @@
 from __future__ import annotations
 
-CREATOR_ENRICHMENT_IMPL_VERSION = "v0.3.3.1"
+from link_glancer.version_core import PUBLIC_VERSION
+
+CREATOR_ENRICHMENT_BUILD = 3
+CREATOR_ENRICHMENT_IMPL_VERSION = f"v{PUBLIC_VERSION}.{CREATOR_ENRICHMENT_BUILD}"
 
 
 def creator_enrichment_public_version() -> str:
-    prefix, _, build = CREATOR_ENRICHMENT_IMPL_VERSION.rpartition(".")
-    return prefix if prefix and build.isdigit() else CREATOR_ENRICHMENT_IMPL_VERSION
+    return f"v{PUBLIC_VERSION}"

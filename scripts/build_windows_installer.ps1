@@ -9,6 +9,7 @@ if (-not (Test-Path ".venv\Scripts\python.exe")) {
 
 Write-Host "Rebuilding Windows application before creating installer..."
 & powershell -ExecutionPolicy Bypass -File scripts\build_windows.ps1
+$publicVersion = & .venv\Scripts\python.exe scripts\print_public_version.py
 
 $isccCommand = Get-Command iscc -ErrorAction SilentlyContinue
 $isccPath = if ($isccCommand) { $isccCommand.Source } else { $null }
@@ -24,7 +25,7 @@ if (-not $isccPath) {
     throw "Missing Inno Setup 6. Install it first, then rerun scripts\build_windows_installer.ps1."
 }
 
-& $isccPath packaging\link_glancer_windows.iss
+& $isccPath "/DAppVersion=$publicVersion" packaging\link_glancer_windows.iss
 
 Write-Host ""
 Write-Host "Installer build complete:"

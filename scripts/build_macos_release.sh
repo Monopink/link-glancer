@@ -27,13 +27,7 @@ if [[ -z "${NOTARY_PROFILE:-}" ]]; then
   exit 1
 fi
 
-VERSION="$(python - <<'PY'
-from pathlib import Path
-namespace = {}
-exec(Path("src/link_glancer/__init__.py").read_text(encoding="utf-8"), namespace)
-print(namespace["__version__"])
-PY
-)"
+VERSION="$(python scripts/print_public_version.py)"
 APP_PATH="dist/LinkGlancer.app"
 DMG_DIR="dist/release"
 DMG_NAME="LinkGlancer-${VERSION}-macos-arm64.dmg"

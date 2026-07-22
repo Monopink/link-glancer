@@ -2,4 +2,6 @@
 
 __all__ = ["__version__"]
 
-__version__ = "0.3.3"
+from link_glancer.version_core import PUBLIC_VERSION
+
+__version__ = PUBLIC_VERSION
