@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-PUBLIC_VERSION = "0.3.3"
+PUBLIC_VERSION = "0.3.4"
 
 
 def public_version_tag() -> str:

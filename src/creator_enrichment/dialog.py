@@ -519,6 +519,17 @@ class CreatorEnrichmentDialog(QDialog):
         if dialog_key == self._last_issue_dialog_key:
             return
         self._last_issue_dialog_key = dialog_key
+        if status.pause_reason == "captcha":
+            action = QMessageBox.question(
+                self,
+                "需要完成验证码",
+                "请在浏览器中完成验证。\n是否准备好重试？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Yes,
+            )
+            if action == QMessageBox.StandardButton.Yes:
+                self._send_command({"cmd": "retry"})
+            return
         if not status.diagnostic_text:
             return
         dialog = _IssueDialog(
