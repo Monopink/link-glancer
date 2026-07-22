@@ -8,6 +8,7 @@ from openpyxl import Workbook
 from link_glancer.tasks.database import list_all_items, list_reviews, load_task_detail
 from link_glancer.tasks.export_fields import resolve_export_fields
 from link_glancer.tasks.models import ReviewRecord, TaskItem
+from link_glancer.tasks.screening import matches_screening_scope
 
 
 def export_task_results(
@@ -16,6 +17,17 @@ def export_task_results(
     task = load_task_detail(database_path, task_id)
     items = list_all_items(database_path, task_id)
     reviews_by_item_id = list_reviews(database_path, task_id)
+    items = [
+        item
+        for item in items
+        if matches_screening_scope(
+            task.task_snapshot,
+            reviews_by_item_id.get(item.task_item_id).review_data
+            if reviews_by_item_id.get(item.task_item_id) is not None
+            else {},
+            task.task_snapshot.export_scope,
+        )
+    ]
 
     workbook = Workbook()
     sheet = workbook.active
@@ -52,6 +64,17 @@ def export_task_results_to_path(database_path: Path, task_id: int, export_path: 
     task = load_task_detail(database_path, task_id)
     items = list_all_items(database_path, task_id)
     reviews_by_item_id = list_reviews(database_path, task_id)
+    items = [
+        item
+        for item in items
+        if matches_screening_scope(
+            task.task_snapshot,
+            reviews_by_item_id.get(item.task_item_id).review_data
+            if reviews_by_item_id.get(item.task_item_id) is not None
+            else {},
+            task.task_snapshot.export_scope,
+        )
+    ]
 
     workbook = Workbook()
     sheet = workbook.active

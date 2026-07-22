@@ -26,6 +26,11 @@ from PySide6.QtWidgets import (
 from link_glancer.browser.detector import list_detected_browsers
 from link_glancer.tasks.models import BrowserConfig, BrowserProfile
 from link_glancer.ui.browser_config_advanced_dialog import BrowserConfigAdvancedDialog
+from link_glancer.ui.fonts import (
+    create_table_font,
+    non_native_file_dialog_options,
+    table_header_stylesheet,
+)
 
 
 class ConfigManagerDialog(QDialog):
@@ -58,6 +63,14 @@ class ConfigManagerDialog(QDialog):
         root.addWidget(QLabel("浏览器配置列表"))
 
         self._config_table = QTableWidget(0, 3)
+        table_font = create_table_font()
+        self._config_table.setFont(table_font)
+        self._config_table.horizontalHeader().setFont(table_font)
+        self._config_table.verticalHeader().setFont(table_font)
+        header_stylesheet = table_header_stylesheet()
+        if header_stylesheet:
+            self._config_table.horizontalHeader().setStyleSheet(header_stylesheet)
+            self._config_table.verticalHeader().setStyleSheet(header_stylesheet)
         self._config_table.setHorizontalHeaderLabels(["浏览器名称", "程序位置", "状态"])
         self._config_table.verticalHeader().setVisible(False)
         self._config_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -361,6 +374,7 @@ class AddBrowserConfigDialog(QDialog):
                 self,
                 "选择浏览器应用或目录",
                 "",
+                options=non_native_file_dialog_options(),
             )
             if selected:
                 self._path_combo.setEditText(selected)
@@ -371,6 +385,7 @@ class AddBrowserConfigDialog(QDialog):
             "选择浏览器程序",
             "",
             "Executable (*.exe);;All Files (*)",
+            options=non_native_file_dialog_options(),
         )
         if selected:
             self._path_combo.setEditText(selected)

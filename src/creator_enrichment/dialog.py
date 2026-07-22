@@ -33,6 +33,7 @@ from link_glancer.runtime.locks import (
     acquire_task_lock,
 )
 from link_glancer.tasks.models import TaskDetail
+from link_glancer.ui.fonts import non_native_file_dialog_options
 
 COLLECTION_POLL_INTERVAL_MS = 1000
 TIME_LABEL_REFRESH_INTERVAL_SECONDS = 5
@@ -789,6 +790,7 @@ class _IssueDialog(QDialog):
             "导出错误详情",
             default_name,
             "Text File (*.txt)",
+            options=non_native_file_dialog_options(),
         )
         if not selected:
             return

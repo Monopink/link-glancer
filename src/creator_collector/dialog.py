@@ -36,6 +36,7 @@ from link_glancer.runtime.locks import (
     acquire_profile_lock,
 )
 from link_glancer.tasks.models import BrowserConfig
+from link_glancer.ui.fonts import non_native_file_dialog_options
 
 DEFAULT_CREATOR_PAGE_URL = ""
 DEFAULT_COLLECTION_EXPORT_NAME = "collection_{timestamp}.xlsx"
@@ -232,6 +233,7 @@ class CreatorCollectorDialog(QDialog):
             "保存采集结果",
             str(default_path),
             "Excel Workbook (*.xlsx)",
+            options=non_native_file_dialog_options(),
         )
         if not selected:
             return False
@@ -688,6 +690,7 @@ class CreatorCollectorProgressDialog(QDialog):
             "保存采集结果",
             str(default_path),
             "Excel Workbook (*.xlsx)",
+            options=non_native_file_dialog_options(),
         )
         if not selected:
             return
@@ -709,6 +712,7 @@ class CreatorCollectorProgressDialog(QDialog):
             "保存采集结果",
             str(default_path),
             "Excel Workbook (*.xlsx)",
+            options=non_native_file_dialog_options(),
         )
         if not selected:
             self._expected_process_exit = True

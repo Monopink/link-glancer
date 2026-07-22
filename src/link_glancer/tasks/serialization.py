@@ -8,6 +8,7 @@ from link_glancer.tasks.models import (
     ReviewShortcutConfig,
     TaskSnapshot,
 )
+from link_glancer.tasks.screening import normalize_task_range_selection
 
 
 def task_snapshot_to_dict(snapshot: TaskSnapshot) -> dict[str, object]:
@@ -28,6 +29,9 @@ def task_snapshot_to_dict(snapshot: TaskSnapshot) -> dict[str, object]:
             "skip": snapshot.shortcuts.skip,
         },
         "export_fields": snapshot.export_fields,
+        "manual_review_scope": snapshot.manual_review_scope,
+        "export_scope": snapshot.export_scope,
+        "enrichment_scope": snapshot.enrichment_scope,
     }
 
 
@@ -56,6 +60,9 @@ def task_snapshot_from_dict(data: dict[str, object]) -> TaskSnapshot:
             skip=str(shortcuts.get("skip", "+")),
         ),
         export_fields=[str(item) for item in data.get("export_fields", [])],
+        manual_review_scope=normalize_task_range_selection(data.get("manual_review_scope")),
+        export_scope=normalize_task_range_selection(data.get("export_scope")),
+        enrichment_scope=normalize_task_range_selection(data.get("enrichment_scope")),
     )
 
 
@@ -103,6 +110,9 @@ def review_field_to_dict(field: ReviewField) -> dict[str, object]:
         "label": field.label,
         "type": field.field_type,
         "required": field.required,
+        "screen_pass_value": field.screen_pass_value,
+        "screen_fail_value": field.screen_fail_value,
+        "source": field.source,
         "options": [
             {
                 "value": option.value,
@@ -115,7 +125,7 @@ def review_field_to_dict(field: ReviewField) -> dict[str, object]:
 
 def review_field_from_dict(data: dict[str, object]) -> ReviewField:
     return ReviewField(
-        field_id=str(data.get("field", data.get("id", ""))),
+        field_id=str(data.get("field", "")),
         label=str(data["label"]),
         field_type=str(data["type"]),  # type: ignore[arg-type]
         required=bool(data.get("required", False)),
@@ -127,6 +137,9 @@ def review_field_from_dict(data: dict[str, object]) -> ReviewField:
             for option in _dict_list(data.get("options", []))
             if str(option.get("value", "")).strip()
         ],
+        screen_pass_value=str(data.get("screen_pass_value", "通过")),
+        screen_fail_value=str(data.get("screen_fail_value", "不通过")),
+        source=str(data.get("source", "manual")),  # type: ignore[arg-type]
     )
 
 

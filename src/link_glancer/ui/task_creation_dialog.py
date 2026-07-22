@@ -35,27 +35,53 @@ from link_glancer.application.services import TaskApplicationService
 from link_glancer.tasks.models import (
     BrowserConfig,
     ReviewField,
+    ReviewFieldSource,
     ReviewOption,
     ReviewShortcutConfig,
+    TaskRangeScope,
+    TaskRangeSelection,
     TaskSnapshot,
+)
+from link_glancer.ui.fonts import (
+    create_table_font,
+    non_native_file_dialog_options,
+    table_header_stylesheet,
 )
 
 REVIEW_FIELD_TYPE_OPTIONS = [
     ("单选", "single_select"),
     ("多选", "multi_select"),
     ("文本", "text"),
-    ("布尔", "boolean"),
+    ("筛选", "screen"),
+]
+REVIEW_FIELD_SOURCE_OPTIONS: list[tuple[str, ReviewFieldSource]] = [
+    ("人工", "manual"),
+    ("机器初筛", "machine"),
+]
+MANUAL_RANGE_SCOPE_OPTIONS: list[tuple[str, TaskRangeScope]] = [
+    ("初筛通过", "screen_passed"),
+    ("初筛不通过", "screen_failed"),
+    ("未初筛", "screen_unresolved"),
+]
+
+OVERALL_RANGE_SCOPE_OPTIONS: list[tuple[str, TaskRangeScope]] = [
+    ("整体通过", "screen_passed"),
+    ("整体不通过", "screen_failed"),
+    ("未筛选", "screen_unresolved"),
 ]
 
 ROW_ORIGIN_ROLE = Qt.ItemDataRole.UserRole + 1
 ROW_TASK_OWNED_ROLE = Qt.ItemDataRole.UserRole + 2
 ROW_IS_UNIQUE_ROLE = Qt.ItemDataRole.UserRole + 3
 ROW_OPTIONS_STASH_ROLE = Qt.ItemDataRole.UserRole + 4
+ROW_SCREEN_PASS_ROLE = Qt.ItemDataRole.UserRole + 5
+ROW_SCREEN_FAIL_ROLE = Qt.ItemDataRole.UserRole + 6
 FORM_FIELD_FULL_WIDTH = 420
 FORM_FIELD_COMPACT_WIDTH = 140
 MAX_AUTO_EXPORT_FIELDS = 50
-OPTIONLESS_FIELD_TYPES = {"text", "boolean"}
+OPTIONLESS_FIELD_TYPES = {"text"}
 SELECTABLE_FIELD_TYPES = {"single_select", "multi_select"}
+SCREEN_FIELD_TYPES = {"screen"}
 
 
 @dataclass(slots=True)
@@ -64,6 +90,38 @@ class ReviewFieldRowState:
     enabled: bool
     origin: str
     task_owned: bool
+
+
+class ScopeSelectionWidget(QWidget):
+    def __init__(
+        self,
+        options: list[tuple[str, TaskRangeScope]],
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._options = options
+        self._checkboxes: dict[TaskRangeScope, QCheckBox] = {}
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(12)
+        for label, value in self._options:
+            checkbox = QCheckBox(label)
+            self._checkboxes[value] = checkbox
+            layout.addWidget(checkbox)
+        layout.addStretch(1)
+
+    def set_value(self, scopes: TaskRangeSelection) -> None:
+        selected = set(scopes)
+        for value, checkbox in self._checkboxes.items():
+            checkbox.setChecked(value in selected)
+
+    def value(self) -> TaskRangeSelection:
+        selected: TaskRangeSelection = []
+        for _, value in self._options:
+            checkbox = self._checkboxes[value]
+            if checkbox.isChecked():
+                selected.append(value)
+        return selected
 
 
 class ReviewOptionsDialog(QDialog):
@@ -116,6 +174,51 @@ class ReviewOptionsDialog(QDialog):
         except ValueError as exc:
             QMessageBox.warning(self, "选项无效", str(exc))
             return
+        self.accept()
+
+
+class ScreenFieldDialog(QDialog):
+    def __init__(
+        self,
+        *,
+        pass_value: str,
+        fail_value: str,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.pass_value = pass_value
+        self.fail_value = fail_value
+        self.setWindowTitle("编辑筛选值")
+        self.resize(420, 180)
+
+        root = QVBoxLayout(self)
+        form = QFormLayout()
+        self._pass_edit = QLineEdit(pass_value)
+        self._fail_edit = QLineEdit(fail_value)
+        form.addRow("通过值", self._pass_edit)
+        form.addRow("不通过值", self._fail_edit)
+        root.addLayout(form)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("确定")
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
+        buttons.accepted.connect(self._accept)
+        buttons.rejected.connect(self.reject)
+        root.addWidget(buttons)
+
+    def _accept(self) -> None:
+        pass_value = self._pass_edit.text().strip()
+        fail_value = self._fail_edit.text().strip()
+        if not pass_value or not fail_value:
+            QMessageBox.warning(self, "筛选值无效", "通过值和不通过值不能为空。")
+            return
+        if pass_value == fail_value:
+            QMessageBox.warning(self, "筛选值无效", "通过值和不通过值不能相同。")
+            return
+        self.pass_value = pass_value
+        self.fail_value = fail_value
         self.accept()
 
 
@@ -193,6 +296,13 @@ class TaskCreationDialog(QDialog):
         self._export_fields_edit.setAcceptRichText(False)
         self._export_fields_edit.setFixedHeight(72)
         self._export_fields_edit.textChanged.connect(self._handle_export_fields_changed)
+        self._manual_scope_widget = ScopeSelectionWidget(MANUAL_RANGE_SCOPE_OPTIONS)
+        self._export_scope_widget = ScopeSelectionWidget(OVERALL_RANGE_SCOPE_OPTIONS)
+        self._enrichment_scope_widget = ScopeSelectionWidget(OVERALL_RANGE_SCOPE_OPTIONS)
+        default_scopes: TaskRangeSelection = [value for _, value in OVERALL_RANGE_SCOPE_OPTIONS]
+        self._manual_scope_widget.set_value(default_scopes)
+        self._export_scope_widget.set_value(default_scopes)
+        self._enrichment_scope_widget.set_value(default_scopes)
 
         form.addRow("Excel 文件", source_widget)
         form.addRow("确认页 URL", self._expanding_form_field(self._confirm_url_edit))
@@ -218,6 +328,18 @@ class TaskCreationDialog(QDialog):
         )
         form.addRow("展示字段", self._expanding_form_field(self._display_fields_edit))
         form.addRow("导出字段", self._expanding_form_field(self._export_fields_edit))
+        form.addRow(
+            "人工初筛范围",
+            self._expanding_form_field(self._manual_scope_widget),
+        )
+        form.addRow(
+            "导出范围",
+            self._expanding_form_field(self._export_scope_widget),
+        )
+        form.addRow(
+            "补充采集范围",
+            self._expanding_form_field(self._enrichment_scope_widget),
+        )
         root.addLayout(form)
 
         shortcut_box = QGroupBox("快捷键")
@@ -242,9 +364,9 @@ class TaskCreationDialog(QDialog):
 
         root.addWidget(QLabel("检查项"))
         self._review_fields_table = QTableWidget()
-        self._review_fields_table.setColumnCount(6)
+        self._review_fields_table.setColumnCount(7)
         self._review_fields_table.setHorizontalHeaderLabels(
-            ["启用", "结果列名", "问题标题", "类型", "必填", "选项"]
+            ["启用", "结果列名", "问题标题", "类型", "来源", "必填", "选项"]
         )
         _setup_table(self._review_fields_table)
         self._review_fields_table.cellClicked.connect(self._handle_review_field_cell_clicked)
@@ -354,6 +476,9 @@ class TaskCreationDialog(QDialog):
         self._url_field_combo.setCurrentText(snapshot.url_field)
         self._display_fields_edit.setPlainText(", ".join(snapshot.display_fields))
         self._export_fields_edit.setPlainText(", ".join(snapshot.export_fields))
+        self._manual_scope_widget.set_value(snapshot.manual_review_scope)
+        self._export_scope_widget.set_value(snapshot.export_scope)
+        self._enrichment_scope_widget.set_value(snapshot.enrichment_scope)
         self._submit_shortcut_edit.setKeySequence(QKeySequence(snapshot.shortcuts.submit))
         self._previous_shortcut_edit.setKeySequence(QKeySequence(snapshot.shortcuts.previous))
         self._next_shortcut_edit.setKeySequence(QKeySequence(snapshot.shortcuts.next))
@@ -378,7 +503,11 @@ class TaskCreationDialog(QDialog):
 
     def _browse_source(self) -> None:
         selected, _ = QFileDialog.getOpenFileName(
-            self, "选择任务源文件", str(Path.cwd()), "Excel Workbook (*.xlsx)"
+            self,
+            "选择任务源文件",
+            str(Path.cwd()),
+            "Excel Workbook (*.xlsx)",
+            options=non_native_file_dialog_options(),
         )
         if not selected:
             return
@@ -466,6 +595,9 @@ class TaskCreationDialog(QDialog):
         url_field = self._url_field_combo.currentText().strip()
         if not url_field:
             raise ValueError("URL 列名不能为空。")
+        manual_review_scope = self._scope_value(self._manual_scope_widget, "人工初筛")
+        export_scope = self._scope_value(self._export_scope_widget, "导出")
+        enrichment_scope = self._scope_value(self._enrichment_scope_widget, "补充采集")
 
         return TaskSnapshot(
             sheet_name=sheet_name,
@@ -484,7 +616,16 @@ class TaskCreationDialog(QDialog):
                 skip=_key_sequence_text(self._skip_shortcut_edit),
             ),
             export_fields=_split_csv(self._export_fields_edit.toPlainText()),
+            manual_review_scope=manual_review_scope,
+            export_scope=export_scope,
+            enrichment_scope=enrichment_scope,
         )
+
+    def _scope_value(self, widget: ScopeSelectionWidget, label: str) -> TaskRangeSelection:
+        value = widget.value()
+        if not value:
+            raise ValueError(f"{label}范围至少选择一项。")
+        return value
 
     def _update_warnings(self, warnings: list[str]) -> None:
         self._warnings_label.setText("\n".join(warnings))
@@ -497,7 +638,7 @@ class TaskCreationDialog(QDialog):
             if self._prompt_add_unique_field_to_global(row):
                 self._configure_review_fields_table()
             return
-        if column != 5:
+        if column != 6:
             return
         try:
             _edit_options_for_row(self._review_fields_table, row)
@@ -626,10 +767,21 @@ class TaskCreationDialog(QDialog):
                 combo_index = type_combo.findData(row_state.field.field_type)
                 if combo_index >= 0:
                     type_combo.setCurrentIndex(combo_index)
-            required_checkbox = self._review_fields_table.cellWidget(row, 4)
+            source_combo = self._review_fields_table.cellWidget(row, 4)
+            if isinstance(source_combo, QComboBox):
+                combo_index = source_combo.findData(row_state.field.source)
+                if combo_index >= 0:
+                    source_combo.setCurrentIndex(combo_index)
+            required_checkbox = self._review_fields_table.cellWidget(row, 5)
             if isinstance(required_checkbox, QCheckBox):
                 required_checkbox.setChecked(row_state.field.required)
-            _set_options_item(self._review_fields_table, row, row_state.field.options)
+            _set_options_item(
+                self._review_fields_table,
+                row,
+                row_state.field.options,
+                screen_pass_value=row_state.field.screen_pass_value,
+                screen_fail_value=row_state.field.screen_fail_value,
+            )
             self._set_row_metadata(
                 row,
                 origin=row_state.origin,
@@ -706,13 +858,14 @@ class TaskCreationDialog(QDialog):
         self._suspend_global_sync = True
         _configure_review_fields_table(
             self._review_fields_table,
-            field_id_editable=True,
+            field_id_editable=self._review_field_id_editable,
         )
         self._suspend_global_sync = False
 
     def _bind_review_row_signals(self, row: int) -> None:
         type_combo = self._review_fields_table.cellWidget(row, 3)
-        required_checkbox = self._review_fields_table.cellWidget(row, 4)
+        source_combo = self._review_fields_table.cellWidget(row, 4)
+        required_checkbox = self._review_fields_table.cellWidget(row, 5)
         if isinstance(type_combo, QComboBox):
             try:
                 type_combo.currentIndexChanged.disconnect(self._handle_review_field_type_changed)
@@ -721,6 +874,12 @@ class TaskCreationDialog(QDialog):
             type_combo.currentIndexChanged.connect(
                 lambda _index, row=row: self._handle_review_field_type_changed(row)
             )
+        if isinstance(source_combo, QComboBox):
+            try:
+                source_combo.currentIndexChanged.disconnect(self._sync_global_review_field_library)
+            except (RuntimeError, TypeError):
+                pass
+            source_combo.currentIndexChanged.connect(self._sync_global_review_field_library)
         if isinstance(required_checkbox, QCheckBox):
             try:
                 required_checkbox.checkStateChanged.disconnect(
@@ -776,6 +935,14 @@ def _key_sequence_text(editor: QKeySequenceEdit) -> str:
 
 
 def _setup_table(table: QTableWidget) -> None:
+    table_font = create_table_font()
+    table.setFont(table_font)
+    table.horizontalHeader().setFont(table_font)
+    table.verticalHeader().setFont(table_font)
+    header_stylesheet = table_header_stylesheet()
+    if header_stylesheet:
+        table.horizontalHeader().setStyleSheet(header_stylesheet)
+        table.verticalHeader().setStyleSheet(header_stylesheet)
     table.verticalHeader().setVisible(False)
     table.setAlternatingRowColors(True)
     table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
@@ -804,29 +971,56 @@ def _add_empty_review_row(table: QTableWidget) -> None:
     for label, value in REVIEW_FIELD_TYPE_OPTIONS:
         type_combo.addItem(label, value)
     table.setCellWidget(row, 3, type_combo)
+    source_combo = QComboBox()
+    for label, value in REVIEW_FIELD_SOURCE_OPTIONS:
+        source_combo.addItem(label, value)
+    table.setCellWidget(row, 4, source_combo)
     required_checkbox = QCheckBox()
-    table.setCellWidget(row, 4, required_checkbox)
+    table.setCellWidget(row, 5, required_checkbox)
     _set_options_item(table, row, [])
     _configure_review_fields_table(table)
 
 
-def _set_options_item(table: QTableWidget, row: int, options: list[ReviewOption]) -> None:
-    summary_item = table.item(row, 5)
+def _set_options_item(
+    table: QTableWidget,
+    row: int,
+    options: list[ReviewOption],
+    *,
+    screen_pass_value: str = "通过",
+    screen_fail_value: str = "不通过",
+) -> None:
+    summary_item = table.item(row, 6)
     if summary_item is None:
         summary_item = QTableWidgetItem()
-        table.setItem(row, 5, summary_item)
+        table.setItem(row, 6, summary_item)
     field_type = _combo_data(table, row, 3) or "single_select"
-    summary_item.setText(_options_preview(options, field_type))
-    summary_item.setToolTip(_options_tooltip(options, field_type))
+    summary_item.setText(
+        _options_preview(
+            options,
+            field_type,
+            screen_pass_value=screen_pass_value,
+            screen_fail_value=screen_fail_value,
+        )
+    )
+    summary_item.setToolTip(
+        _options_tooltip(
+            options,
+            field_type,
+            screen_pass_value=screen_pass_value,
+            screen_fail_value=screen_fail_value,
+        )
+    )
     summary_item.setData(Qt.ItemDataRole.UserRole, list(options))
+    summary_item.setData(ROW_SCREEN_PASS_ROLE, screen_pass_value)
+    summary_item.setData(ROW_SCREEN_FAIL_ROLE, screen_fail_value)
     table.setRowHeight(row, max(table.rowHeight(row), 34))
 
 
 def _set_options_stash(table: QTableWidget, row: int, options: list[ReviewOption]) -> None:
-    summary_item = table.item(row, 5)
+    summary_item = table.item(row, 6)
     if summary_item is None:
         summary_item = QTableWidgetItem()
-        table.setItem(row, 5, summary_item)
+        table.setItem(row, 6, summary_item)
     summary_item.setData(ROW_OPTIONS_STASH_ROLE, list(options))
 
 
@@ -842,9 +1036,26 @@ def _options_stash_value(table: QTableWidget, row: int, column: int) -> list[Rev
 
 def _edit_options_for_row(table: QTableWidget, row: int) -> None:
     field_type = _combo_data(table, row, 3) or "single_select"
+    if field_type in SCREEN_FIELD_TYPES:
+        pass_value, fail_value = _screen_values(table, row, 6)
+        dialog = ScreenFieldDialog(
+            pass_value=pass_value,
+            fail_value=fail_value,
+            parent=table,
+        )
+        if dialog.exec() != int(QDialog.DialogCode.Accepted):
+            return
+        _set_options_item(
+            table,
+            row,
+            [],
+            screen_pass_value=dialog.pass_value,
+            screen_fail_value=dialog.fail_value,
+        )
+        return
     if field_type not in SELECTABLE_FIELD_TYPES:
         return
-    existing_options = _options_value(table, row, 5)
+    existing_options = _options_value(table, row, 6)
     dialog = ReviewOptionsDialog(existing_options, table)
     if dialog.exec() != int(QDialog.DialogCode.Accepted):
         return
@@ -852,7 +1063,15 @@ def _edit_options_for_row(table: QTableWidget, row: int) -> None:
     _set_options_stash(table, row, dialog.options)
 
 
-def _options_preview(options: list[ReviewOption], field_type: str) -> str:
+def _options_preview(
+    options: list[ReviewOption],
+    field_type: str,
+    *,
+    screen_pass_value: str = "通过",
+    screen_fail_value: str = "不通过",
+) -> str:
+    if field_type in SCREEN_FIELD_TYPES:
+        return f"通过={screen_pass_value} / 不通过={screen_fail_value}"
     if field_type in OPTIONLESS_FIELD_TYPES:
         return "不适用"
     if not options:
@@ -863,7 +1082,15 @@ def _options_preview(options: list[ReviewOption], field_type: str) -> str:
     return " / ".join(parts)
 
 
-def _options_tooltip(options: list[ReviewOption], field_type: str) -> str:
+def _options_tooltip(
+    options: list[ReviewOption],
+    field_type: str,
+    *,
+    screen_pass_value: str = "通过",
+    screen_fail_value: str = "不通过",
+) -> str:
+    if field_type in SCREEN_FIELD_TYPES:
+        return f"通过：{screen_pass_value}\n不通过：{screen_fail_value}"
     if field_type in OPTIONLESS_FIELD_TYPES:
         return ""
     if not options:
@@ -895,9 +1122,11 @@ def _collect_review_field_at_row(table: QTableWidget, row: int) -> ReviewField |
     field_id = _table_text(table, row, 1)
     label = _table_text(table, row, 2)
     field_type = _combo_data(table, row, 3) or "single_select"
-    required = _checkbox_value(table, row, 4)
-    options = _options_value(table, row, 5)
-    stashed_options = _options_stash_value(table, row, 5)
+    source = _combo_data(table, row, 4) or "manual"
+    required = _checkbox_value(table, row, 5)
+    options = _options_value(table, row, 6)
+    stashed_options = _options_stash_value(table, row, 6)
+    screen_pass_value, screen_fail_value = _screen_values(table, row, 6)
     if not field_id and not label:
         return None
     if not field_id or not label:
@@ -906,12 +1135,17 @@ def _collect_review_field_at_row(table: QTableWidget, row: int) -> ReviewField |
         raise ValueError(f"检查项 {label} 需要至少一个选项。")
     if field_type in OPTIONLESS_FIELD_TYPES:
         options = stashed_options or options
+    if field_type in SCREEN_FIELD_TYPES:
+        options = []
     return ReviewField(
         field_id=field_id,
         label=label,
         field_type=str(field_type),  # type: ignore[arg-type]
         required=required,
         options=options,
+        screen_pass_value=screen_pass_value,
+        screen_fail_value=screen_fail_value,
+        source=str(source),  # type: ignore[arg-type]
     )
 
 
@@ -963,14 +1197,25 @@ def _fill_review_fields_table(
             combo_index = type_combo.findData(field.field_type)
             if combo_index >= 0:
                 type_combo.setCurrentIndex(combo_index)
-        required_checkbox = table.cellWidget(row, 4)
+        source_combo = table.cellWidget(row, 4)
+        if isinstance(source_combo, QComboBox):
+            combo_index = source_combo.findData(field.source)
+            if combo_index >= 0:
+                source_combo.setCurrentIndex(combo_index)
+        required_checkbox = table.cellWidget(row, 5)
         if isinstance(required_checkbox, QCheckBox):
             required_checkbox.setChecked(field.required)
-        summary_item = table.item(row, 5)
+        summary_item = table.item(row, 6)
         if summary_item is None:
             summary_item = QTableWidgetItem()
-            table.setItem(row, 5, summary_item)
-        _set_options_item(table, row, field.options)
+            table.setItem(row, 6, summary_item)
+        _set_options_item(
+            table,
+            row,
+            field.options,
+            screen_pass_value=field.screen_pass_value,
+            screen_fail_value=field.screen_fail_value,
+        )
         _set_options_stash(table, row, field.options)
     _configure_review_fields_table(table, field_id_editable=field_id_editable)
 
@@ -1059,6 +1304,15 @@ def _options_value(table: QTableWidget, row: int, column: int) -> list[ReviewOpt
     return [deepcopy(option) for option in raw_options if isinstance(option, ReviewOption)]
 
 
+def _screen_values(table: QTableWidget, row: int, column: int) -> tuple[str, str]:
+    item = table.item(row, column)
+    if item is None:
+        return "通过", "不通过"
+    pass_value = str(item.data(ROW_SCREEN_PASS_ROLE) or "通过").strip() or "通过"
+    fail_value = str(item.data(ROW_SCREEN_FAIL_ROLE) or "不通过").strip() or "不通过"
+    return pass_value, fail_value
+
+
 def _key_editor_value(table: QTableWidget, row: int, column: int) -> str:
     widget = table.cellWidget(row, column)
     if not isinstance(widget, QKeySequenceEdit):
@@ -1079,8 +1333,13 @@ def _cell_value(table: QTableWidget, row: int, column: int) -> object:
             "origin": item.data(ROW_ORIGIN_ROLE) if item is not None else "global",
             "task_owned": bool(item.data(ROW_TASK_OWNED_ROLE)) if item is not None else True,
         }
-    if column == 5:
-        return _options_value(table, row, column)
+    if column == 6:
+        pass_value, fail_value = _screen_values(table, row, column)
+        return {
+            "options": _options_value(table, row, column),
+            "screen_pass_value": pass_value,
+            "screen_fail_value": fail_value,
+        }
     if isinstance(widget, QKeySequenceEdit):
         return widget.keySequence().toString(QKeySequence.SequenceFormat.NativeText).strip()
     return _table_text(table, row, column)
@@ -1103,17 +1362,29 @@ def _set_cell_value(table: QTableWidget, row: int, column: int, value: object) -
         item.setData(ROW_TASK_OWNED_ROLE, bool(value.get("task_owned")))
         item.setData(ROW_IS_UNIQUE_ROLE, origin == "unique")
         return
-    if column == 5:
-        options = value if isinstance(value, list) else []
+    if column == 6:
+        options: list[ReviewOption] = []
+        screen_pass_value = "通过"
+        screen_fail_value = "不通过"
+        if isinstance(value, dict):
+            raw_options = value.get("options")
+            if isinstance(raw_options, list):
+                options = [item for item in raw_options if isinstance(item, ReviewOption)]
+            screen_pass_value = str(value.get("screen_pass_value") or "通过")
+            screen_fail_value = str(value.get("screen_fail_value") or "不通过")
+        elif isinstance(value, list):
+            options = [item for item in value if isinstance(item, ReviewOption)]
         _set_options_item(
             table,
             row,
-            [item for item in options if isinstance(item, ReviewOption)],
+            options,
+            screen_pass_value=screen_pass_value,
+            screen_fail_value=screen_fail_value,
         )
         _set_options_stash(
             table,
             row,
-            [item for item in options if isinstance(item, ReviewOption)],
+            options,
         )
         return
     if isinstance(widget, QKeySequenceEdit):
@@ -1129,12 +1400,14 @@ def _configure_review_fields_table(table: QTableWidget, *, field_id_editable: bo
     header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
     header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
     header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
-    header.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
+    header.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
+    header.setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
     table.setColumnWidth(0, 58)
     table.setColumnWidth(1, 150)
     table.setColumnWidth(3, 78)
-    table.setColumnWidth(4, 62)
-    table.setColumnWidth(5, 360)
+    table.setColumnWidth(4, 92)
+    table.setColumnWidth(5, 62)
+    table.setColumnWidth(6, 360)
     for row in range(table.rowCount()):
         origin_item = table.item(row, 1)
         is_unique = bool(origin_item.data(ROW_IS_UNIQUE_ROLE)) if origin_item is not None else False
@@ -1152,7 +1425,7 @@ def _configure_review_fields_table(table: QTableWidget, *, field_id_editable: bo
                 label_item.setFlags(flags & ~Qt.ItemFlag.ItemIsEditable)
             else:
                 label_item.setFlags(flags | Qt.ItemFlag.ItemIsEditable)
-        option_item = table.item(row, 5)
+        option_item = table.item(row, 6)
         if option_item is not None:
             unique_color = QColor("#9ca3af")
             default_color = table.palette().text().color()
@@ -1161,9 +1434,12 @@ def _configure_review_fields_table(table: QTableWidget, *, field_id_editable: bo
                 if item is not None:
                     item.setForeground(color)
         type_combo = table.cellWidget(row, 3)
-        required_checkbox = table.cellWidget(row, 4)
+        source_combo = table.cellWidget(row, 4)
+        required_checkbox = table.cellWidget(row, 5)
         if isinstance(type_combo, QComboBox):
             type_combo.setEnabled(not is_unique)
+        if isinstance(source_combo, QComboBox):
+            source_combo.setEnabled(not is_unique)
         if isinstance(required_checkbox, QCheckBox):
             required_checkbox.setEnabled(not is_unique)
         _normalize_review_field_row_options(table, row)
@@ -1177,19 +1453,46 @@ def _configure_review_fields_table(table: QTableWidget, *, field_id_editable: bo
 
 
 def _field_type_supports_options(field_type: str | None) -> bool:
-    return (field_type or "single_select") in SELECTABLE_FIELD_TYPES
+    return (field_type or "single_select") in (*SELECTABLE_FIELD_TYPES, *SCREEN_FIELD_TYPES)
 
 
 def _normalize_review_field_row_options(table: QTableWidget, row: int) -> None:
     field_type = _combo_data(table, row, 3) or "single_select"
-    visible_options = _options_value(table, row, 5)
-    stashed_options = _options_stash_value(table, row, 5)
+    source_combo = table.cellWidget(row, 4)
+    visible_options = _options_value(table, row, 6)
+    stashed_options = _options_stash_value(table, row, 6)
+    screen_pass_value, screen_fail_value = _screen_values(table, row, 6)
+    if isinstance(source_combo, QComboBox) and field_type not in SCREEN_FIELD_TYPES:
+        source_index = source_combo.findData("manual")
+        if source_index >= 0 and source_combo.currentData() != "manual":
+            source_combo.setCurrentIndex(source_index)
+    if field_type in SCREEN_FIELD_TYPES:
+        _set_options_item(
+            table,
+            row,
+            [],
+            screen_pass_value=screen_pass_value,
+            screen_fail_value=screen_fail_value,
+        )
+        return
     if field_type in OPTIONLESS_FIELD_TYPES:
         options_to_stash = visible_options or stashed_options
         if options_to_stash:
             _set_options_stash(table, row, options_to_stash)
-        _set_options_item(table, row, [])
+        _set_options_item(
+            table,
+            row,
+            [],
+            screen_pass_value=screen_pass_value,
+            screen_fail_value=screen_fail_value,
+        )
         return
     options_to_restore = visible_options or stashed_options
-    _set_options_item(table, row, options_to_restore)
+    _set_options_item(
+        table,
+        row,
+        options_to_restore,
+        screen_pass_value=screen_pass_value,
+        screen_fail_value=screen_fail_value,
+    )
     _set_options_stash(table, row, options_to_restore)

@@ -108,7 +108,7 @@ class ReviewWindow(QMainWindow):
         self._switching_current_item = False
         self._browser_unavailable_notified = False
 
-        self.setWindowTitle(f"检查{dev_mode_title_suffix()}")
+        self.setWindowTitle(f"人工检查{dev_mode_title_suffix()}")
         self.resize(660, 660)
         self.setMinimumWidth(560)
 
@@ -146,6 +146,9 @@ class ReviewWindow(QMainWindow):
         self._item_details_label.setWordWrap(True)
         self._item_details_label.setTextFormat(Qt.TextFormat.PlainText)
         layout.addWidget(self._item_details_label)
+        self._scope_label = QLabel("-")
+        self._scope_label.setTextFormat(Qt.TextFormat.PlainText)
+        layout.addWidget(self._scope_label)
 
         self._fields_container = QWidget()
         self._fields_layout = QVBoxLayout(self._fields_container)
@@ -275,13 +278,19 @@ class ReviewWindow(QMainWindow):
         self._refresh_browser_availability(notify=False)
         viewing_index = self.task.viewing_task_index
         completed = self._display_completed_items()
-        percentage = int((completed / self.task.total_items) * 100) if self.task.total_items else 0
-        self._progress_label.setText(f"{completed}/{self.task.total_items}")
-        self._progress_bar.setMaximum(max(self.task.total_items, 1))
+        total = self._scope_total_items()
+        percentage = int((completed / total) * 100) if total else 0
+        self._progress_label.setText(f"{completed}/{total}")
+        self._progress_bar.setMaximum(max(total, 1))
         self._progress_bar.setValue(completed)
         self._progress_bar.setFormat(f"{percentage}%")
         self._refresh_time_labels()
         self._item_details_label.setText(self._build_item_details(viewing_index))
+        scope_label = self._app_service.range_scope_label(
+            self.task.task_snapshot.manual_review_scope,
+            mode="manual",
+        )
+        self._scope_label.setText(f"当前检查范围：{scope_label}")
         self._sync_form_with_viewing_item()
         self._apply_interaction_state()
 
@@ -353,7 +362,7 @@ class ReviewWindow(QMainWindow):
     def _review_time_metrics(self) -> int | None:
         elapsed = max(int((datetime.now(UTC) - self._review_started_at).total_seconds()), 0)
         completed_in_session = self._display_completed_items() - self._review_started_completed
-        remaining = max(self.task.total_items - self._display_completed_items(), 0)
+        remaining = max(self._scope_total_items() - self._display_completed_items(), 0)
         if completed_in_session <= 0:
             return None
         return int(elapsed / completed_in_session * remaining)
@@ -377,10 +386,15 @@ class ReviewWindow(QMainWindow):
         return self._display_completed_items_for(self.task)
 
     def _display_completed_items_for(self, task: TaskDetail) -> int:
-        if task.total_items <= 0:
+        total = self._scope_total_items_for(task)
+        if total <= 0:
             return 0
-        pointer_completed = max(0, min(task.current_task_index - 1, task.total_items))
-        return min(task.completed_items, pointer_completed)
+        scope_indexes = self._scope_indexes_for(task)
+        pointer_position = 0
+        for index in scope_indexes:
+            if index < task.current_task_index:
+                pointer_position += 1
+        return min(self._scope_completed_count_for(task), pointer_position)
 
     def _collect_review_values(self) -> tuple[dict[str, object], list[str]]:
         values: dict[str, object] = {}
@@ -464,20 +478,26 @@ class ReviewWindow(QMainWindow):
             return
         if not self._can_view_previous():
             return
-        self._navigate_to(self.task.viewing_task_index - 1)
+        scope_indexes = self._scope_indexes()
+        current_position = scope_indexes.index(self.task.viewing_task_index)
+        self._navigate_to(scope_indexes[current_position - 1])
 
     def _go_to_next(self) -> None:
         if self._switching_current_item:
             return
         if not self._can_view_next():
             return
-        self._navigate_to(self.task.viewing_task_index + 1)
+        scope_indexes = self._scope_indexes()
+        current_position = scope_indexes.index(self.task.viewing_task_index)
+        self._navigate_to(scope_indexes[current_position + 1])
 
     def _navigate_to(self, task_index: int) -> None:
         if self._switching_current_item:
             return
         if self._is_viewing_current_item():
             self._save_current_draft()
+        if task_index not in self._scope_indexes():
+            return
         self.task = self._app_service.set_viewing_task_index(
             task_id=self.task.task_id,
             task_index=task_index,
@@ -485,15 +505,21 @@ class ReviewWindow(QMainWindow):
         self._refresh_view()
 
     def _can_view_previous(self) -> bool:
-        return self.task.viewing_task_index > 1
+        scope_indexes = self._scope_indexes()
+        return (
+            self.task.viewing_task_index in scope_indexes
+            and scope_indexes.index(self.task.viewing_task_index) > 0
+        )
 
     def _can_view_next(self) -> bool:
-        return self.task.viewing_task_index < self._max_viewing_index()
+        scope_indexes = self._scope_indexes()
+        if self.task.viewing_task_index not in scope_indexes:
+            return False
+        return scope_indexes.index(self.task.viewing_task_index) < len(scope_indexes) - 1
 
     def _max_viewing_index(self) -> int:
-        if self.task.total_items <= 0:
-            return 1
-        return min(self.task.current_task_index, self.task.total_items)
+        scope_indexes = self._scope_indexes()
+        return scope_indexes[-1] if scope_indexes else 1
 
     def _is_viewing_current_item(self) -> bool:
         return self.task.viewing_task_index == self.task.current_task_index
@@ -579,6 +605,21 @@ class ReviewWindow(QMainWindow):
     def _populate_review_form(self, values: dict[str, object]) -> None:
         for field_id, widget in self._field_widgets.items():
             widget.set_value(values.get(field_id))
+
+    def _scope_indexes(self) -> list[int]:
+        return self._app_service.manual_scope_indexes(self.task)
+
+    def _scope_indexes_for(self, task: TaskDetail) -> list[int]:
+        return self._app_service.manual_scope_indexes(task)
+
+    def _scope_total_items(self) -> int:
+        return self._app_service.manual_scope_total_count(self.task)
+
+    def _scope_total_items_for(self, task: TaskDetail) -> int:
+        return self._app_service.manual_scope_total_count(task)
+
+    def _scope_completed_count_for(self, task: TaskDetail) -> int:
+        return self._app_service.manual_scope_completed_count(task)
 
     def _sync_form_with_viewing_item(self) -> None:
         values: dict[str, object] = {}

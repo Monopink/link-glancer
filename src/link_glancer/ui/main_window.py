@@ -52,9 +52,15 @@ from link_glancer.tasks.models import (
     TaskStatus,
 )
 from link_glancer.ui.config_manager_dialog import ConfigManagerDialog
+from link_glancer.ui.fonts import (
+    create_table_font,
+    non_native_file_dialog_options,
+    table_header_stylesheet,
+)
 from link_glancer.ui.review_window import ReviewWindow
 from link_glancer.ui.task_creation_dialog import TaskCreationDialog
 from link_glancer.version import internal_version_text, public_version_text
+from machine_screening import MachineScreeningDialog
 
 
 class _TaskMutationWorker(QObject):
@@ -262,14 +268,17 @@ class MainWindow(QMainWindow):
         export_button.clicked.connect(self._export_task_with_dialog)
         delete_button = QPushButton("删除任务")
         delete_button.clicked.connect(self._delete_current_task)
+        self._machine_screening_button = QPushButton("自动初筛")
+        self._machine_screening_button.clicked.connect(self._open_machine_screening_dialog)
         self._creator_enrichment_button = QPushButton("补充采集")
         self._creator_enrichment_button.clicked.connect(self._open_creator_enrichment_dialog)
-        start_button = QPushButton("开始检查")
+        start_button = QPushButton("人工检查")
         start_button.clicked.connect(self._start_review_flow)
         start_button.setAutoDefault(True)
         start_button.setDefault(True)
         actions.addWidget(self._back_to_list_button)
         actions.addWidget(config_button)
+        actions.addWidget(self._machine_screening_button)
         actions.addWidget(self._creator_enrichment_button)
         actions.addStretch(1)
         actions.addWidget(export_button)
@@ -284,6 +293,14 @@ class MainWindow(QMainWindow):
         *,
         focus_policy: Qt.FocusPolicy,
     ) -> None:
+        table_font = create_table_font()
+        table.setFont(table_font)
+        table.horizontalHeader().setFont(table_font)
+        table.verticalHeader().setFont(table_font)
+        header_stylesheet = table_header_stylesheet()
+        if header_stylesheet:
+            table.horizontalHeader().setStyleSheet(header_stylesheet)
+            table.verticalHeader().setStyleSheet(header_stylesheet)
         table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
@@ -541,6 +558,7 @@ class MainWindow(QMainWindow):
             f"#{self.task.task_id}  ·  {self.task.name}  ·  {self._task_summary_text(self.task)}"
         )
         self._refresh_task_data_table()
+        self._update_machine_screening_button()
         self._update_creator_enrichment_button()
 
     def _start_review_flow(self) -> None:
@@ -558,6 +576,13 @@ class MainWindow(QMainWindow):
                 self,
                 "无法开始",
                 "当前检查缓冲区没有可用的 URL。\n请确认采集结果中包含有效的 url 列。",
+            )
+            return
+        if not self.app_service.has_manual_scope_items(self.task):
+            QMessageBox.information(
+                self,
+                "无可检查条目",
+                "当前人工检查范围内没有可检查的条目。",
             )
             return
         confirm_url = self._resolve_confirmation_url()
@@ -580,7 +605,7 @@ class MainWindow(QMainWindow):
             )
         except RuntimeLockConflictError as exc:
             self._release_review_locks()
-            QMessageBox.warning(self, "无法开始检查", str(exc))
+            QMessageBox.warning(self, "无法开始人工检查", str(exc))
             return
         request = BrowserLaunchRequest(
             browser_config_id=self.task.browser_config.profile_id,
@@ -602,8 +627,8 @@ class MainWindow(QMainWindow):
         self.browser.open_confirmation_page(confirm_url)
         result = QMessageBox.question(
             self,
-            "确认开始检查",
-            "请确认网页已正常打开，并完成登录或验证码等准备。\n\n是否开始检查？",
+            "确认开始人工检查",
+            "请确认网页已正常打开，并完成登录或验证码等准备。\n\n是否开始人工检查？",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
             QMessageBox.StandardButton.Yes,
         )
@@ -612,10 +637,17 @@ class MainWindow(QMainWindow):
             self._confirmation_task_id = None
             self._release_review_locks()
             self._update_window_title()
-            self.statusBar().showMessage("已取消开始检查。", 3000)
+            self.statusBar().showMessage("已取消开始人工检查。", 3000)
             return
         self._confirmation_task_id = self.task.task_id
         self.task = self.app_service.mark_task_in_progress(self.task.task_id)
+        if self.task.current_item is None:
+            QMessageBox.information(self, "无可检查条目", "当前人工检查范围内没有可检查的条目。")
+            self.browser.shutdown()
+            self._confirmation_task_id = None
+            self._release_review_locks()
+            self._update_window_title()
+            return
         self._enter_review_mode()
 
     def _enter_review_mode(self) -> None:
@@ -702,6 +734,25 @@ class MainWindow(QMainWindow):
         )
         self._creator_enrichment_button.setVisible(has_creator_id)
         self._creator_enrichment_button.setEnabled(has_creator_id)
+
+    def _update_machine_screening_button(self) -> None:
+        if not hasattr(self, "_machine_screening_button") or not self.task:
+            return
+        has_machine_fields = self.app_service.has_machine_screening_fields(self.task.task_snapshot)
+        has_url_field = bool(self.task.task_snapshot.url_field.strip())
+        self._machine_screening_button.setVisible(has_machine_fields)
+        self._machine_screening_button.setEnabled(has_machine_fields and has_url_field)
+
+    def _open_machine_screening_dialog(self) -> None:
+        if not self.task:
+            return
+        dialog = MachineScreeningDialog(
+            app_service=self.app_service,
+            task=self.task,
+            parent=self,
+        )
+        dialog.exec()
+        self._refresh_task_page()
 
     def _open_creator_enrichment_dialog(self) -> None:
         if not self.task:
@@ -1060,6 +1111,7 @@ class MainWindow(QMainWindow):
             "导出",
             str(default_path),
             "Excel Workbook (*.xlsx)",
+            options=non_native_file_dialog_options(),
         )
         if not selected:
             return

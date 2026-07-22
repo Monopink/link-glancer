@@ -4,9 +4,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
-FieldType = Literal["single_select", "multi_select", "text", "boolean"]
+FieldType = Literal["single_select", "multi_select", "text", "screen"]
 TaskStatus = Literal["ready", "in_progress", "completed"]
 CollectorSessionStatus = Literal["active", "interrupted", "finalizing", "finalized", "discarded"]
+TaskRangeScope = Literal["screen_passed", "screen_failed", "screen_unresolved"]
+TaskRangeSelection = list[TaskRangeScope]
+ReviewFieldSource = Literal["manual", "machine"]
 
 
 @dataclass(slots=True)
@@ -22,6 +25,9 @@ class ReviewField:
     field_type: FieldType
     required: bool = False
     options: list[ReviewOption] = field(default_factory=list)
+    screen_pass_value: str = "通过"
+    screen_fail_value: str = "不通过"
+    source: ReviewFieldSource = "manual"
 
 
 @dataclass(slots=True)
@@ -63,6 +69,15 @@ class TaskSnapshot:
     enabled_review_field_ids: list[str] = field(default_factory=list)
     shortcuts: ReviewShortcutConfig = field(default_factory=ReviewShortcutConfig)
     export_fields: list[str] = field(default_factory=list)
+    manual_review_scope: TaskRangeSelection = field(
+        default_factory=lambda: ["screen_passed", "screen_failed", "screen_unresolved"]
+    )
+    export_scope: TaskRangeSelection = field(
+        default_factory=lambda: ["screen_passed", "screen_failed", "screen_unresolved"]
+    )
+    enrichment_scope: TaskRangeSelection = field(
+        default_factory=lambda: ["screen_passed", "screen_failed", "screen_unresolved"]
+    )
 
 
 @dataclass(slots=True)

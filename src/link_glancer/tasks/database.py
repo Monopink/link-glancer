@@ -29,7 +29,7 @@ from link_glancer.tasks.serialization import (
     task_snapshot_to_dict,
 )
 
-CURRENT_SCHEMA_VERSION = 7
+CURRENT_SCHEMA_VERSION = 8
 
 
 @dataclass(frozen=True)
@@ -1091,11 +1091,6 @@ def _table_names(connection: sqlite3.Connection) -> set[str]:
     return {str(row[0]) for row in rows}
 
 
-def _table_columns(connection: sqlite3.Connection, table_name: str) -> set[str]:
-    rows = connection.execute(f"PRAGMA table_info({table_name})").fetchall()
-    return {str(row[1]) for row in rows}
-
-
 def _schema_version(connection: sqlite3.Connection) -> int | None:
     try:
         row = connection.execute(
@@ -1224,9 +1219,12 @@ def _migrate_schema(connection: sqlite3.Connection) -> None:
         return
     if schema_version == 5:
         _migrate_schema_v5_to_v6(connection)
-        return
+        schema_version = 6
     if schema_version == 6:
         _migrate_schema_v6_to_v7(connection)
+        schema_version = 7
+    if schema_version == 7:
+        _migrate_schema_v7_to_v8(connection)
         return
     raise RuntimeError(
         f"不支持从 schema 版本 {schema_version} 自动迁移到 {CURRENT_SCHEMA_VERSION}。"
@@ -1234,8 +1232,8 @@ def _migrate_schema(connection: sqlite3.Connection) -> None:
 
 
 def _migrate_schema_v5_to_v6(connection: sqlite3.Connection) -> None:
-    # v6 only adds creator collector temporary-session tables; existing task data stays intact.
     _ensure_schema_objects(connection)
+    _set_app_setting(connection, "schema_version", 6)
 
 
 def _migrate_schema_v6_to_v7(connection: sqlite3.Connection) -> None:
@@ -1263,6 +1261,91 @@ def _migrate_schema_v6_to_v7(connection: sqlite3.Connection) -> None:
         """
     )
     _ensure_schema_objects(connection)
+    _set_app_setting(connection, "schema_version", 7)
+
+
+def _migrate_schema_v7_to_v8(connection: sqlite3.Connection) -> None:
+    _ensure_schema_objects(connection)
+    _migrate_task_snapshot_payloads(connection)
+    _migrate_app_settings_payloads(connection)
+    _set_app_setting(connection, "schema_version", 8)
+
+
+def _migrate_task_snapshot_payloads(connection: sqlite3.Connection) -> None:
+    rows = connection.execute("SELECT id, task_snapshot_json FROM tasks").fetchall()
+    for task_id, raw_payload in rows:
+        payload = json.loads(str(raw_payload))
+        if not isinstance(payload, dict):
+            continue
+        normalized = _normalize_task_snapshot_payload(payload)
+        connection.execute(
+            "UPDATE tasks SET task_snapshot_json = ?, updated_at = ? WHERE id = ?",
+            (_json(normalized), _now_iso(), int(task_id)),
+        )
+
+
+def _migrate_app_settings_payloads(connection: sqlite3.Connection) -> None:
+    review_field_library = load_app_setting_from_connection(connection, "review_field_library")
+    if isinstance(review_field_library, list):
+        normalized_library = [
+            _normalize_review_field_payload(item)
+            for item in review_field_library
+            if isinstance(item, dict)
+        ]
+        _set_app_setting(connection, "review_field_library", normalized_library)
+
+    last_defaults = load_app_setting_from_connection(connection, "last_task_creation_defaults")
+    if isinstance(last_defaults, dict):
+        snapshot = last_defaults.get("task_snapshot")
+        if isinstance(snapshot, dict):
+            last_defaults["task_snapshot"] = _normalize_task_snapshot_payload(snapshot)
+            _set_app_setting(connection, "last_task_creation_defaults", last_defaults)
+
+
+def _normalize_task_snapshot_payload(payload: dict[str, object]) -> dict[str, object]:
+    normalized = dict(payload)
+    review_fields = normalized.get("review_fields")
+    if isinstance(review_fields, list):
+        normalized["review_fields"] = [
+            _normalize_review_field_payload(item)
+            for item in review_fields
+            if isinstance(item, dict)
+        ]
+    normalized.setdefault(
+        "manual_review_scope", ["screen_passed", "screen_failed", "screen_unresolved"]
+    )
+    normalized.setdefault("export_scope", ["screen_passed", "screen_failed", "screen_unresolved"])
+    normalized.setdefault(
+        "enrichment_scope", ["screen_passed", "screen_failed", "screen_unresolved"]
+    )
+    return normalized
+
+
+def _normalize_review_field_payload(payload: dict[str, object]) -> dict[str, object]:
+    normalized = dict(payload)
+    normalized.setdefault("field", str(normalized.get("id", "")))
+    normalized.setdefault("screen_pass_value", "通过")
+    normalized.setdefault("screen_fail_value", "不通过")
+    normalized.setdefault("source", "manual")
+    return normalized
+
+
+def _table_columns(connection: sqlite3.Connection, table_name: str) -> set[str]:
+    rows = connection.execute(f"PRAGMA table_info({table_name})").fetchall()
+    return {str(row[1]) for row in rows}
+
+
+def load_app_setting_from_connection(connection: sqlite3.Connection, key: str) -> object | None:
+    row = connection.execute(
+        "SELECT value_json FROM app_settings WHERE key = ?",
+        (key,),
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        return json.loads(str(row[0]))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
 
 
 def load_task_item_by_index(

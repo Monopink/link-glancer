@@ -60,6 +60,7 @@ from link_glancer.browser.detector import detect_browser
 from link_glancer.runtime.dev import JsonlDevLogger, is_dev_mode
 from link_glancer.runtime.paths import ensure_browser_environment_dir
 from link_glancer.tasks.models import BrowserConfig, TaskItem
+from link_glancer.tasks.screening import matches_screening_scope
 
 AUTO_START_PROFILE_WAIT_SECONDS = 8
 PROFILE_WAIT_GRACE_SECONDS = 4
@@ -511,9 +512,20 @@ class CreatorEnrichmentSession(BrowserGuardMixin, CapturePipelineMixin, ContactB
         )
 
     def _eligible_items(self) -> list[TaskItem]:
+        task = self._app_service.load_task(self._task_id)
         items = self._app_service.list_all_items(self._task_id)
+        reviews = self._app_service.list_reviews(self._task_id)
         return [
-            item for item in items if normalized_creator_id(item.task_data.get("creator_oecuid"))
+            item
+            for item in items
+            if normalized_creator_id(item.task_data.get("creator_oecuid"))
+            and matches_screening_scope(
+                task.task_snapshot,
+                reviews.get(item.task_item_id).review_data
+                if reviews.get(item.task_item_id) is not None
+                else {},
+                task.task_snapshot.enrichment_scope,
+            )
         ]
 
     def _pending_items(self) -> list[TaskItem]:

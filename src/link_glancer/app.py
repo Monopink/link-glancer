@@ -11,7 +11,7 @@ from link_glancer.runtime.dev import dev_mode_title_suffix
 from link_glancer.runtime.locks import register_instance
 from link_glancer.runtime.paths import bundled_asset_path
 from link_glancer.tasks.database import DatabaseResetRequiredError, reset_app_database
-from link_glancer.ui.fonts import apply_application_font
+from link_glancer.ui.fonts import apply_application_font, dialog_stylesheet
 from link_glancer.ui.main_window import MainWindow
 
 
@@ -21,9 +21,7 @@ class StartupCancelledError(RuntimeError):
 
 def create_application() -> QApplication:
     _set_windows_app_user_model_id()
-    QApplication.setHighDpiScaleFactorRoundingPolicy(
-        Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
-    )
+    QApplication.setHighDpiScaleFactorRoundingPolicy(Qt.HighDpiScaleFactorRoundingPolicy.Round)
     app = QApplication([])
     app.setApplicationName(f"LinkGlancer{dev_mode_title_suffix()}")
     app.setOrganizationName("LinkGlancer")
@@ -34,9 +32,10 @@ def create_application() -> QApplication:
     tray_icon = QSystemTrayIcon(app.windowIcon(), app)
     tray_icon.setToolTip("LinkGlancer")
     tray_icon.show()
-    app.setStyle(QStyleFactory.create("Fusion"))
+    app.setStyle(_create_application_style())
     apply_application_font(app)
     _apply_color_scheme(app)
+    dialog_font_styles = dialog_stylesheet()
     app.setStyleSheet(
         """
         QWidget[card="true"] {
@@ -81,6 +80,7 @@ def create_application() -> QApplication:
             background: palette(base);
         }
         """
+        + dialog_font_styles
     )
 
     try:
@@ -164,6 +164,17 @@ def _set_windows_app_user_model_id() -> None:
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("LinkGlancer.Desktop")
     except (AttributeError, OSError):
         return
+
+
+def _create_application_style():
+    available_styles = {key.lower(): key for key in QStyleFactory.keys()}
+    if sys.platform == "win32":
+        for name in ("windowsvista", "windows"):
+            if name in available_styles:
+                style = QStyleFactory.create(available_styles[name])
+                if style is not None:
+                    return style
+    return QStyleFactory.create("Fusion")
 
 
 def _activate_main_window(window: MainWindow) -> None:

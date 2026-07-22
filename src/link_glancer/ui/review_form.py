@@ -48,8 +48,6 @@ class ReviewFieldWidget(QFrame):
         value = self.value()
         if self.field.field_type == "multi_select":
             return isinstance(value, list) and len(value) > 0
-        if self.field.field_type == "boolean":
-            return value is not None
         if self.field.field_type == "text":
             return isinstance(value, str) and bool(value.strip())
         return value not in (None, "")
@@ -176,7 +174,7 @@ class MultiSelectFieldWidget(ReviewFieldWidget):
         return False
 
 
-class BooleanFieldWidget(ReviewFieldWidget):
+class ScreenFieldWidget(ReviewFieldWidget):
     def __init__(
         self,
         field: ReviewField,
@@ -184,45 +182,49 @@ class BooleanFieldWidget(ReviewFieldWidget):
         option_shortcut_handler: Callable[[str, str], None] | None = None,
     ) -> None:
         super().__init__(field, option_shortcut_handler=option_shortcut_handler)
-        self._current: bool | None = None
+        self._current: str | None = None
         layout = QVBoxLayout(self)
         layout.addWidget(_field_title(field))
 
         row = QHBoxLayout()
-        self._yes = QPushButton("Yes")
-        self._no = QPushButton("No")
-        self._yes.setCheckable(True)
-        self._no.setCheckable(True)
-        self._yes.clicked.connect(lambda checked: self._toggle(True, checked))
-        self._no.clicked.connect(lambda checked: self._toggle(False, checked))
-        row.addWidget(self._yes)
-        row.addWidget(self._no)
+        self._pass_button = QPushButton(field.screen_pass_value)
+        self._fail_button = QPushButton(field.screen_fail_value)
+        self._pass_button.setCheckable(True)
+        self._fail_button.setCheckable(True)
+        self._pass_button.clicked.connect(
+            lambda checked: self._toggle(field.screen_pass_value, checked)
+        )
+        self._fail_button.clicked.connect(
+            lambda checked: self._toggle(field.screen_fail_value, checked)
+        )
+        row.addWidget(self._pass_button)
+        row.addWidget(self._fail_button)
         row.addStretch(1)
         layout.addLayout(row)
 
-    def _toggle(self, value: bool, checked: bool) -> None:
+    def _toggle(self, value: str, checked: bool) -> None:
         if not checked:
             self._current = None
-            self._yes.setChecked(False)
-            self._no.setChecked(False)
+            self._pass_button.setChecked(False)
+            self._fail_button.setChecked(False)
             return
 
         self._current = value
-        self._yes.setChecked(value is True)
-        self._no.setChecked(value is False)
+        self._pass_button.setChecked(value == self.field.screen_pass_value)
+        self._fail_button.setChecked(value == self.field.screen_fail_value)
 
-    def value(self) -> bool | None:
+    def value(self) -> str | None:
         return self._current
 
     def set_value(self, value: object) -> None:
-        if value is True:
-            self._toggle(True, True)
-        elif value is False:
-            self._toggle(False, True)
+        if value == self.field.screen_pass_value:
+            self._toggle(self.field.screen_pass_value, True)
+        elif value == self.field.screen_fail_value:
+            self._toggle(self.field.screen_fail_value, True)
         else:
             self._current = None
-            self._yes.setChecked(False)
-            self._no.setChecked(False)
+            self._pass_button.setChecked(False)
+            self._fail_button.setChecked(False)
 
     def clear_value(self) -> None:
         self.set_value(None)
@@ -272,7 +274,7 @@ def create_field_widget(
     widget_types = {
         "single_select": SingleSelectFieldWidget,
         "multi_select": MultiSelectFieldWidget,
-        "boolean": BooleanFieldWidget,
+        "screen": ScreenFieldWidget,
         "text": TextFieldWidget,
     }
     return widget_types[field.field_type](
