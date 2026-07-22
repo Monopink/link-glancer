@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from time import monotonic, sleep
 
 from playwright.sync_api import Error as PlaywrightError
 
 from creator_enrichment.parsers import normalized_creator_id
 
-CONTACT_BADGE_LOGIC_VERSION = "20260722_playwright_locator_v1"
 CONTACT_ICON_ROOT_SELECTOR = "#creator-detail-profile-container [data-e2e='73fc4445-a755-a7ab']"
 CONTACT_ICON_BUTTON_SELECTOR = "div.inline-block > [data-e2e='0af7a642-88d7-376d']"
 CONTACT_ICON_BUTTON_ITEM_SELECTOR = ":scope > [data-e2e='f9158724-e9b3-bca4'].cursor-pointer"
@@ -18,12 +18,15 @@ ALLOWED_CONTACT_ICON_CLASSES = (
     "alliance-icon-viber_circle",
     "alliance-icon-zalo_circle",
 )
+UNEXPECTED_TAB_BREACH_REASONS = frozenset({"context_page_opened", "popup_opened"})
+POST_CLICK_SETTLE_SECONDS = 0.75
 
 
 class ContactBadgeMixin:
     def _click_contact_badge(self) -> bool:
         if self._page is None:
             return False
+        self._contact_badge_click_failure_reason = ""
         if self._current_step != "waiting_contact_badge":
             return self._skip_contact_badge_click(reason="step_mismatch")
         if self._captured_contact is not None:
@@ -48,12 +51,16 @@ class ContactBadgeMixin:
                 self._log_event(
                     "badge_click_success",
                     task_index=self._current_task_index,
-                    logic_version=CONTACT_BADGE_LOGIC_VERSION,
                     strategy=self._last_contact_badge_strategy,
                     click_mode=str(result.get("click_mode") or ""),
                     candidate_index=int(result.get("candidate_index") or 0),
+                    matched_icon_class=str(result.get("matched_icon_class") or ""),
                     candidate_count=int(result.get("candidate_count") or 0),
                     candidate_summary=str(result.get("candidate_summary") or ""),
+                    page_count_before=int(result.get("page_count_before") or 0),
+                    page_count_after=int(result.get("page_count_after") or 0),
+                    unexpected_new_page=bool(result.get("unexpected_new_page")),
+                    page_guard_breach_reason=str(result.get("page_guard_breach_reason") or ""),
                     page_url=self._safe_page_url(),
                 )
                 return True
@@ -63,14 +70,19 @@ class ContactBadgeMixin:
             self._log_event(
                 "badge_click_attempt",
                 task_index=self._current_task_index,
-                logic_version=CONTACT_BADGE_LOGIC_VERSION,
                 detected=self._last_contact_badge_detected,
                 clicked=False,
                 strategy=self._last_contact_badge_strategy,
                 click_mode=str(result.get("click_mode") or ""),
                 candidate_index=int(result.get("candidate_index") or 0),
+                matched_icon_class=str(result.get("matched_icon_class") or ""),
                 candidate_count=int(result.get("candidate_count") or 0),
                 candidate_summary=str(result.get("candidate_summary") or ""),
+                page_count_before=int(result.get("page_count_before") or 0),
+                page_count_after=int(result.get("page_count_after") or 0),
+                unexpected_new_page=bool(result.get("unexpected_new_page")),
+                page_guard_breach_reason=str(result.get("page_guard_breach_reason") or ""),
+                click_error=str(result.get("click_error") or ""),
             )
             return False
         finally:
@@ -81,7 +93,6 @@ class ContactBadgeMixin:
         self._log_event(
             "badge_click_skipped",
             task_index=self._current_task_index,
-            logic_version=CONTACT_BADGE_LOGIC_VERSION,
             reason=reason,
             step=self._current_step,
             page_url=self._safe_page_url(),
@@ -126,6 +137,7 @@ class ContactBadgeMixin:
                             strategy: "dom:root_missing",
                             clickMode: "dom_scan",
                             candidateIndex: -1,
+                            matchedIconClass: "",
                             candidate_count: 0,
                             candidate_summary: "",
                         };
@@ -191,6 +203,7 @@ class ContactBadgeMixin:
                             strategy: "dom:contact_icon:group_missing",
                             clickMode: "dom_scan",
                             candidateIndex: -1,
+                            matchedIconClass: "",
                             candidate_count: 0,
                             candidate_summary: "",
                         };
@@ -235,6 +248,7 @@ class ContactBadgeMixin:
                             strategy: `dom:contact_icon:${matchedIconKind}`,
                             clickMode: "playwright_locator",
                             candidateIndex: index,
+                            matchedIconClass: matchedIconKind,
                             candidate_count: allowedCandidateCount,
                             candidate_summary: candidateSummary,
                         };
@@ -246,6 +260,7 @@ class ContactBadgeMixin:
                             strategy: "dom:contact_icon:not_visible",
                             clickMode: "dom_scan",
                             candidateIndex: allowedCandidateIndex,
+                            matchedIconClass: "",
                             candidate_count: allowedCandidateCount,
                             candidate_summary: candidateSummary,
                         };
@@ -258,6 +273,7 @@ class ContactBadgeMixin:
                             : "dom:contact_icon:not_found",
                         clickMode: "dom_scan",
                         candidateIndex: allowedCandidateIndex,
+                        matchedIconClass: "",
                         candidate_count: candidates.length,
                         candidate_summary: candidateSummary,
                     };
@@ -274,26 +290,52 @@ class ContactBadgeMixin:
             return {"detected": False, "clicked": False, "strategy": "dom:error"}
         if not isinstance(result, dict):
             return {"detected": False, "clicked": False, "strategy": "dom:invalid"}
-        candidate_index = int(result.get("candidateIndex", -1) or -1)
+        raw_candidate_index = result.get("candidateIndex", -1)
+        candidate_index = int(raw_candidate_index) if raw_candidate_index is not None else -1
         clicked = False
         click_mode = str(result.get("clickMode") or "")
+        click_error = ""
+        page_count_before = 0
+        page_count_after = 0
+        unexpected_new_page = False
+        page_guard_breach_reason = ""
+        matched_icon_class = str(result.get("matchedIconClass") or "")
         if candidate_index >= 0 and bool(result.get("detected")):
-            clicked = self._click_contact_badge_candidate(candidate_index=candidate_index)
+            click_result = self._click_contact_badge_candidate(candidate_index=candidate_index)
+            clicked = bool(click_result.get("clicked"))
             if clicked:
                 click_mode = "playwright_locator"
+            click_error = str(click_result.get("click_error") or "")
+            page_count_before = int(click_result.get("page_count_before") or 0)
+            page_count_after = int(click_result.get("page_count_after") or 0)
+            unexpected_new_page = bool(click_result.get("unexpected_new_page"))
+            page_guard_breach_reason = str(click_result.get("page_guard_breach_reason") or "")
+            if unexpected_new_page:
+                self._contact_badge_click_failure_reason = "unexpected_new_page"
+                result["strategy"] = "dom:contact_icon:unexpected_new_page"
         return {
             "detected": bool(result.get("detected")),
             "clicked": clicked,
             "strategy": str(result.get("strategy") or ""),
             "click_mode": click_mode,
             "candidate_index": candidate_index,
+            "matched_icon_class": matched_icon_class,
             "candidate_count": int(result.get("candidate_count") or 0),
             "candidate_summary": str(result.get("candidate_summary") or ""),
+            "page_count_before": page_count_before,
+            "page_count_after": page_count_after,
+            "unexpected_new_page": unexpected_new_page,
+            "page_guard_breach_reason": page_guard_breach_reason,
+            "click_error": click_error,
         }
 
-    def _click_contact_badge_candidate(self, *, candidate_index: int) -> bool:
+    def _click_contact_badge_candidate(self, *, candidate_index: int) -> dict[str, object]:
         if self._page is None:
-            return False
+            return {"clicked": False, "click_error": "no_page"}
+        pages_before = self._alive_context_pages()
+        page_count_before = len(pages_before)
+        guard_breached_before = bool(getattr(self, "_page_guard_breached", False))
+        guard_reason_before = str(getattr(self, "_page_guard_breach_reason", "") or "")
         try:
             root = self._page.locator(CONTACT_ICON_ROOT_SELECTOR).first
             buttons = root.locator(CONTACT_ICON_BUTTON_SELECTOR).first.locator(
@@ -301,11 +343,100 @@ class ContactBadgeMixin:
             )
             count = buttons.count()
             if candidate_index < 0 or candidate_index >= count:
-                return False
+                return {
+                    "clicked": False,
+                    "click_error": "candidate_index_out_of_range",
+                    "page_count_before": page_count_before,
+                    "page_count_after": page_count_before,
+                    "unexpected_new_page": False,
+                    "page_guard_breach_reason": guard_reason_before,
+                }
             buttons.nth(candidate_index).click(timeout=1500)
         except PlaywrightError:
-            return False
-        return True
+            return {
+                "clicked": False,
+                "click_error": "playwright_click_error",
+                "page_count_before": page_count_before,
+                "page_count_after": len(self._alive_context_pages()),
+                "unexpected_new_page": False,
+                "page_guard_breach_reason": str(
+                    getattr(self, "_page_guard_breach_reason", "") or ""
+                ),
+            }
+        self._wait_for_post_click_settle()
+        pages_after = self._alive_context_pages()
+        page_count_after = len(pages_after)
+        guard_reason_after = str(getattr(self, "_page_guard_breach_reason", "") or "")
+        unexpected_pages = [
+            page for page in pages_after if page is not self._page and page not in pages_before
+        ]
+        unexpected_new_page = page_count_after > page_count_before or (
+            guard_reason_after in UNEXPECTED_TAB_BREACH_REASONS
+            and (not guard_breached_before or guard_reason_after != guard_reason_before)
+        )
+        unexpected_page_urls = [self._page_url(page) for page in unexpected_pages]
+        for page in unexpected_pages:
+            try:
+                page.close()
+            except PlaywrightError:
+                continue
+        if unexpected_new_page:
+            self._mark_page_guard_breached("unexpected_tab_after_contact_click")
+            self._log_event(
+                "unexpected_tab_after_contact_click",
+                task_index=self._current_task_index,
+                page_count_before=page_count_before,
+                page_count_after=page_count_after,
+                unexpected_page_urls=unexpected_page_urls,
+                page_guard_breach_reason=guard_reason_after,
+            )
+            return {
+                "clicked": False,
+                "click_error": "unexpected_new_page",
+                "page_count_before": page_count_before,
+                "page_count_after": page_count_after,
+                "unexpected_new_page": True,
+                "page_guard_breach_reason": guard_reason_after,
+            }
+        return {
+            "clicked": True,
+            "click_error": "",
+            "page_count_before": page_count_before,
+            "page_count_after": page_count_after,
+            "unexpected_new_page": False,
+            "page_guard_breach_reason": guard_reason_after,
+        }
+
+    def _alive_context_pages(self) -> list[object]:
+        context = getattr(self, "_context", None)
+        if context is None:
+            return []
+        try:
+            pages = list(context.pages)
+        except PlaywrightError:
+            return []
+        alive_pages: list[object] = []
+        for page in pages:
+            if self._page_url(page):
+                alive_pages.append(page)
+        return alive_pages
+
+    def _page_url(self, page) -> str:
+        if page is None:
+            return ""
+        try:
+            return str(page.url or "")
+        except PlaywrightError:
+            return ""
+
+    def _wait_for_post_click_settle(self) -> None:
+        deadline = monotonic() + POST_CLICK_SETTLE_SECONDS
+        while monotonic() < deadline:
+            if str(getattr(self, "_page_guard_breach_reason", "") or "") in (
+                UNEXPECTED_TAB_BREACH_REASONS
+            ):
+                break
+            sleep(0.05)
 
     def _maybe_capture_profile_from_dom(self) -> bool:
         if self._page is None or self._current_task_index is None:

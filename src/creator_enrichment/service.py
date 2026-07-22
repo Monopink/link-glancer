@@ -36,10 +36,7 @@ from creator_enrichment.constants import (
     STATE_STATUS_SKIPPED,
     STATE_STATUS_SUCCESS,
 )
-from creator_enrichment.contact_badge import (
-    CONTACT_BADGE_LOGIC_VERSION,
-    ContactBadgeMixin,
-)
+from creator_enrichment.contact_badge import ContactBadgeMixin
 from creator_enrichment.diagnostics import build_diagnostic_text
 from creator_enrichment.models import CreatorEnrichmentFailureAttempt, CreatorEnrichmentStatus
 from creator_enrichment.page_script import (
@@ -54,6 +51,7 @@ from creator_enrichment.parsers import (
     sorted_items_by_region,
 )
 from creator_enrichment.state import is_terminal_status, normalize_state, now_iso, update_item_state
+from creator_enrichment.version import CREATOR_ENRICHMENT_IMPL_VERSION
 from link_glancer.application import TaskApplicationService
 from link_glancer.browser.detector import detect_browser
 from link_glancer.runtime.dev import JsonlDevLogger, is_dev_mode
@@ -120,6 +118,7 @@ class CreatorEnrichmentSession(BrowserGuardMixin, CapturePipelineMixin, ContactB
         self._last_contact_badge_strategy = ""
         self._last_contact_badge_clicked_at: datetime | None = None
         self._contact_badge_click_inflight = False
+        self._contact_badge_click_failure_reason = ""
         self._contact_positive_signal = False
         self._profile_patch_applied = False
         self._failure_attempts: list[CreatorEnrichmentFailureAttempt] = []
@@ -151,7 +150,6 @@ class CreatorEnrichmentSession(BrowserGuardMixin, CapturePipelineMixin, ContactB
             )
             self._log_event(
                 "session_start",
-                contact_badge_logic_version=CONTACT_BADGE_LOGIC_VERSION,
                 jsonl_path=str(self._dev_logger.path),
                 artifact_dir=str(self._dev_logger.artifact_dir),
             )
@@ -285,6 +283,11 @@ class CreatorEnrichmentSession(BrowserGuardMixin, CapturePipelineMixin, ContactB
                     "badge_clicked",
                     task_index=self._current_task_index,
                     source="service",
+                )
+                return self.status()
+            if self._contact_badge_click_failure_reason == "unexpected_new_page":
+                self._handle_retryable_manual_failure(
+                    self._with_subject("联系方式点击触发了异常新标签，请处理页面后继续。")
                 )
                 return self.status()
             if self._timed_out(CONTACT_BADGE_WAIT_SECONDS):
@@ -833,6 +836,7 @@ class CreatorEnrichmentSession(BrowserGuardMixin, CapturePipelineMixin, ContactB
         self._last_contact_badge_strategy = ""
         self._last_contact_badge_clicked_at = None
         self._contact_badge_click_inflight = False
+        self._contact_badge_click_failure_reason = ""
         self._contact_positive_signal = False
         self._profile_patch_applied = False
         self._last_dom_profile_signature = ""
@@ -894,6 +898,7 @@ class CreatorEnrichmentSession(BrowserGuardMixin, CapturePipelineMixin, ContactB
             return
         self._dev_logger.log(
             event,
+            impl_version=CREATOR_ENRICHMENT_IMPL_VERSION,
             task_id=self._task_id,
             current_task_index=self._current_task_index,
             current_region=self._current_region,
