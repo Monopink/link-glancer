@@ -822,11 +822,12 @@ class CreatorEnrichmentSession(BrowserGuardMixin, CapturePipelineMixin, ContactB
     def _mark_current_auto_skipped(self, message: str) -> None:
         if self._current_task_index is None:
             return
-        self._begin_task_finalization(self._current_task_index)
+        finalized_task_index = self._current_task_index
+        self._begin_task_finalization(finalized_task_index)
         subject = self._current_subject()
         update_item_state(
             self._state,
-            task_index=self._current_task_index,
+            task_index=finalized_task_index,
             status=STATE_STATUS_AUTO_SKIPPED,
             reason=message,
             region=self._current_region or "",
@@ -844,6 +845,7 @@ class CreatorEnrichmentSession(BrowserGuardMixin, CapturePipelineMixin, ContactB
             subject,
             "补充采集异常，已自动跳过并继续下一条。",
         )
+        self._finish_task_finalization(finalized_task_index)
         self._continue_after_terminal_transition()
 
     def _complete(self, message: str) -> None:
