@@ -102,10 +102,7 @@ class ContactBadgeMixin:
     def _stabilize_page_after_contact_click(self, *, reason: str) -> None:
         if self._current_task_index is None:
             return
-        if not self._ensure_single_work_page(reason=f"{reason}:page_guard"):
-            return
-        target_url = self._detail_url_for_task(self._current_task_index)
-        if not target_url or self._page is None:
+        if self._page is None:
             return
         if self._current_page_matches_current_item():
             return
@@ -114,12 +111,7 @@ class ContactBadgeMixin:
             reason=reason,
             task_index=self._current_task_index,
             page_url=self._safe_page_url(),
-            target_url=target_url,
-        )
-        self._repair_work_page_if_needed(
-            reason=f"{reason}:repair",
-            task_index=self._current_task_index,
-            target_url=target_url,
+            target_url=self._detail_url_for_task(self._current_task_index),
         )
 
     def _click_contact_badge_via_dom(self) -> dict[str, object]:

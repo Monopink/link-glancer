@@ -24,7 +24,6 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from creator_enrichment.constants import BROWSER_CLOSED_MESSAGE
 from link_glancer.application import TaskApplicationService
 from link_glancer.runtime.dev import dev_mode_title_suffix, is_dev_mode
 from link_glancer.runtime.locks import (
@@ -57,12 +56,15 @@ class _EnrichmentWorkerStatus:
     remaining_regions: list[str]
     last_message: str
     pause_reason: str | None
+    attention_event_id: int
     diagnostic_summary: str | None
     diagnostic_text: str | None
     failure_attempts: list[dict[str, object]]
     attention_required: bool
     started_at: datetime | None
     estimated_end_at: datetime | None
+    auto_skip_on_failure: bool
+    issue_code: str | None
 
     @classmethod
     def idle(cls) -> _EnrichmentWorkerStatus:
@@ -83,12 +85,15 @@ class _EnrichmentWorkerStatus:
             remaining_regions=[],
             last_message="补充采集会话未启动。",
             pause_reason=None,
+            attention_event_id=0,
             diagnostic_summary=None,
             diagnostic_text=None,
             failure_attempts=[],
             attention_required=False,
             started_at=None,
             estimated_end_at=None,
+            auto_skip_on_failure=False,
+            issue_code=None,
         )
 
     @classmethod
@@ -122,6 +127,7 @@ class _EnrichmentWorkerStatus:
             ),
             last_message=str(payload.get("last_message") or ""),
             pause_reason=str(payload.get("pause_reason") or "") or None,
+            attention_event_id=int(payload.get("attention_event_id") or 0),
             diagnostic_summary=(
                 str(payload.get("diagnostic_summary"))
                 if payload.get("diagnostic_summary")
@@ -138,6 +144,8 @@ class _EnrichmentWorkerStatus:
             attention_required=bool(payload.get("attention_required")),
             started_at=_parse_datetime(payload.get("started_at")),
             estimated_end_at=_parse_datetime(payload.get("estimated_end_at")),
+            auto_skip_on_failure=bool(payload.get("auto_skip_on_failure")),
+            issue_code=str(payload.get("issue_code") or "") or None,
         )
 
 
@@ -161,8 +169,7 @@ class CreatorEnrichmentDialog(QDialog):
         self._force_close = False
         self._last_time_label_refresh_at: datetime | None = None
         self._last_notified_message = ""
-        self._last_issue_dialog_key: tuple[object, ...] | None = None
-        self._last_browser_closed_notice = ""
+        self._last_issue_dialog_event_id = 0
         self._manual_pause_pending = False
         self._startup_loop: QEventLoop | None = None
         self._startup_result: bool | None = None
@@ -189,6 +196,7 @@ class CreatorEnrichmentDialog(QDialog):
         left_grid.setColumnStretch(1, 1)
         self._auto_skip_checkbox = QCheckBox("自动跳过")
         self._auto_skip_checkbox.setChecked(False)
+        self._auto_skip_checkbox.toggled.connect(self._sync_runtime_options)
         self._count_label = QLabel("0 / 0")
         self._success_label = QLabel("0")
         self._no_contact_label = QLabel("0")
@@ -321,7 +329,6 @@ class CreatorEnrichmentDialog(QDialog):
                 self._maybe_handle_startup_phase()
                 self._refresh_from_status()
                 self._notify_status_change()
-                self._show_browser_closed_notice_if_needed()
                 self._show_issue_dialog_if_needed()
             return
         if message_type == "error":
@@ -364,7 +371,12 @@ class CreatorEnrichmentDialog(QDialog):
         )
         if result == QMessageBox.StandardButton.Yes:
             self._startup_phase = "browser_confirm_done"
-            self._send_command({"cmd": "prepare_pages"})
+            self._send_command(
+                {
+                    "cmd": "prepare_pages",
+                    "auto_skip_on_failure": self._auto_skip_checkbox.isChecked(),
+                }
+            )
             return
         self._startup_phase = "browser_confirm"
         self._finish_startup(result=False)
@@ -472,13 +484,15 @@ class CreatorEnrichmentDialog(QDialog):
             self._show_system_notification("补充采集完成", status.last_message)
             return
         if status.paused:
-            if status.pause_reason == "manual_action":
+            if status.pause_reason == "browser_closed":
                 return
             title = "补充采集已暂停"
             if status.pause_reason == "captcha":
                 title = "需要验证码"
             elif status.pause_reason == "region_mismatch":
                 title = "需要切换区域"
+            elif status.pause_reason == "manual_action":
+                title = "补充采集需要处理"
             self._show_system_notification(title, status.last_message)
 
     def _show_system_notification(self, title: str, message: str) -> None:
@@ -491,9 +505,27 @@ class CreatorEnrichmentDialog(QDialog):
         tray_icon.showMessage(title, message, tray_icon.MessageIcon.Information, 8000)
 
     def _resume(self) -> None:
+        if self._status.attention_required:
+            self._send_command(
+                {
+                    "cmd": "retry",
+                    "auto_skip_on_failure": self._auto_skip_checkbox.isChecked(),
+                }
+            )
+            return
         self._send_command(
             {
                 "cmd": "resume",
+                "auto_skip_on_failure": self._auto_skip_checkbox.isChecked(),
+            }
+        )
+
+    def _sync_runtime_options(self) -> None:
+        if self._process.state() != QProcess.ProcessState.Running:
+            return
+        self._send_command(
+            {
+                "cmd": "set_options",
                 "auto_skip_on_failure": self._auto_skip_checkbox.isChecked(),
             }
         )
@@ -504,31 +536,29 @@ class CreatorEnrichmentDialog(QDialog):
 
     def _show_issue_dialog_if_needed(self) -> None:
         status = self._status
-        if status.last_message == BROWSER_CLOSED_MESSAGE:
-            return
-        if self._manual_pause_pending or status.pause_reason == "manual_action":
+        if self._manual_pause_pending:
             return
         if not status.attention_required:
             return
-        dialog_key = (
-            status.current_task_index,
-            status.pause_reason,
-            status.last_message,
-            status.diagnostic_summary,
-        )
-        if dialog_key == self._last_issue_dialog_key:
+        if status.attention_event_id <= 0:
             return
-        self._last_issue_dialog_key = dialog_key
+        if status.attention_event_id == self._last_issue_dialog_event_id:
+            return
+        self._last_issue_dialog_event_id = status.attention_event_id
         if status.pause_reason == "captcha":
-            action = QMessageBox.question(
-                self,
-                "需要完成验证码",
-                "请在浏览器中完成验证。\n是否准备好重试？",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
-                QMessageBox.StandardButton.Yes,
+            action = self._show_simple_issue_dialog(
+                title=self._issue_dialog_title(status),
+                message=self._issue_dialog_message(status),
             )
-            if action == QMessageBox.StandardButton.Yes:
-                self._send_command({"cmd": "retry"})
+            if action == "retry":
+                self._send_command(
+                    {
+                        "cmd": "retry",
+                        "auto_skip_on_failure": self._auto_skip_checkbox.isChecked(),
+                    }
+                )
+            elif action == "skip":
+                self._send_command({"cmd": "skip"})
             return
         if not status.diagnostic_text:
             return
@@ -542,37 +572,43 @@ class CreatorEnrichmentDialog(QDialog):
         )
         action = dialog.exec_action()
         if action == "retry":
-            self._send_command({"cmd": "retry"})
+            self._send_command(
+                {
+                    "cmd": "retry",
+                    "auto_skip_on_failure": self._auto_skip_checkbox.isChecked(),
+                }
+            )
         elif action == "skip":
             self._send_command({"cmd": "skip"})
-
-    def _show_browser_closed_notice_if_needed(self) -> None:
-        status = self._status
-        if status.last_message != BROWSER_CLOSED_MESSAGE:
-            return
-        notice_key = f"{status.current_task_index}:{status.last_message}"
-        if notice_key == self._last_browser_closed_notice:
-            return
-        self._last_browser_closed_notice = notice_key
-        QMessageBox.warning(self, "浏览器已关闭", status.last_message)
 
     def _issue_dialog_title(self, status: _EnrichmentWorkerStatus) -> str:
         if status.pause_reason == "captcha":
             return "需要完成验证码"
         if status.pause_reason == "region_mismatch":
-            return "需要切换店铺区域"
+            return "页面区域不匹配"
         return "补充采集需要人工处理"
 
     def _issue_dialog_message(self, status: _EnrichmentWorkerStatus) -> str:
         if status.pause_reason == "captcha":
-            return "请在浏览器中完成验证。\n是否准备好重试？"
+            return "请先在浏览器中完成验证，然后重试。"
         if status.pause_reason == "region_mismatch":
-            target_region = status.current_region or "目标区域"
-            return (
-                f"当前页面的店铺区域与达人数据区域不一致，请切换区域：{target_region}。\n"
-                "是否准备好重试？"
-            )
+            return "当前页面区域与当前数据区域不一致，请切换到正确区域后重试。"
         return "当前达人的补充采集出现异常已暂停，请进行检查并重试或跳过。"
+
+    def _show_simple_issue_dialog(self, *, title: str, message: str) -> str:
+        dialog = QMessageBox(self)
+        dialog.setIcon(QMessageBox.Icon.Warning)
+        dialog.setWindowTitle(title)
+        dialog.setText(message)
+        retry_button = dialog.addButton("重试", QMessageBox.ButtonRole.AcceptRole)
+        skip_button = dialog.addButton("跳过", QMessageBox.ButtonRole.DestructiveRole)
+        dialog.exec()
+        clicked = dialog.clickedButton()
+        if clicked is retry_button:
+            return "retry"
+        if clicked is skip_button:
+            return "skip"
+        return "retry"
 
     def _send_command(self, payload: dict[str, object]) -> None:
         if self._process.state() != QProcess.ProcessState.Running:
@@ -665,7 +701,7 @@ class _IssueDialog(QDialog):
         self._diagnostic_text = diagnostic_text
         self._failure_attempts = failure_attempts
         self._task_name = task_name
-        self._selected_action = "close"
+        self._selected_action = "retry"
         self.setWindowTitle(title)
         self.resize(860, 620)
 

@@ -11,7 +11,14 @@ from link_glancer.tasks.models import TaskItem
 
 
 class BrowserGuardMixin:
-    def _ensure_single_work_page(self, *, reason: str, force_reset: bool = False) -> bool:
+    def _ensure_single_work_page(
+        self,
+        *,
+        reason: str,
+        force_reset: bool = False,
+        allow_guard_reset: bool = True,
+        allow_navigation_correction: bool = True,
+    ) -> bool:
         if self._context is None:
             return False
         try:
@@ -30,8 +37,8 @@ class BrowserGuardMixin:
             guard_breach_reason=self._page_guard_breach_reason,
             force_reset=force_reset,
         )
-        reset_applied = force_reset or self._page_guard_breached
-        if force_reset or self._page_guard_breached:
+        reset_applied = force_reset or (allow_guard_reset and self._page_guard_breached)
+        if reset_applied:
             pages = self._reset_page_environment(
                 reason=reason,
                 pages=pages,
@@ -76,15 +83,20 @@ class BrowserGuardMixin:
             self._work_page_task_index = None
         self._page = work_page
         self._attach_page_diagnostics(work_page, source="work_page")
-        if recreated:
+        if recreated and allow_navigation_correction:
             self._restore_work_page_after_recreation(reason=reason)
-        elif reset_applied and target_task_index is not None and target_url:
+        elif (
+            reset_applied
+            and allow_navigation_correction
+            and target_task_index is not None
+            and target_url
+        ):
             self._reset_work_page_after_normalization(
                 reason=reason,
                 task_index=target_task_index,
                 target_url=target_url,
             )
-        elif target_task_index is not None and target_url:
+        elif allow_navigation_correction and target_task_index is not None and target_url:
             self._repair_work_page_if_needed(
                 reason=reason,
                 task_index=target_task_index,
@@ -317,11 +329,13 @@ class BrowserGuardMixin:
             return False
         if current_parts.netloc != target_parts.netloc:
             return False
-        if current_parts.path != target_parts.path:
+        current_path = current_parts.path.rstrip("/")
+        target_path = target_parts.path.rstrip("/")
+        if current_path != target_path:
             return False
-        return query_param(current_url, "cid") == query_param(target_url, "cid") and query_param(
-            current_url, "shop_region"
-        ) == query_param(target_url, "shop_region")
+        current_cid = query_param(current_url, "cid")
+        target_cid = query_param(target_url, "cid")
+        return bool(current_cid) and current_cid == target_cid
 
     def _is_trusted_detail_page(
         self,

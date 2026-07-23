@@ -23,6 +23,7 @@ from creator_enrichment.constants import (
     CONTACT_WAIT_SECONDS,
     DETAIL_URL_TEMPLATE,
     FAILURE_RETRY_LIMIT,
+    PAUSE_REASON_BROWSER_CLOSED,
     PAUSE_REASON_CAPTCHA,
     PAUSE_REASON_MANUAL_ACTION,
     PAUSE_REASON_REGION_MISMATCH,
@@ -48,6 +49,7 @@ from creator_enrichment.parsers import (
     normalized_creator_id,
     normalized_region,
     parse_datetime,
+    query_param,
     remaining_regions_from_items,
     sorted_items_by_region,
 )
@@ -63,9 +65,13 @@ AUTO_START_PROFILE_WAIT_SECONDS = 8
 PROFILE_WAIT_GRACE_SECONDS = 4
 ATTENTION_PAUSE_REASONS = {
     PAUSE_REASON_CAPTCHA,
-    PAUSE_REASON_REGION_MISMATCH,
     PAUSE_REASON_MANUAL_ACTION,
+    PAUSE_REASON_REGION_MISMATCH,
 }
+
+ISSUE_CODE_CAPTCHA = "captcha"
+ISSUE_CODE_REGION_MISMATCH = "region_mismatch"
+ISSUE_CODE_MANUAL_ACTION = "manual_action"
 
 
 class CreatorEnrichmentSession(BrowserGuardMixin, CapturePipelineMixin, ContactBadgeMixin):
@@ -141,6 +147,9 @@ class CreatorEnrichmentSession(BrowserGuardMixin, CapturePipelineMixin, ContactB
         self._last_dom_profile_probe_at: datetime | None = None
         self._page_guard_breached = False
         self._page_guard_breach_reason = ""
+        self._current_attempt_is_retry = False
+        self._attention_event_id = 0
+        self._issue_code: str | None = None
 
     def start(self) -> CreatorEnrichmentStatus:
         self.shutdown()
@@ -176,7 +185,11 @@ class CreatorEnrichmentSession(BrowserGuardMixin, CapturePipelineMixin, ContactB
             self._context.on("response", self._handle_response)
             self._context.on("page", self._handle_context_page)
             self._context.add_init_script(network_capture_init_script())
-            if not self._ensure_single_work_page(reason="start"):
+            if not self._ensure_single_work_page(
+                reason="start",
+                allow_guard_reset=False,
+                allow_navigation_correction=False,
+            ):
                 raise PlaywrightError(self._last_message or "无法创建补充采集工作页面。")
             if self._state.get("started_at") is None:
                 self._state["started_at"] = now_iso()
@@ -211,14 +224,6 @@ class CreatorEnrichmentSession(BrowserGuardMixin, CapturePipelineMixin, ContactB
         if self._current_task_index is None:
             self._complete("补充采集完成。")
             return self.status()
-        if self._is_captcha_present():
-            self._pause(
-                PAUSE_REASON_CAPTCHA,
-                self._with_subject("检测到人机验证，请先完成验证后继续。"),
-            )
-            self._mark_current_paused(STATE_STATUS_PAUSED_CAPTCHA)
-            return self.status()
-
         if self._current_step == "waiting_profile":
             if self._captured_profile is not None:
                 self._apply_profile()
@@ -292,11 +297,10 @@ class CreatorEnrichmentSession(BrowserGuardMixin, CapturePipelineMixin, ContactB
                 )
                 return self.status()
             if self._timed_out(CONTACT_BADGE_WAIT_SECONDS):
-                self._handle_retryable_manual_failure(
-                    self._with_subject(
-                        "资料显示存在联系方式，但页面未出现可点击的联系方式图标，请处理后继续。"
-                    )
+                failure_message = self._with_subject(
+                    "资料显示存在联系方式，但页面未出现可点击的联系方式图标，请处理后继续。"
                 )
+                self._handle_retryable_manual_failure(failure_message)
             return self.status()
 
         return self.status()
@@ -322,18 +326,20 @@ class CreatorEnrichmentSession(BrowserGuardMixin, CapturePipelineMixin, ContactB
         self._collection_started = True
         self._paused = False
         self._pause_reason = None
+        self._issue_code = None
         self._last_message = self._with_subject("补充采集中。")
         self._start_current_attempt(reload_page=False, clear_failure_history=True)
         self._log_event("resume", task_index=self._current_task_index)
         return self.status()
 
-    def prepare_pages(self) -> CreatorEnrichmentStatus:
+    def prepare_pages(self, *, auto_skip_on_failure: bool = False) -> CreatorEnrichmentStatus:
         if self._context is None or self._page is None:
             self._last_message = "补充采集会话未启动。"
             return self.status()
         if self._completed:
             self._last_message = "补充采集已完成。"
             return self.status()
+        self._auto_skip_on_failure = auto_skip_on_failure
         if self._current_task_index is None:
             self._advance_to_next_pending(open_page=False)
         self._ensure_resource_blocking()
@@ -346,6 +352,10 @@ class CreatorEnrichmentSession(BrowserGuardMixin, CapturePipelineMixin, ContactB
         self._pause_reason = None
         self._last_message = self._with_subject("正在自动开始补充采集。")
         self._start_current_attempt(reload_page=False, clear_failure_history=True)
+        return self.status()
+
+    def set_runtime_options(self, *, auto_skip_on_failure: bool) -> CreatorEnrichmentStatus:
+        self._auto_skip_on_failure = auto_skip_on_failure
         return self.status()
 
     def skip_current(self) -> CreatorEnrichmentStatus:
@@ -362,6 +372,7 @@ class CreatorEnrichmentSession(BrowserGuardMixin, CapturePipelineMixin, ContactB
         self._persist_state()
         self._paused = False
         self._pause_reason = None
+        self._issue_code = None
         self._paused_started_at = None
         self._pause_step = "idle"
         self._current_step = "idle"
@@ -372,17 +383,18 @@ class CreatorEnrichmentSession(BrowserGuardMixin, CapturePipelineMixin, ContactB
         self._continue_after_terminal_transition()
         return self.status()
 
-    def retry_current(self) -> CreatorEnrichmentStatus:
+    def retry_current(self, *, auto_skip_on_failure: bool = False) -> CreatorEnrichmentStatus:
         if self._context is None or self._page is None:
             self._last_message = "补充采集会话未启动。"
             return self.status()
         if self._current_task_index is None:
             self._last_message = "当前没有可重试的达人。"
             return self.status()
+        self._auto_skip_on_failure = auto_skip_on_failure
         self._paused = False
         self._pause_reason = None
+        self._issue_code = None
         self._resume_eta_clock()
-        self._sync_current_page()
         self._start_current_attempt(reload_page=True, clear_failure_history=True)
         self._last_message = self._with_subject("正在重试。")
         self._log_event("retry", task_index=self._current_task_index, reason="manual")
@@ -393,6 +405,7 @@ class CreatorEnrichmentSession(BrowserGuardMixin, CapturePipelineMixin, ContactB
             self._paused_started_at = datetime.now(UTC)
         self._paused = True
         self._pause_reason = PAUSE_REASON_MANUAL_ACTION
+        self._issue_code = None
         self._last_message = "补充采集已暂停。"
         self._pause_step = "idle"
         self._attempt_in_progress = False
@@ -439,6 +452,7 @@ class CreatorEnrichmentSession(BrowserGuardMixin, CapturePipelineMixin, ContactB
         self._page_guard_breached = False
         self._page_guard_breach_reason = ""
         self._startup_phase = "idle"
+        self._issue_code = None
         self._current_step = "idle"
         self._collection_started = False
         self._route_installed = False
@@ -446,7 +460,8 @@ class CreatorEnrichmentSession(BrowserGuardMixin, CapturePipelineMixin, ContactB
 
     def _handle_browser_closed(self) -> None:
         self._failure_attempts = []
-        self._pause(PAUSE_REASON_MANUAL_ACTION, BROWSER_CLOSED_MESSAGE)
+        self._issue_code = None
+        self._pause(PAUSE_REASON_BROWSER_CLOSED, BROWSER_CLOSED_MESSAGE)
         self._context = None
         self._page = None
         self._work_page_task_index = None
@@ -484,12 +499,15 @@ class CreatorEnrichmentSession(BrowserGuardMixin, CapturePipelineMixin, ContactB
             remaining_regions=list(self._remaining_regions),
             last_message=self._last_message,
             pause_reason=self._pause_reason,
+            attention_event_id=self._attention_event_id,
             diagnostic_summary=self._diagnostic_summary(),
             diagnostic_text=self._diagnostic_text(),
             failure_attempts=self._failure_attempts_for_status(),
             attention_required=self._attention_required(),
             started_at=self._started_at,
             estimated_end_at=estimated_end_at,
+            auto_skip_on_failure=self._auto_skip_on_failure,
+            issue_code=self._issue_code,
         )
 
     def _eligible_items(self) -> list[TaskItem]:
@@ -535,7 +553,8 @@ class CreatorEnrichmentSession(BrowserGuardMixin, CapturePipelineMixin, ContactB
         confirmation_url = self._resolve_browser_confirmation_url()
         if not confirmation_url:
             return
-        self._navigate_page(self._page, confirmation_url)
+        self._mark_collection_mode_stale(self._page)
+        self._page.goto(confirmation_url, wait_until="commit")
         if self._current_task_index is not None and confirmation_url == self._detail_url_for_task(
             self._current_task_index
         ):
@@ -587,6 +606,7 @@ class CreatorEnrichmentSession(BrowserGuardMixin, CapturePipelineMixin, ContactB
         self._captured_profile = None
         self._captured_contact = None
         self._attempt_in_progress = True
+        self._current_attempt_is_retry = reload_page
         self._current_step = "waiting_profile"
         self._waiting_started_at = datetime.now(UTC)
         self._attempt_creator_id = creator_id
@@ -602,6 +622,8 @@ class CreatorEnrichmentSession(BrowserGuardMixin, CapturePipelineMixin, ContactB
             if not self._ensure_single_work_page(
                 reason=normalize_reason,
                 force_reset=reload_page,
+                allow_guard_reset=reload_page,
+                allow_navigation_correction=reload_page,
             ):
                 self._handle_retryable_manual_failure(
                     "补充采集工作页面不可用，请处理后继续，或跳过当前达人。"
@@ -629,12 +651,6 @@ class CreatorEnrichmentSession(BrowserGuardMixin, CapturePipelineMixin, ContactB
                     "resume_reuse_page",
                     task_index=self._current_task_index,
                     page_url=self._safe_page_url(),
-                )
-            if not self._current_page_matches_current_item():
-                self._repair_work_page_if_needed(
-                    reason="attempt_post_open",
-                    task_index=self._current_task_index,
-                    target_url=target_url,
                 )
             self._bring_page_to_front(self._page)
             if self._collection_started:
@@ -726,6 +742,8 @@ class CreatorEnrichmentSession(BrowserGuardMixin, CapturePipelineMixin, ContactB
             self._paused_started_at = datetime.now(UTC)
         self._paused = True
         self._pause_reason = reason
+        if self._should_raise_attention(reason=reason, message=message):
+            self._attention_event_id += 1
         self._last_message = message
         self._pause_step = self._current_step or "idle"
         self._attempt_in_progress = False
@@ -746,16 +764,18 @@ class CreatorEnrichmentSession(BrowserGuardMixin, CapturePipelineMixin, ContactB
 
     def _handle_retryable_manual_failure(self, message: str) -> None:
         attempt_index = len(self._failure_attempts) + 1
+        issue = self._classify_failure_issue(default_message=message)
         diagnostic_text = self._build_diagnostic_text(
-            message=message,
-            pause_reason=PAUSE_REASON_MANUAL_ACTION,
+            message=issue["message"],
+            pause_reason=issue["pause_reason"],
             pause_step=self._current_step or "idle",
         )
         self._failure_attempts.append(
             CreatorEnrichmentFailureAttempt(
                 index=attempt_index,
-                summary=message,
+                summary=issue["message"],
                 diagnostic_text=diagnostic_text,
+                issue_code=issue["code"],
             )
         )
         self._write_dev_diagnostic_artifact(
@@ -764,23 +784,28 @@ class CreatorEnrichmentSession(BrowserGuardMixin, CapturePipelineMixin, ContactB
                 f"_attempt_{attempt_index}"
             ),
             diagnostic_text=diagnostic_text,
-            summary=message,
+            summary=issue["message"],
             kind="failure_attempt",
             attempt_index=attempt_index,
         )
+        self._issue_code = issue["code"]
+        if not issue["retryable"]:
+            self._pause_issue_for_current(issue)
+            return
         if attempt_index < FAILURE_RETRY_LIMIT:
             self._paused = False
             self._pause_reason = None
+            self._issue_code = None
             self._pause_step = self._current_step or "idle"
             self._last_message = self._with_subject(
                 f"补充采集异常，正在进行第 {attempt_index + 1} 次重试。"
             )
             self._start_current_attempt(reload_page=True, clear_failure_history=False)
             return
-        if self._auto_skip_on_failure:
-            self._mark_current_auto_skipped(message)
+        if self._auto_skip_on_failure and issue["auto_skippable"]:
+            self._mark_current_auto_skipped(issue["message"])
             return
-        self._pause_manual_for_current(message)
+        self._pause_issue_for_current(issue)
 
     def _mark_current_paused(self, paused_status: str) -> None:
         if self._current_task_index is None:
@@ -809,6 +834,8 @@ class CreatorEnrichmentSession(BrowserGuardMixin, CapturePipelineMixin, ContactB
         self._persist_state()
         self._paused = False
         self._pause_reason = None
+        self._issue_code = None
+        self._attention_event_id = 0
         self._pause_step = "idle"
         self._current_step = "idle"
         self._waiting_started_at = None
@@ -823,6 +850,7 @@ class CreatorEnrichmentSession(BrowserGuardMixin, CapturePipelineMixin, ContactB
         self._completed = True
         self._paused = True
         self._pause_reason = None
+        self._issue_code = None
         self._attempt_in_progress = False
         self._current_step = "idle"
         self._waiting_started_at = None
@@ -833,6 +861,7 @@ class CreatorEnrichmentSession(BrowserGuardMixin, CapturePipelineMixin, ContactB
 
     def _reset_attempt_state(self, *, clear_page_capture: bool = True) -> None:
         self._attempt_in_progress = False
+        self._current_attempt_is_retry = False
         self._profile_wait_grace_used = False
         self._last_profile_response_url = ""
         self._last_profile_payload = None
@@ -934,17 +963,28 @@ class CreatorEnrichmentSession(BrowserGuardMixin, CapturePipelineMixin, ContactB
         )
         self._persist_state()
         self._advance_to_next_pending(open_page=True)
-        self._last_message = self._message_for_subject(
-            subject,
-            "当前达人没有联系方式，已继续下一条。",
-        )
+        if self._completed:
+            self._last_message = self._completion_message(f"{subject or '最后一条'}没有联系方式。")
+        else:
+            self._last_message = self._message_for_subject(
+                subject,
+                "当前达人没有联系方式，已继续下一条。",
+            )
         self._continue_after_terminal_transition()
 
     def _continue_after_terminal_transition(self) -> None:
         if self._paused or self._completed or self._current_task_index is None:
             return
+        self._issue_code = None
         self._sync_current_page()
         self._start_current_attempt(reload_page=False, clear_failure_history=True)
+
+    def _completion_message(self, detail: str | None = None) -> str:
+        base = "补充采集已全部完成。"
+        detail = (detail or "").strip()
+        if not detail:
+            return base
+        return f"{base}{detail}"
 
     def _status_counts(self) -> dict[str, int]:
         counts = {
@@ -986,7 +1026,13 @@ class CreatorEnrichmentSession(BrowserGuardMixin, CapturePipelineMixin, ContactB
         except PlaywrightError:
             self._handle_browser_closed()
             return False
-        if self._ensure_single_work_page(reason="runtime_check"):
+        if self._startup_phase == "browser_confirm":
+            return self._page_is_alive(self._page)
+        if self._ensure_single_work_page(
+            reason="runtime_check",
+            allow_guard_reset=False,
+            allow_navigation_correction=False,
+        ):
             return True
         if self._context is not None:
             self._pause_manual_for_current("工作页面不可用，请处理浏览器后重试。")
@@ -1046,6 +1092,50 @@ class CreatorEnrichmentSession(BrowserGuardMixin, CapturePipelineMixin, ContactB
             return None
         return list(self._failure_attempts)
 
+    def _classify_failure_issue(self, *, default_message: str) -> dict[str, object]:
+        if self._is_captcha_present():
+            return {
+                "code": ISSUE_CODE_CAPTCHA,
+                "message": "检测到人机验证，请先完成验证后继续。",
+                "pause_reason": PAUSE_REASON_CAPTCHA,
+                "retryable": False,
+                "auto_skippable": False,
+            }
+        if self._is_current_page_region_mismatched():
+            return {
+                "code": ISSUE_CODE_REGION_MISMATCH,
+                "message": self._with_subject(
+                    "当前页面区域与当前数据区域不匹配，请切换到正确页面后继续。"
+                ),
+                "pause_reason": PAUSE_REASON_REGION_MISMATCH,
+                "retryable": False,
+                "auto_skippable": False,
+            }
+        return {
+            "code": ISSUE_CODE_MANUAL_ACTION,
+            "message": default_message,
+            "pause_reason": PAUSE_REASON_MANUAL_ACTION,
+            "retryable": True,
+            "auto_skippable": True,
+        }
+
+    def _pause_issue_for_current(self, issue: dict[str, object]) -> None:
+        self._issue_code = str(issue["code"])
+        self._pause(str(issue["pause_reason"]), str(issue["message"]))
+        paused_status = STATE_STATUS_PAUSED_MANUAL_ACTION
+        if str(issue["pause_reason"]) == PAUSE_REASON_CAPTCHA:
+            paused_status = STATE_STATUS_PAUSED_CAPTCHA
+        self._mark_current_paused(paused_status)
+
+    def _is_current_page_region_mismatched(self) -> bool:
+        expected_region = normalized_region(self._current_region)
+        if not expected_region:
+            return False
+        page_region = normalized_region(query_param(self._safe_page_url(), "shop_region"))
+        if not page_region:
+            return False
+        return page_region != expected_region
+
     def _build_diagnostic_text(
         self,
         *,
@@ -1083,10 +1173,10 @@ class CreatorEnrichmentSession(BrowserGuardMixin, CapturePipelineMixin, ContactB
     def _attention_required(self) -> bool:
         if not self._paused or self._completed:
             return False
-        return (
-            self._pause_reason in ATTENTION_PAUSE_REASONS
-            and self._last_message != "补充采集已暂停。"
-        )
+        return self._should_raise_attention(reason=self._pause_reason, message=self._last_message)
+
+    def _should_raise_attention(self, *, reason: str | None, message: str) -> bool:
+        return reason in ATTENTION_PAUSE_REASONS and message != "补充采集已暂停。"
 
     def _write_dev_pause_diagnostic(self, *, reason: str, message: str) -> None:
         if reason not in ATTENTION_PAUSE_REASONS or message == "补充采集已暂停。":

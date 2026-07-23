@@ -7,21 +7,12 @@ from urllib.parse import urlsplit
 from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import Response
 
-from creator_enrichment.constants import (
-    CONTACT_API_PATH,
-    PAUSE_REASON_CAPTCHA,
-    PAUSE_REASON_REGION_MISMATCH,
-    PROFILE_API_PATH,
-    STATE_STATUS_PAUSED_CAPTCHA,
-    STATE_STATUS_PAUSED_REGION_MISMATCH,
-    STATE_STATUS_SUCCESS,
-)
+from creator_enrichment.constants import CONTACT_API_PATH, PROFILE_API_PATH, STATE_STATUS_SUCCESS
 from creator_enrichment.parsers import (
     contact_info_available,
     contact_patch,
     nested_value,
     normalized_creator_id,
-    normalized_region,
     profile_request_metadata,
     query_param,
     should_capture_profile,
@@ -393,55 +384,16 @@ class CapturePipelineMixin:
             return
         payload = captured.payload
         response_code = int(payload.get("code") or 0)
-        item_region = normalized_region(item.task_data.get("selection_region"))
-        request_region = normalized_region(
-            captured.shop_region or query_param(self._safe_page_url(), "shop_region")
-        )
         self._log_event(
             "profile_apply",
             task_index=self._current_task_index,
             response_code=response_code,
-            item_region=item_region,
-            request_region=request_region,
             captured_creator_id=captured.creator_id,
         )
         if response_code != 0:
-            if self._is_captcha_present():
-                self._pause(PAUSE_REASON_CAPTCHA, "检测到人机验证，请先完成验证后继续。")
-                self._mark_current_paused(STATE_STATUS_PAUSED_CAPTCHA)
-                return
-            if item_region and request_region and item_region != request_region:
-                self._log_event(
-                    "profile_region_mismatch",
-                    task_index=self._current_task_index,
-                    response_code=response_code,
-                    item_region=item_region,
-                    request_region=request_region,
-                )
-                self._pause(
-                    PAUSE_REASON_REGION_MISMATCH,
-                    self._with_subject("当前店铺区域与达人区域不匹配，请处理后继续。"),
-                )
-                self._mark_current_paused(STATE_STATUS_PAUSED_REGION_MISMATCH)
-                return
             self._handle_retryable_manual_failure(
                 "达人资料接口返回异常，请处理页面后继续，或跳过当前达人。"
             )
-            return
-
-        if item_region and request_region and item_region != request_region:
-            self._log_event(
-                "profile_region_mismatch",
-                task_index=self._current_task_index,
-                response_code=response_code,
-                item_region=item_region,
-                request_region=request_region,
-            )
-            self._pause(
-                PAUSE_REASON_REGION_MISMATCH,
-                self._with_subject("当前店铺区域与达人区域不匹配，请处理后继续。"),
-            )
-            self._mark_current_paused(STATE_STATUS_PAUSED_REGION_MISMATCH)
             return
 
         profile = payload.get("creator_profile")
@@ -567,7 +519,12 @@ class CapturePipelineMixin:
             )
             self._persist_state()
             self._advance_to_next_pending(open_page=True)
-            self._last_message = self._message_for_subject(subject, "已保存补充资料。")
+            if self._completed:
+                self._last_message = self._completion_message(
+                    f"{subject or '最后一条'}补充资料已保存。"
+                )
+            else:
+                self._last_message = self._message_for_subject(subject, "已保存补充资料。")
             self._finish_task_finalization(finalized_task_index)
             self._continue_after_terminal_transition()
             return

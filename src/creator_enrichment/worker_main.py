@@ -83,13 +83,27 @@ class _EnrichmentWorkerRuntime:
             )
             return
         if action == "prepare_pages":
-            self._call_session(lambda session: session.prepare_pages())
+            auto_skip_on_failure = bool(command.get("auto_skip_on_failure"))
+            self._call_session(
+                lambda session: session.prepare_pages(auto_skip_on_failure=auto_skip_on_failure)
+            )
+            return
+        if action == "set_options":
+            auto_skip_on_failure = bool(command.get("auto_skip_on_failure"))
+            self._call_session(
+                lambda session: session.set_runtime_options(
+                    auto_skip_on_failure=auto_skip_on_failure
+                )
+            )
             return
         if action == "pause":
             self._call_session(lambda session: session.stop())
             return
         if action == "retry":
-            self._call_session(lambda session: session.retry_current())
+            auto_skip_on_failure = bool(command.get("auto_skip_on_failure"))
+            self._call_session(
+                lambda session: session.retry_current(auto_skip_on_failure=auto_skip_on_failure)
+            )
             return
         if action == "skip":
             self._call_session(lambda session: session.skip_current())
@@ -177,12 +191,15 @@ class _EnrichmentWorkerRuntime:
                 "remaining_regions": [],
                 "last_message": "补充采集会话未启动。",
                 "pause_reason": None,
+                "attention_event_id": 0,
                 "diagnostic_summary": None,
                 "diagnostic_text": None,
                 "failure_attempts": [],
                 "attention_required": False,
                 "started_at": None,
                 "estimated_end_at": None,
+                "auto_skip_on_failure": False,
+                "issue_code": None,
             }
         status = self._session.status()
         return {
@@ -202,6 +219,7 @@ class _EnrichmentWorkerRuntime:
             "remaining_regions": status.remaining_regions,
             "last_message": status.last_message,
             "pause_reason": status.pause_reason,
+            "attention_event_id": status.attention_event_id,
             "diagnostic_summary": status.diagnostic_summary,
             "diagnostic_text": status.diagnostic_text,
             "failure_attempts": [
@@ -215,6 +233,8 @@ class _EnrichmentWorkerRuntime:
             "attention_required": status.attention_required,
             "started_at": _serialize_datetime(status.started_at),
             "estimated_end_at": _serialize_datetime(status.estimated_end_at),
+            "auto_skip_on_failure": status.auto_skip_on_failure,
+            "issue_code": status.issue_code,
         }
 
     def _push_message(self, payload: dict[str, object]) -> None:

@@ -9,6 +9,7 @@ class CreatorEnrichmentFailureAttempt:
     index: int
     summary: str
     diagnostic_text: str
+    issue_code: str = "manual_action"
 
 
 @dataclass(slots=True)
@@ -29,9 +30,12 @@ class CreatorEnrichmentStatus:
     remaining_regions: list[str]
     last_message: str
     pause_reason: str | None = None
+    attention_event_id: int = 0
     diagnostic_summary: str | None = None
     diagnostic_text: str | None = None
     failure_attempts: list[CreatorEnrichmentFailureAttempt] | None = None
     attention_required: bool = False
     started_at: datetime | None = None
     estimated_end_at: datetime | None = None
+    auto_skip_on_failure: bool = False
+    issue_code: str | None = None
